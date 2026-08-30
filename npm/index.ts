@@ -1,0 +1,8 @@
+export { Actor } from "./shared/actor.js"
+export type { ActorClass, ActorReference, ActorReferenceOptions } from "./shared/actor.js"
+export type { JsonObject, JsonPrimitive, JsonValue } from "./shared/types.js"
+export { configureDurableObjects } from "./workflow/client.js"
+export type { DurableObjectsClientOptions } from "./workflow/client.js"
+export { currentActorInvocation } from "./shared/invocationContext.js"
+export type { ActorInvocationContext } from "./shared/invocationContext.js"
+export { ActorConfigurationError, ActorDefinitionError, ActorInvocationError, ActorProtocolError, ActorSerializationError, ActorValidationError } from "./shared/errors.js"

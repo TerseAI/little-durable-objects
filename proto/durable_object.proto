@@ -1,0 +1,63 @@
+syntax = "proto3";
+
+package durable_object.v1;
+
+service ActorHostService {
+  rpc Invoke(InvokeActorRequest) returns (InvokeActorReply);
+}
+
+service ActorControlPlaneService {
+  rpc ResolveActorHost(ResolveActorHostRequest) returns (ResolvedActorHost);
+  rpc Execute(ControlPlaneRequest) returns (ControlPlaneReply);
+}
+
+message ResolveActorHostRequest {
+  ActorKey actor = 1;
+}
+
+message ResolvedActorHost {
+  string route = 1;
+}
+
+message ControlPlaneRequest {
+  bytes command_json = 1;
+  repeated bytes binary_payloads = 2;
+}
+
+message ControlPlaneReply {
+  bytes reply_json = 1;
+  repeated bytes binary_payloads = 2;
+}
+
+message ActorKey {
+  string namespace_id = 1;
+  string actor_type = 2;
+  string actor_id = 3;
+}
+
+message InvokeActorRequest {
+  string request_id = 1;
+  ActorKey actor = 2;
+  string method = 3;
+  bytes args_json = 4;
+  uint64 timeout_ms = 5;
+}
+
+message InvokeActorReply {
+  oneof result {
+    ActorCompleted completed = 1;
+    ActorFailed failed = 2;
+    Reroute reroute = 3;
+  }
+}
+
+message ActorCompleted {
+  bytes result_json = 1;
+}
+
+message ActorFailed {
+  string code = 1;
+  string message = 2;
+}
+
+message Reroute {}

@@ -1,0 +1,49 @@
+{
+    "name": "@terse/durable-objects",
+    "version": "0.4.7",
+    "description": "Provider-neutral durable objects for sandbox compute",
+    "type": "module",
+    "license": "SEE LICENSE IN LICENSE.md",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/TerseAI/durable-objects.git",
+        "directory": "npm"
+    },
+    "publishConfig": {
+        "access": "public"
+    },
+    "main": "dist/index.js",
+    "types": "dist/index.d.ts",
+    "exports": {
+        ".": "./dist/index.js",
+        "./host": "./dist/host.js",
+        "./modal": "./dist/providers/modal.js",
+        "./provider-http": "./dist/providers/http.js",
+        "./providers": "./dist/providers/types.js",
+        "./regions": "./dist/regions.js"
+    },
+    "files": [
+        "dist",
+        "README.md",
+        "LICENSE.md"
+    ],
+    "scripts": {
+        "build": "pnpm run generate:protocol && tsc -p tsconfig.build.json",
+        "clean": "rm -rf dist .test-dist",
+        "generate:protocol": "node scripts/generateActorGrpcSchema.mjs",
+        "test": "pnpm run build && tsc -p tsconfig.test.json && node --test --test-concurrency=1 .test-dist/*.test.js .test-dist/shared/*.test.js .test-dist/workflow/*.test.js .test-dist/host/*.test.js .test-dist/host/worker/*.test.js .test-dist/providers/*.test.js",
+        "format": "prettier --config ../.prettierrc --write \"*.ts\" \"{fixtures,host,providers,shared,workflow}/**/*.ts\"",
+        "format:check": "prettier --config ../.prettierrc --check \"*.ts\" \"{fixtures,host,providers,shared,workflow}/**/*.ts\""
+    },
+    "dependencies": {
+        "@grpc/grpc-js": "1.14.4",
+        "modal": "^0.7.2",
+        "protobufjs": "8.6.4",
+        "tsx": "^4.0.0",
+        "zod": "^4.3.6"
+    },
+    "devDependencies": {
+        "@types/node": "^22.0.0",
+        "typescript": "^5.0.0"
+    }
+}

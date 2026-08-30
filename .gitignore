@@ -1,0 +1,10 @@
+node_modules/
+npm/node_modules/
+npm/dist/
+npm/.test-dist/
+target/
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db

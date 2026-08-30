@@ -1,0 +1,54 @@
+name: CI
+
+on:
+    push:
+        branches: [main]
+    pull_request:
+
+permissions:
+    contents: read
+
+jobs:
+    rust:
+        name: Rust runtime
+        runs-on: ubuntu-24.04
+        services:
+            postgres:
+                image: postgres:16
+                env:
+                    POSTGRES_DB: durable_objects_test
+                    POSTGRES_PASSWORD: postgres
+                    POSTGRES_USER: postgres
+                ports:
+                    - 5432:5432
+                options: >-
+                    --health-cmd "pg_isready -U postgres -d durable_objects_test"
+                    --health-interval 5s
+                    --health-timeout 5s
+                    --health-retries 10
+        steps:
+            - uses: actions/checkout@v4
+            - name: Install Rust toolchain
+              run: rustup toolchain install 1.89.0 --profile minimal --component rustfmt && rustup default 1.89.0
+            - name: Check formatting
+              run: cargo fmt --all -- --check
+            - name: Run tests
+              env:
+                  DURABLE_OBJECT_TEST_POSTGRES_URL: postgresql://postgres:postgres@127.0.0.1:5432/durable_objects_test?sslmode=disable
+              run: cargo test --locked --no-fail-fast
+
+    npm:
+        name: TypeScript package
+        runs-on: ubuntu-24.04
+        steps:
+            - uses: actions/checkout@v4
+            - uses: pnpm/action-setup@v4
+              with:
+                  version: 10.17.1
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: "22.19.0"
+                  cache: pnpm
+            - run: pnpm install --frozen-lockfile
+            - run: pnpm --dir npm format:check
+            - run: pnpm --dir npm test
