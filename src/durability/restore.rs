@@ -1,5 +1,3 @@
-//! Rebuild an actor's local SQLite cache from canonical durable LTX history.
-
 use std::{
     fs,
     io::{Seek, SeekFrom, Write},
@@ -27,8 +25,6 @@ pub trait ActorStateRestorer: Send + Sync {
     async fn restore(&self, object: &ActorStorageKey, manifest: &ActorManifest) -> Result<()>;
 }
 
-/// Downloads canonical history and replaces the object's local cache as one object
-/// directory swap.
 pub struct LtxActorStateRestorer {
     store: Arc<dyn ActorDurabilityStore>,
     databases: Arc<ActorDatabaseStore>,

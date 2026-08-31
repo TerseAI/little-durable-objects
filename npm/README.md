@@ -1,28 +1,22 @@
 # @terse/durable-objects
 
-Provider-neutral durable objects for sandbox compute. The package includes:
+The package provides the typed `Actor` API, direct gRPC workflow client, JavaScript host executor, canonical-region catalog, provider contract, and bundled Modal command.
 
-- the typed `Actor` API and direct gRPC application client;
-- the JavaScript executor used inside a regional host sandbox;
-- a stable canonical-region catalog;
-- a generic `SandboxProvider` contract and authenticated HTTP bridge;
-- the first provider adapter for Modal sandboxes and Volumes.
+Workflow sandboxes receive one system-issued project JWT. The same token authorizes route resolution and direct host invocation:
 
 ```ts
 import { Actor, configureDurableObjects } from "@terse/durable-objects"
 
 configureDurableObjects({
-  credential: process.env.OBJECT_CREDENTIAL!,
-  credentialsUrl: "https://identity.example.com/workflow-credentials",
-  controlPlaneUrl: "https://objects.example.com",
-  codeRevision: "git-sha",
-  region: "north-america-east",
+  token: process.env.DURABLE_OBJECT_TOKEN!,
+  namespaceId: process.env.DURABLE_OBJECT_NAMESPACE_ID!,
+  controlPlaneUrl: process.env.DURABLE_OBJECT_CONTROL_PLANE_URL!,
 })
 
 export class Counter extends Actor {
   count = 0
 
-  async increment(): Promise<number> {
+  increment(): number {
     return ++this.count
   }
 }
@@ -30,4 +24,15 @@ export class Counter extends Actor {
 await Counter.get("account-1").increment()
 ```
 
-Actor hosts conventionally load `src/durable-objects.ts`. See the [architecture and self-hosting documentation](https://github.com/TerseAI/durable-objects) in the source repository.
+Calling `configureDurableObjects` is optional when these environment variables are already present:
+
+```text
+DURABLE_OBJECT_TOKEN
+DURABLE_OBJECT_NAMESPACE_ID
+DURABLE_OBJECT_CONTROL_PLANE_URL
+DURABLE_OBJECT_INVOCATION_TIMEOUT_MS  # optional, default 30000
+```
+
+The `terse-durable-objects-modal` executable reads one JSON command from stdin, uses `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET` through the Modal TypeScript SDK, and writes one JSON result to stdout. The Rust control plane invokes it locally; no provider HTTP server is required.
+
+Actor hosts conventionally load `src/durable-objects.ts`. See the [runtime repository](https://github.com/TerseAI/durable-objects) for backend configuration, admin RPCs, authentication, and lifecycle behavior.

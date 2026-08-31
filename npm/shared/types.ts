@@ -33,10 +33,15 @@ const cancelCommandSchema = z.object({
     actor: actorIdentitySchema
 })
 
-const executorCommandSchema = z.discriminatedUnion("type", [invokeCommandSchema, cancelCommandSchema])
+const evictCommandSchema = z.object({
+    type: z.literal("evict"),
+    actor: actorIdentitySchema
+})
+
+const executorCommandSchema = z.discriminatedUnion("type", [invokeCommandSchema, cancelCommandSchema, evictCommandSchema])
 
 const actorSessionServerMessageSchema = z.discriminatedUnion("type", [
-    z.object({ type: z.literal("attached"), protocol: z.literal(8) }),
+    z.object({ type: z.literal("attached"), protocol: z.literal(9) }),
     z.object({
         type: z.literal("command"),
         message_id: z.number().int().nonnegative(),
@@ -123,14 +128,15 @@ function isJsonObject(value: JsonValue): value is JsonObject {
 
 type InvokeCommand = z.infer<typeof invokeCommandSchema>
 type CancelCommand = z.infer<typeof cancelCommandSchema>
+type EvictCommand = z.infer<typeof evictCommandSchema>
 type ActorExecutorCommand = z.infer<typeof executorCommandSchema>
 type ActorSessionServerMessage = z.infer<typeof actorSessionServerMessageSchema>
-type ActorExecutorReply = InvokedReply | FailedReply | CancelledReply
+type ActorExecutorReply = InvokedReply | FailedReply | CancelledReply | EvictedReply
 type ActorSessionClientMessage = AttachMessage | ReplyMessage
 
 interface AttachMessage {
     readonly type: "attach"
-    readonly protocol: 8
+    readonly protocol: 9
     readonly actor_types: readonly string[]
 }
 
@@ -156,6 +162,10 @@ interface CancelledReply {
     readonly type: "cancelled"
 }
 
+interface EvictedReply {
+    readonly type: "evicted"
+}
+
 interface ActorWorkerData {
     readonly actorType: string
     readonly moduleUrl: string
@@ -172,6 +182,7 @@ export type {
     ActorWorkerData,
     ActorWorkerRequest,
     CancelCommand,
+    EvictCommand,
     InvokeCommand,
     JsonObject,
     JsonPrimitive,

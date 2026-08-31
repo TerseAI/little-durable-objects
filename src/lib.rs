@@ -1,5 +1,3 @@
-//! Core actor runtime primitives.
-
 pub mod actor;
 pub mod actor_state;
 pub mod clock;

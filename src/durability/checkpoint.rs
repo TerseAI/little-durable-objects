@@ -1,5 +1,3 @@
-//! Asynchronous creation of consolidated SQLite recovery images.
-
 use std::{path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result, ensure};
@@ -9,7 +7,6 @@ use super::{
 };
 use crate::actor_state::ActorStorageKey;
 
-/// Builds checkpoints off the request path and publishes them with one manifest CAS.
 pub(crate) struct CheckpointCompactor {
     store: Arc<RegionalActorStore>,
     minimum_tail_txids: u64,

@@ -14,11 +14,13 @@
     },
     "main": "dist/index.js",
     "types": "dist/index.d.ts",
+    "bin": {
+        "terse-durable-objects-modal": "./dist/providers/modalCli.js"
+    },
     "exports": {
         ".": "./dist/index.js",
         "./host": "./dist/host.js",
         "./modal": "./dist/providers/modal.js",
-        "./provider-http": "./dist/providers/http.js",
         "./providers": "./dist/providers/types.js",
         "./regions": "./dist/regions.js"
     },
@@ -31,7 +33,7 @@
         "build": "pnpm run generate:protocol && tsc -p tsconfig.build.json",
         "clean": "rm -rf dist .test-dist",
         "generate:protocol": "node scripts/generateActorGrpcSchema.mjs",
-        "test": "pnpm run build && tsc -p tsconfig.test.json && node --test --test-concurrency=1 .test-dist/*.test.js .test-dist/shared/*.test.js .test-dist/workflow/*.test.js .test-dist/host/*.test.js .test-dist/host/worker/*.test.js .test-dist/providers/*.test.js",
+        "test": "pnpm run clean && pnpm run build && tsc -p tsconfig.test.json && node --test --test-concurrency=1 .test-dist/*.test.js .test-dist/shared/*.test.js .test-dist/workflow/*.test.js .test-dist/host/*.test.js .test-dist/host/worker/*.test.js .test-dist/providers/*.test.js",
         "format": "prettier --config ../.prettierrc --write \"*.ts\" \"{fixtures,host,providers,shared,workflow}/**/*.ts\"",
         "format:check": "prettier --config ../.prettierrc --check \"*.ts\" \"{fixtures,host,providers,shared,workflow}/**/*.ts\""
     },

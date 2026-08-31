@@ -1,5 +1,3 @@
-//! Derived durable-object lifecycle. Cache residency is never authoritative.
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DurableExistence {
     Present,

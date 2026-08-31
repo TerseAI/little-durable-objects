@@ -1,9 +1,3 @@
-//! Canonical durable actor state.
-//!
-//! Production stores ownership and the canonical LTX tip in a CAS-protected
-//! PostgreSQL manifest, while each ownership epoch writes its LTX records to one
-//! appendable GCS Rapid object. The filesystem implementation exists for tests.
-
 mod archive;
 mod local;
 mod postgres;

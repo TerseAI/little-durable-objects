@@ -11,6 +11,52 @@ service ActorControlPlaneService {
   rpc Execute(ControlPlaneRequest) returns (ControlPlaneReply);
 }
 
+service ActorAdminService {
+  rpc EnsureNamespace(EnsureNamespaceRequest) returns (EnsureNamespaceReply);
+  rpc RegisterLaunchSpec(RegisterLaunchSpecRequest) returns (RegisterLaunchSpecReply);
+  rpc IssueWorkflowToken(IssueWorkflowTokenRequest) returns (IssueWorkflowTokenReply);
+  rpc GetJwks(GetJwksRequest) returns (GetJwksReply);
+}
+
+message EnsureNamespaceRequest {
+  string namespace_id = 1;
+}
+
+message EnsureNamespaceReply {
+  bool created = 1;
+}
+
+message RegisterLaunchSpecRequest {
+  string namespace_id = 1;
+  string code_revision = 2;
+  string modal_image_id = 3;
+  string working_directory = 4;
+  optional string actor_entrypoint = 5;
+}
+
+message RegisterLaunchSpecReply {
+  bool created = 1;
+}
+
+message IssueWorkflowTokenRequest {
+  string namespace_id = 1;
+  string execution_id = 2;
+  string code_revision = 3;
+  string region = 4;
+  int64 deadline_unix_ms = 5;
+}
+
+message IssueWorkflowTokenReply {
+  string token = 1;
+  int64 expires_at_ms = 2;
+}
+
+message GetJwksRequest {}
+
+message GetJwksReply {
+  bytes jwks_json = 1;
+}
+
 message ResolveActorHostRequest {
   ActorKey actor = 1;
 }

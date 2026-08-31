@@ -32,10 +32,10 @@ test("the actor session carries only owned execution commands", async () => {
 
         assert.deepEqual(await readMessage(iterator), {
             type: "attach",
-            protocol: 8,
+            protocol: 9,
             actor_types: ["SessionCounter"]
         })
-        customerSocket.write(`${JSON.stringify({ type: "attached", protocol: 8 })}\n`)
+        customerSocket.write(`${JSON.stringify({ type: "attached", protocol: 9 })}\n`)
         await startup
 
         customerSocket.write(

@@ -16,7 +16,10 @@ pub use self::{
     database_store::ActorDatabaseStore,
     ownership::ActorOwner,
 };
-pub(crate) use self::{execution_locks::ActorExecutionLocks, restore_cache::ActorRestoreCache};
+pub(crate) use self::{
+    execution_locks::{ActorExecutionAdmission, ActorExecutionGuard, ActorExecutionLocks},
+    restore_cache::ActorRestoreCache,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ActorStorageKey(String);

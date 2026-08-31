@@ -22,9 +22,6 @@ const QUEUE_CAPACITY: usize = 10_000;
 pub(crate) const MAX_FORWARDED_BATCH_EVENTS: usize = 100;
 const FLUSH_EVERY: Duration = Duration::from_secs(1);
 
-/// Credential-free telemetry used inside actor-host sandboxes. Events cross the already
-/// authenticated control-plane connection; only the trusted control plane holds the
-/// PostHog API key and it replaces every event's namespace scope from the JWT.
 pub(crate) struct ControlPlaneActorTelemetry {
     sender: mpsc::Sender<ActorTelemetryEvent>,
     shutdown: watch::Sender<bool>,

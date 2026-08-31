@@ -1,9 +1,3 @@
-//! End-to-end tests for the SQLite WAL capture path.
-//!
-//! Every test uses a temporary file-backed database: WAL mode is unavailable to the
-//! ordinary in-memory database, so `Connection::open_in_memory` cannot exercise any of
-//! this.
-
 use crate::{
     actor_state::{ActorDatabaseTestExt, SqliteActorDatabase},
     ltx::{

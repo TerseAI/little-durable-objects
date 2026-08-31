@@ -1,5 +1,3 @@
-//! Injectable time for leases and ownership checks.
-
 use std::{
     sync::OnceLock,
     time::{Instant, SystemTime, UNIX_EPOCH},

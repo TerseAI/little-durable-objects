@@ -5,8 +5,6 @@ use async_trait::async_trait;
 
 use super::{ActorTelemetry, ActorTelemetryEvent};
 
-/// Deterministic in-memory telemetry used by local tests. Production call sites use
-/// the same trait and typed events as the PostHog and forwarding implementations.
 #[derive(Default)]
 pub(crate) struct LocalActorTelemetry {
     events: Mutex<Vec<ActorTelemetryEvent>>,

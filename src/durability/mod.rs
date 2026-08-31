@@ -1,5 +1,3 @@
-//! Actor-state capture, publication, restore, and maintenance.
-
 mod capture;
 mod checkpoint;
 mod maintenance;

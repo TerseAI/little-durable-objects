@@ -1,5 +1,3 @@
-//! Credentialless actor-host process lifecycle.
-
 use std::{
     env,
     future::Future,
@@ -32,22 +30,23 @@ use crate::{
 };
 
 use super::{
-    ActorDrainReason, ActorHostDependencies, ActorProcessRole, HOST_ACTOR_DRAIN_TIMEOUT,
-    HostEndpoint, LeasedActorHost,
-    credentials::{HostCredentialIssuer, HostCredentialRequest, IssuedHostCredentials},
+    ActorDrainReason, ActorHostDependencies, HOST_ACTOR_DRAIN_TIMEOUT, HostEndpoint,
+    LeasedActorHost,
 };
 
 const HOST_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const HOST_HEALTH_INTERVAL: Duration = Duration::from_secs(60);
+const DEFAULT_ACTOR_IDLE_TIMEOUT_MS: u64 = 60_000;
+const DEFAULT_HOST_IDLE_TIMEOUT_MS: u64 = 300_000;
+const MAX_IDLE_TIMEOUT_MS: u64 = 86_400_000;
 
-/// Configuration injected into one sandbox. The bootstrap credential is exchanged
-/// for short-lived JWTs and is never sent to the durable-object control plane.
 pub struct ActorHostConfig {
-    pub credentials_url: String,
     pub control_plane_url: String,
-    pub credential: String,
-    pub host_id: Option<super::HostId>,
-    pub session_id: Option<String>,
+    pub control_plane_token: String,
+    pub jwt_public_keys: String,
+    pub namespace_id: String,
+    pub host_id: super::HostId,
+    pub session_id: String,
     pub region: String,
     pub code_revision: Option<String>,
     pub local_root: PathBuf,
@@ -59,6 +58,8 @@ pub struct ActorHostConfig {
     pub jwt_max_lifetime: Duration,
     pub lease_duration: Duration,
     pub renew_every: Duration,
+    pub actor_idle_timeout: Duration,
+    pub host_idle_timeout: Duration,
 }
 
 impl ActorHostConfig {
@@ -67,19 +68,23 @@ impl ActorHostConfig {
     }
 
     fn from_lookup(mut get: impl FnMut(&str) -> Option<String>) -> Result<Self> {
-        let credentials_url = required(&mut get, "DURABLE_OBJECT_CREDENTIALS_URL")?;
         let control_plane_url = required(&mut get, "DURABLE_OBJECT_CONTROL_PLANE_URL")?;
-        let credential = required(&mut get, "DURABLE_OBJECT_CREDENTIAL")?;
-        let host_id = get("DURABLE_OBJECT_HOST_ID").map(super::HostId::new);
-        let session_id = get("DURABLE_OBJECT_SESSION_ID");
-        ensure!(
-            host_id.is_some() == session_id.is_some(),
-            "DURABLE_OBJECT_HOST_ID and DURABLE_OBJECT_SESSION_ID must be set together"
-        );
-        if let Some(session_id) = &session_id {
-            uuid::Uuid::parse_str(session_id)
-                .context("DURABLE_OBJECT_SESSION_ID must be a UUID")?;
+        let control_plane_token = required(&mut get, "DURABLE_OBJECT_HOST_TOKEN")?;
+        let jwt_public_keys = required(&mut get, "DURABLE_OBJECT_JWT_PUBLIC_KEYS")?;
+        let namespace_id = required(&mut get, "DURABLE_OBJECT_NAMESPACE_ID")?;
+        ActorScope {
+            namespace_id: namespace_id.clone(),
         }
+        .validate()?;
+        let host_id = super::HostId::new(required(&mut get, "DURABLE_OBJECT_HOST_ID")?);
+        ensure!(
+            host_id
+                .as_str()
+                .starts_with(&format!("host.v1.{namespace_id}.")),
+            "DURABLE_OBJECT_HOST_ID does not belong to DURABLE_OBJECT_NAMESPACE_ID"
+        );
+        let session_id = required(&mut get, "DURABLE_OBJECT_SESSION_ID")?;
+        uuid::Uuid::parse_str(&session_id).context("DURABLE_OBJECT_SESSION_ID must be a UUID")?;
         let region = get("DURABLE_OBJECT_REGION").unwrap_or_else(|| "default".into());
         ensure!(valid_region(&region), "DURABLE_OBJECT_REGION is invalid");
         let code_revision = get("DURABLE_OBJECT_CODE_REVISION");
@@ -109,6 +114,18 @@ impl ActorHostConfig {
             duration_seconds(&mut get, "DURABLE_OBJECT_JWT_MAX_TTL_SECONDS", 1_800)?;
         let lease_duration = duration_ms(&mut get, "DURABLE_OBJECT_LEASE_MS", 30_000)?;
         let renew_every = duration_ms(&mut get, "DURABLE_OBJECT_RENEW_MS", 10_000)?;
+        let actor_idle_timeout = bounded_duration_ms(
+            &mut get,
+            "DURABLE_OBJECT_ACTOR_IDLE_TIMEOUT_MS",
+            DEFAULT_ACTOR_IDLE_TIMEOUT_MS,
+            MAX_IDLE_TIMEOUT_MS,
+        )?;
+        let host_idle_timeout = bounded_duration_ms(
+            &mut get,
+            "DURABLE_OBJECT_HOST_IDLE_TIMEOUT_MS",
+            DEFAULT_HOST_IDLE_TIMEOUT_MS,
+            MAX_IDLE_TIMEOUT_MS,
+        )?;
         ensure!(
             lease_duration.as_millis() <= u128::from(MAX_HOST_LEASE_DURATION_MS),
             "DURABLE_OBJECT_LEASE_MS must not exceed {MAX_HOST_LEASE_DURATION_MS}"
@@ -118,9 +135,10 @@ impl ActorHostConfig {
             "DURABLE_OBJECT_RENEW_MS must be shorter than DURABLE_OBJECT_LEASE_MS"
         );
         Ok(Self {
-            credentials_url,
             control_plane_url,
-            credential,
+            control_plane_token,
+            jwt_public_keys,
+            namespace_id,
             host_id,
             session_id,
             region,
@@ -134,6 +152,8 @@ impl ActorHostConfig {
             jwt_max_lifetime,
             lease_duration,
             renew_every,
+            actor_idle_timeout,
+            host_idle_timeout,
         })
     }
 }
@@ -151,14 +171,10 @@ where
 type HostTask = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 
 struct AuthenticatedHost {
-    token_issuer: HostCredentialIssuer,
-    issued: IssuedHostCredentials,
-    credential_request: HostCredentialRequest,
     control_plane: Arc<ControlPlaneClient>,
     actor_scope: ActorScope,
     invocation_auth: ActorJwtVerifier,
     telemetry: Arc<dyn ActorTelemetry>,
-    token_exchange_ms: f64,
     control_plane_connect_ms: f64,
 }
 
@@ -183,32 +199,19 @@ struct ActorHostProcess {
     host_server: HostTask,
     executor_connection: HostTask,
     javascript_process: HostTask,
-    token_refresh: HostTask,
     lease_lost: watch::Receiver<bool>,
+    actor_activity: watch::Receiver<usize>,
+    host_idle_timeout: Duration,
 }
 
 async fn authenticate_host(config: &ActorHostConfig) -> Result<AuthenticatedHost> {
     let phase_started = Instant::now();
-    let token_issuer =
-        HostCredentialIssuer::new(&config.credentials_url, config.credential.clone())?;
-    let request = HostCredentialRequest {
-        host_id: config.host_id.clone(),
-        session_id: config.session_id.clone(),
-        process_role: ActorProcessRole::Host,
-        region: config.region.clone(),
-        code_revision: config.code_revision.clone(),
-    };
-    let issued = token_issuer.issue(&request).await?;
-    let token_exchange_ms = elapsed_ms(phase_started);
-    let credential_request = issued.host_request();
-
-    let phase_started = Instant::now();
     let control_plane = Arc::new(
-        ControlPlaneClient::connect(&config.control_plane_url, &issued.control_plane_token).await?,
+        ControlPlaneClient::connect(&config.control_plane_url, &config.control_plane_token).await?,
     );
     let control_plane_connect_ms = elapsed_ms(phase_started);
     let actor_scope = ActorScope {
-        namespace_id: issued.namespace_id.clone(),
+        namespace_id: config.namespace_id.clone(),
     };
     actor_scope.validate()?;
     let telemetry: Arc<dyn ActorTelemetry> = Arc::new(ControlPlaneActorTelemetry::new(
@@ -218,14 +221,8 @@ async fn authenticate_host(config: &ActorHostConfig) -> Result<AuthenticatedHost
         ActorTelemetryScope::namespace(&actor_scope),
         telemetry.clone(),
     )?;
-    ensure!(
-        issued.process_role == ActorProcessRole::Host
-            && issued.region == config.region
-            && issued.code_revision == config.code_revision,
-        "control-plane credential placement does not match host configuration"
-    );
     let invocation_auth = ActorJwtVerifier::for_scope(
-        issued.public_keys_json()?,
+        &config.jwt_public_keys,
         config.jwt_issuer.clone(),
         config.invocation_jwt_audience.clone(),
         ActorTokenPurpose::Invocation,
@@ -233,14 +230,10 @@ async fn authenticate_host(config: &ActorHostConfig) -> Result<AuthenticatedHost
     )?;
 
     Ok(AuthenticatedHost {
-        token_issuer,
-        issued,
-        credential_request,
         control_plane,
         actor_scope,
         invocation_auth,
         telemetry,
-        token_exchange_ms,
         control_plane_connect_ms,
     })
 }
@@ -252,14 +245,10 @@ async fn start_host_process(
     let authenticated = authenticate_host(&config).await?;
     let host = start_actor_host(&config, &authenticated).await?;
     let AuthenticatedHost {
-        token_issuer,
-        issued,
-        credential_request,
-        control_plane,
+        control_plane: _,
         actor_scope,
-        invocation_auth,
+        invocation_auth: _,
         telemetry,
-        token_exchange_ms,
         control_plane_connect_ms,
     } = authenticated;
     let StartedActorHost {
@@ -272,13 +261,12 @@ async fn start_host_process(
         host_bind_ms,
         initial_lease_ms,
     } = host;
-    let host_id = issued.host_id.clone();
-    let session_id = issued.session_id.clone();
+    let host_id = config.host_id.clone();
+    let session_id = config.session_id.clone();
 
     info!(
         host_id = %host_id,
         namespace_id = %actor_scope.namespace_id,
-        token_expires_at_ms = issued.expires_at_ms,
         session_id,
         host_route,
         region = %config.region,
@@ -292,7 +280,7 @@ async fn start_host_process(
             scope: telemetry_scope.clone(),
             role: ActorSystemRole::Host,
             total_ms: elapsed_ms(process_started),
-            token_exchange_ms,
+            token_exchange_ms: 0.0,
             control_plane_connect_ms,
             host_bind_ms,
             initial_lease_ms,
@@ -306,13 +294,8 @@ async fn start_host_process(
         true,
         0,
     );
-    let token_refresh: HostTask = Box::pin(token_issuer.refresh(
-        control_plane,
-        invocation_auth,
-        credential_request,
-        issued.expires_at_ms,
-    ));
     let lease_lost = leased_host.lease_lost();
+    let actor_activity = leased_host.activity();
 
     Ok(ActorHostProcess {
         host_id,
@@ -324,8 +307,9 @@ async fn start_host_process(
         host_server,
         executor_connection,
         javascript_process,
-        token_refresh,
         lease_lost,
+        actor_activity,
+        host_idle_timeout: config.host_idle_timeout,
     })
 }
 
@@ -344,7 +328,7 @@ async fn start_actor_host(
         .clone()
         .unwrap_or_else(|| format!("http://{local_host_address}"));
     let endpoint = HostEndpoint {
-        id: authenticated.issued.host_id.clone(),
+        id: config.host_id.clone(),
         route: host_route.clone(),
     };
     let executor_listener = ActorExecutorListener::bind(&config.executor_socket).await?;
@@ -374,7 +358,7 @@ async fn start_actor_host(
     let phase_started = Instant::now();
     let leased_host = LeasedActorHost::start(
         endpoint,
-        authenticated.issued.session_id.clone(),
+        config.session_id.clone(),
         dependencies,
         config.lease_duration,
         config.renew_every,
@@ -425,14 +409,27 @@ where
         HOST_HEALTH_INTERVAL,
     );
     tokio::pin!(shutdown);
+    let mut idle_deadline = Some(tokio::time::Instant::now() + host_process.host_idle_timeout);
     loop {
         let stop = tokio::select! {
             result = &mut host_process.host_server => Some(HostStop::Grpc(result)),
             result = &mut host_process.executor_connection => Some(HostStop::ExecutorConnection(result)),
             result = &mut host_process.javascript_process => Some(HostStop::JavaScriptProcess(result)),
-            result = &mut host_process.token_refresh => Some(HostStop::TokenRefresh(result)),
             result = wait_for_lease_loss(&mut host_process.lease_lost) => Some(HostStop::LeaseLost(result)),
             () = &mut shutdown => Some(HostStop::Requested),
+            activity = host_process.actor_activity.changed() => {
+                if activity.is_err() {
+                    Some(HostStop::ActivityTrackerStopped)
+                } else {
+                    idle_deadline = if *host_process.actor_activity.borrow() == 0 {
+                        Some(tokio::time::Instant::now() + host_process.host_idle_timeout)
+                    } else {
+                        None
+                    };
+                    None
+                }
+            },
+            () = wait_for_idle_deadline(idle_deadline) => Some(HostStop::Idle),
             _ = health_ticks.tick() => {
                 publish_host_health(
                     host_process.telemetry.as_ref(),
@@ -461,13 +458,14 @@ async fn stop_host(host_process: ActorHostProcess, stop: HostStop) -> Result<()>
         host_server,
         executor_connection,
         javascript_process,
-        token_refresh,
         lease_lost: _,
+        actor_activity: _,
+        host_idle_timeout: _,
     } = host_process;
-    let drain_reason = if matches!(&stop, HostStop::LeaseLost(_)) {
-        ActorDrainReason::LeaseLost
-    } else {
-        ActorDrainReason::Shutdown
+    let drain_reason = match &stop {
+        HostStop::LeaseLost(_) => ActorDrainReason::LeaseLost,
+        HostStop::Idle => ActorDrainReason::Idle,
+        _ => ActorDrainReason::Shutdown,
     };
     let stopped_after_lease_loss = matches!(&stop, HostStop::LeaseLost(_));
     let drain_result = leased_host.drain(drain_reason).await;
@@ -491,10 +489,6 @@ async fn stop_host(host_process: ActorHostProcess, stop: HostStop) -> Result<()>
             let component_result = finish_host_tasks(host_server, executor_connection).await;
             executor_result.and(component_result)
         }
-        HostStop::TokenRefresh(token_result) => {
-            let component_result = finish_host_tasks(host_server, executor_connection).await;
-            token_result.and(component_result)
-        }
         HostStop::LeaseLost(lease_result) => {
             let component_result = finish_host_tasks(host_server, executor_connection).await;
             let lease_result: Result<()> = lease_result.and_then(|()| {
@@ -505,9 +499,15 @@ async fn stop_host(host_process: ActorHostProcess, stop: HostStop) -> Result<()>
             lease_result.and(component_result)
         }
         HostStop::Requested => finish_host_tasks(host_server, executor_connection).await,
+        HostStop::Idle => finish_host_tasks(host_server, executor_connection).await,
+        HostStop::ActivityTrackerStopped => {
+            finish_host_tasks(host_server, executor_connection).await?;
+            Err(anyhow::anyhow!(
+                "actor activity tracker stopped unexpectedly"
+            ))
+        }
     };
     drop(javascript_process);
-    drop(token_refresh);
     if let Err(error) = &serve_result {
         error!(
             host_id = %host_id,
@@ -555,9 +555,17 @@ enum HostStop {
     Grpc(Result<()>),
     ExecutorConnection(Result<()>),
     JavaScriptProcess(Result<()>),
-    TokenRefresh(Result<()>),
     LeaseLost(Result<()>),
     Requested,
+    Idle,
+    ActivityTrackerStopped,
+}
+
+async fn wait_for_idle_deadline(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
 }
 
 fn spawn_javascript_process() -> Result<tokio::process::Child> {
@@ -652,6 +660,20 @@ fn duration_ms(
     Ok(Duration::from_millis(value))
 }
 
+fn bounded_duration_ms(
+    get: &mut impl FnMut(&str) -> Option<String>,
+    name: &str,
+    default: u64,
+    maximum: u64,
+) -> Result<Duration> {
+    let duration = duration_ms(get, name, default)?;
+    ensure!(
+        duration.as_millis() <= u128::from(maximum),
+        "{name} must not exceed {maximum}"
+    );
+    Ok(duration)
+}
+
 fn duration_seconds(
     get: &mut impl FnMut(&str) -> Option<String>,
     name: &str,
@@ -683,14 +705,20 @@ mod tests {
     fn valid() -> HashMap<String, String> {
         HashMap::from([
             (
-                "DURABLE_OBJECT_CREDENTIALS_URL".into(),
-                "http://127.0.0.1:3001/sdk/actor-token".into(),
-            ),
-            (
                 "DURABLE_OBJECT_CONTROL_PLANE_URL".into(),
                 "http://127.0.0.1:7100".into(),
             ),
-            ("DURABLE_OBJECT_CREDENTIAL".into(), "project-token".into()),
+            ("DURABLE_OBJECT_HOST_TOKEN".into(), "host-jwt".into()),
+            ("DURABLE_OBJECT_JWT_PUBLIC_KEYS".into(), "{}".into()),
+            ("DURABLE_OBJECT_NAMESPACE_ID".into(), "namespace-1".into()),
+            (
+                "DURABLE_OBJECT_HOST_ID".into(),
+                "host.v1.namespace-1.00000000-0000-4000-8000-000000000001".into(),
+            ),
+            (
+                "DURABLE_OBJECT_SESSION_ID".into(),
+                "00000000-0000-4000-8000-000000000002".into(),
+            ),
             (
                 "DURABLE_OBJECT_LOCAL_ROOT".into(),
                 "/data/durable-objects".into(),
@@ -705,10 +733,6 @@ mod tests {
     #[test]
     fn configures_a_credentialless_actor_host() -> Result<()> {
         let config = parse(&valid())?;
-        assert_eq!(
-            config.credentials_url,
-            "http://127.0.0.1:3001/sdk/actor-token"
-        );
         assert_eq!(config.control_plane_url, "http://127.0.0.1:7100");
         assert_eq!(config.local_root, PathBuf::from("/data/durable-objects"));
         assert_eq!(config.host_bind, "127.0.0.1:0".parse()?);
@@ -721,6 +745,8 @@ mod tests {
         );
         assert_eq!(config.lease_duration, Duration::from_secs(30));
         assert_eq!(config.renew_every, Duration::from_secs(10));
+        assert_eq!(config.actor_idle_timeout, Duration::from_secs(60));
+        assert_eq!(config.host_idle_timeout, Duration::from_secs(5 * 60));
         assert_eq!(config.region, "default");
         Ok(())
     }
@@ -728,7 +754,7 @@ mod tests {
     #[test]
     fn rejects_missing_credentials_and_invalid_lease_timing() {
         let mut missing_token = valid();
-        missing_token.remove("DURABLE_OBJECT_CREDENTIAL");
+        missing_token.remove("DURABLE_OBJECT_HOST_TOKEN");
         assert!(parse(&missing_token).is_err());
 
         let mut invalid_lease = valid();
@@ -742,6 +768,16 @@ mod tests {
             (MAX_HOST_LEASE_DURATION_MS + 1).to_string(),
         );
         assert!(parse(&oversized_lease).is_err());
+
+        for (name, value) in [
+            ("DURABLE_OBJECT_ACTOR_IDLE_TIMEOUT_MS", "0"),
+            ("DURABLE_OBJECT_ACTOR_IDLE_TIMEOUT_MS", "86400001"),
+            ("DURABLE_OBJECT_HOST_IDLE_TIMEOUT_MS", "not-a-number"),
+        ] {
+            let mut invalid_idle = valid();
+            invalid_idle.insert(name.into(), value.into());
+            assert!(parse(&invalid_idle).is_err());
+        }
     }
 
     #[test]

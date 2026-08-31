@@ -1,26 +1,23 @@
 import { AlreadyExistsError, ModalClient, NotFoundError } from "modal"
-import type { App, Sandbox } from "modal"
-import { createHash, randomUUID } from "node:crypto"
+import type { App, Sandbox, Volume } from "modal"
+import { createHash } from "node:crypto"
 
 import { canonicalRegionForModal, modalPlacement } from "../regions.js"
 import type { CanonicalRegionCatalog } from "../regions.js"
 
-import type { ActorHostHandle, EnsureHostRequest, SandboxProvider, SandboxProviderHooks } from "./types.js"
+import type { ActorHostHandle, EnsureHostRequest, SandboxProvider } from "./types.js"
 
 const hostPort = 7101
 const cacheMount = "/var/cache/durable-objects"
+const hostRouteFile = "/tmp/durable-object-route"
+const readyFile = "/tmp/durable-object-ready"
+const maximumSandboxLifetimeMs = 24 * 60 * 60 * 1000
 
 interface ModalSandboxProviderOptions {
-    readonly tokenId: string
-    readonly tokenSecret: string
-    readonly controlPlaneUrl: string
-    readonly credentialsUrl: string
-    readonly jwtIssuer?: string
-    readonly invokeAudience?: string
     readonly appName?: string
     readonly binaryPath?: string
     readonly catalog?: CanonicalRegionCatalog
-    readonly hooks: SandboxProviderHooks
+    readonly client?: ModalClient
 }
 
 class ModalSandboxProvider implements SandboxProvider {
@@ -29,8 +26,8 @@ class ModalSandboxProvider implements SandboxProvider {
     private readonly binaryPath: string
     private readonly activations = new Map<string, Promise<ActorHostHandle>>()
 
-    constructor(private readonly options: ModalSandboxProviderOptions) {
-        this.modal = new ModalClient({ tokenId: options.tokenId, tokenSecret: options.tokenSecret })
+    constructor(private readonly options: ModalSandboxProviderOptions = {}) {
+        this.modal = options.client ?? new ModalClient()
         this.appName = options.appName ?? "durable-object-hosts"
         this.binaryPath = options.binaryPath ?? "/usr/local/bin/durable-object-runtime"
     }
@@ -45,13 +42,9 @@ class ModalSandboxProvider implements SandboxProvider {
     }
 
     private async ensureHostOnce(request: EnsureHostRequest, name: string): Promise<ActorHostHandle> {
+        validateEnsureRequest(request)
         const placement = modalPlacement(request.canonicalRegion, this.options.catalog)
-        const [app, artifact, bootstrap, volume] = await Promise.all([
-            this.modal.apps.fromName(this.appName, { createIfMissing: true }),
-            this.options.hooks.resolveArtifact(request),
-            this.options.hooks.issueHostBootstrap(request),
-            this.modal.volumes.fromName(resourceName("cache", request), { createIfMissing: true })
-        ])
+        const [app, image, cache] = await Promise.all([this.modal.apps.fromName(this.appName, { createIfMissing: true }), this.modal.images.fromId(request.modalImageId), this.cacheVolume(request)])
         const existing = await this.existing(app, name)
         if (existing) {
             try {
@@ -61,17 +54,26 @@ class ModalSandboxProvider implements SandboxProvider {
             }
         }
 
-        const image = await this.modal.images.fromId(artifact.imageId)
         let sandbox: Sandbox
         try {
             sandbox = await this.modal.sandboxes.create(app, image, {
                 name,
-                timeoutMs: 24 * 60 * 60 * 1000,
-                idleTimeoutMs: 5 * 60 * 1000,
+                timeoutMs: maximumSandboxLifetimeMs,
+                idleTimeoutMs: request.hostIdleTimeoutMs,
+                command: [
+                    "sh",
+                    "-c",
+                    'until test -s "$1"; do sleep 0.05; done; export DURABLE_OBJECT_HOST_ROUTE="$(cat "$1")"; exec "$2"',
+                    "durable-object-host-bootstrap",
+                    hostRouteFile,
+                    this.binaryPath
+                ],
+                workdir: request.workingDirectory,
+                env: hostEnvironment(request),
                 h2Ports: [hostPort],
                 regions: [...placement.regions],
                 cloud: placement.cloud,
-                volumes: { [cacheMount]: volume }
+                volumes: { [cacheMount]: cache.volume }
             })
         } catch (error) {
             if (!(error instanceof AlreadyExistsError)) throw error
@@ -86,7 +88,7 @@ class ModalSandboxProvider implements SandboxProvider {
             throw new Error(`Modal placed host in ${observedCanonical ?? "an unknown region"}; expected ${request.canonicalRegion}`)
         }
 
-        const handle = await this.start(sandbox, request, artifact.workingDirectory, artifact.actorEntrypoint, bootstrap.credential)
+        const handle = await this.start(sandbox, request, cache.source)
         await writeMetadata(sandbox, handle)
         return handle
     }
@@ -113,6 +115,16 @@ class ModalSandboxProvider implements SandboxProvider {
         await this.modal.volumes.delete(resourceName("cache", request), { allowMissing: true })
     }
 
+    private async cacheVolume(request: EnsureHostRequest): Promise<{ volume: Volume; source: ActorHostHandle["cacheSource"] }> {
+        const name = resourceName("cache", request)
+        try {
+            return { volume: await this.modal.volumes.fromName(name), source: "volume" }
+        } catch (error) {
+            if (!(error instanceof NotFoundError)) throw error
+            return { volume: await this.modal.volumes.fromName(name, { createIfMissing: true }), source: "durable_storage" }
+        }
+    }
+
     private async existing(app: App, name: string): Promise<Sandbox | undefined> {
         try {
             const sandbox = await this.modal.sandboxes.fromName(app.name ?? this.appName, name)
@@ -135,39 +147,49 @@ class ModalSandboxProvider implements SandboxProvider {
         return handle
     }
 
-    private async start(sandbox: Sandbox, request: EnsureHostRequest, workingDirectory: string, actorEntrypoint: string | undefined, credential: string): Promise<ActorHostHandle> {
+    private async start(sandbox: Sandbox, request: EnsureHostRequest, cacheSource: ActorHostHandle["cacheSource"]): Promise<ActorHostHandle> {
         const route = (await sandbox.tunnels())[hostPort]?.url
         if (!route) throw new Error("Modal did not create the durable-object HTTP/2 tunnel")
-        const hostId = `host.v1.${request.namespaceId}.${randomUUID()}`
-        const sessionId = randomUUID()
-        const executorSocket = "/tmp/durable-object-executor.sock"
-        const readyFile = "/tmp/durable-object-ready"
-        const environment = {
-            DURABLE_OBJECT_PROCESS_ROLE: "host",
-            DURABLE_OBJECT_CREDENTIAL: credential,
-            DURABLE_OBJECT_CREDENTIALS_URL: this.options.credentialsUrl,
-            DURABLE_OBJECT_CONTROL_PLANE_URL: this.options.controlPlaneUrl,
-            DURABLE_OBJECT_JWT_ISSUER: this.options.jwtIssuer ?? "durable-object-control-plane",
-            DURABLE_OBJECT_INVOKE_JWT_AUDIENCE: this.options.invokeAudience ?? "durable-object-invoke",
-            DURABLE_OBJECT_HOST_ID: hostId,
-            DURABLE_OBJECT_SESSION_ID: sessionId,
-            DURABLE_OBJECT_REGION: request.canonicalRegion,
-            DURABLE_OBJECT_CODE_REVISION: request.codeRevision,
-            DURABLE_OBJECT_LOCAL_ROOT: `${cacheMount}/runtime`,
-            DURABLE_OBJECT_EXECUTOR_SOCKET: executorSocket,
-            DURABLE_OBJECT_HOST_READY_FILE: readyFile,
-            DURABLE_OBJECT_HOST_BIND: `0.0.0.0:${hostPort}`,
-            DURABLE_OBJECT_HOST_ROUTE: route,
-            ...(actorEntrypoint ? { DURABLE_OBJECT_ENTRYPOINT: actorEntrypoint } : {})
-        }
-        const process = await sandbox.exec([this.binaryPath], { workdir: workingDirectory, env: environment, stdout: "pipe", stderr: "pipe" })
-        void process.wait().catch(() => undefined)
+        await writeFile(sandbox, hostRouteFile, route)
         const ready = await sandbox.exec(["sh", "-c", `for i in $(seq 1 1200); do test -f ${readyFile} && exit 0; sleep 0.05; done; exit 1`], { stdout: "pipe", stderr: "pipe" })
         if ((await ready.wait()) !== 0) {
             await sandbox.terminate()
             throw new Error("durable-object host did not become ready")
         }
-        return { hostId, route, canonicalRegion: request.canonicalRegion, cacheSource: "volume" }
+        return { hostId: request.hostId, route, canonicalRegion: request.canonicalRegion, cacheSource }
+    }
+}
+
+function hostEnvironment(request: EnsureHostRequest): Record<string, string> {
+    return {
+        DURABLE_OBJECT_PROCESS_ROLE: "host",
+        DURABLE_OBJECT_HOST_TOKEN: request.hostToken,
+        DURABLE_OBJECT_JWT_PUBLIC_KEYS: request.jwtPublicKeys,
+        DURABLE_OBJECT_NAMESPACE_ID: request.namespaceId,
+        DURABLE_OBJECT_CONTROL_PLANE_URL: request.controlPlaneUrl,
+        DURABLE_OBJECT_JWT_ISSUER: request.jwtIssuer,
+        DURABLE_OBJECT_INVOKE_JWT_AUDIENCE: request.invocationJwtAudience,
+        DURABLE_OBJECT_HOST_ID: request.hostId,
+        DURABLE_OBJECT_SESSION_ID: request.sessionId,
+        DURABLE_OBJECT_REGION: request.canonicalRegion,
+        DURABLE_OBJECT_CODE_REVISION: request.codeRevision,
+        DURABLE_OBJECT_LOCAL_ROOT: `${cacheMount}/runtime`,
+        DURABLE_OBJECT_EXECUTOR_SOCKET: "/tmp/durable-object-executor.sock",
+        DURABLE_OBJECT_HOST_READY_FILE: readyFile,
+        DURABLE_OBJECT_HOST_BIND: `0.0.0.0:${hostPort}`,
+        DURABLE_OBJECT_ACTOR_IDLE_TIMEOUT_MS: String(request.actorIdleTimeoutMs),
+        DURABLE_OBJECT_HOST_IDLE_TIMEOUT_MS: String(request.hostIdleTimeoutMs),
+        ...(request.actorEntrypoint ? { DURABLE_OBJECT_ENTRYPOINT: request.actorEntrypoint } : {})
+    }
+}
+
+function validateEnsureRequest(request: EnsureHostRequest): void {
+    if (!request.hostId.startsWith(`host.v1.${request.namespaceId}.`)) throw new Error("host ID does not belong to its namespace")
+    if (!Number.isInteger(request.actorIdleTimeoutMs) || request.actorIdleTimeoutMs <= 0 || request.actorIdleTimeoutMs > maximumSandboxLifetimeMs) {
+        throw new Error("actor idle timeout is invalid")
+    }
+    if (!Number.isInteger(request.hostIdleTimeoutMs) || request.hostIdleTimeoutMs <= 0 || request.hostIdleTimeoutMs > maximumSandboxLifetimeMs) {
+        throw new Error("host idle timeout is invalid")
     }
 }
 
@@ -185,8 +207,12 @@ async function runtimePlacement(sandbox: Sandbox): Promise<{ cloud?: string; reg
 }
 
 async function writeMetadata(sandbox: Sandbox, handle: ActorHostHandle): Promise<void> {
-    const file = await sandbox.open("/tmp/durable-object-host.json", "w")
-    await file.write(new TextEncoder().encode(JSON.stringify(handle)))
+    await writeFile(sandbox, "/tmp/durable-object-host.json", JSON.stringify(handle))
+}
+
+async function writeFile(sandbox: Sandbox, path: string, contents: string): Promise<void> {
+    const file = await sandbox.open(path, "w")
+    await file.write(new TextEncoder().encode(contents))
     await file.flush()
     await file.close()
 }

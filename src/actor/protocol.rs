@@ -159,6 +159,13 @@ impl ActorInvocationFailure {
         }
     }
 
+    pub(crate) fn resource_exhausted_before_execution() -> Self {
+        Self {
+            code: "resource_exhausted".into(),
+            message: "actor already has 32 queued invocations".into(),
+        }
+    }
+
     pub(crate) fn deadline_exceeded_while_waiting() -> Self {
         Self {
             code: "deadline_exceeded".into(),
@@ -186,6 +193,7 @@ pub enum ActorExecutionResult {
     Completed { result: Value },
     Failed { failure: ActorInvocationFailure },
     Reroute,
+    HostUnavailable,
 }
 
 #[cfg(test)]

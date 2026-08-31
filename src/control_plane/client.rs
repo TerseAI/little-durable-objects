@@ -227,7 +227,15 @@ impl HostLeaseStore for ControlPlaneClient {
             })
             .await?
         {
-            ControlPlaneCommandReply::Lease { lease } => Ok(lease),
+            ControlPlaneCommandReply::Lease {
+                lease,
+                replacement_token,
+            } => {
+                if let Some(token) = replacement_token {
+                    self.replace_token(&token)?;
+                }
+                Ok(lease)
+            }
             reply => anyhow::bail!("unexpected register-lease reply: {reply:?}"),
         }
     }

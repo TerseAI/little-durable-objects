@@ -1,9 +1,3 @@
-//! Multi-region archival, checkpointing, and safe Rapid garbage collection.
-//!
-//! A supervisor runs this worker separately from sandbox request handling. One pass
-//! archives closed Rapid generations, creates an eligible checkpoint, then deletes
-//! closed Rapid generations covered by Standard multi-region recovery data.
-
 use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, ensure};

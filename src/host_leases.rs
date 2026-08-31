@@ -1,5 +1,3 @@
-//! Authoritative storage for actor-host leases.
-
 mod local;
 mod postgres;
 

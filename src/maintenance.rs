@@ -1,5 +1,3 @@
-//! Lifecycle for the separately supervised durability-maintenance process.
-
 use std::{
     collections::HashMap,
     env,

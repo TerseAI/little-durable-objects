@@ -4,12 +4,30 @@ use std::{
 };
 
 use anyhow::Result;
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 
 use super::ActorStorageKey;
 
+const MAX_ADMITTED_INVOCATIONS_PER_ACTOR: usize = 33;
+
 pub struct ActorExecutionLocks {
-    locks: Mutex<HashMap<ActorStorageKey, Weak<AsyncMutex<()>>>>,
+    locks: Mutex<HashMap<ActorStorageKey, Weak<ActorExecutionGate>>>,
+}
+
+pub enum ActorExecutionAdmission {
+    Acquired(ActorExecutionGuard),
+    Full,
+}
+
+pub struct ActorExecutionGuard {
+    _gate: Arc<ActorExecutionGate>,
+    _execution: OwnedMutexGuard<()>,
+    _admission: OwnedSemaphorePermit,
+}
+
+struct ActorExecutionGate {
+    execution: Arc<AsyncMutex<()>>,
+    admissions: Arc<Semaphore>,
 }
 
 impl ActorExecutionLocks {
@@ -19,27 +37,45 @@ impl ActorExecutionLocks {
         }
     }
 
-    pub async fn acquire(&self, storage_key: &ActorStorageKey) -> Result<OwnedMutexGuard<()>> {
-        let execution = {
-            let mut locks = self
-                .locks
-                .lock()
-                .map_err(|_| anyhow::anyhow!("actor execution-lock map poisoned"))?;
-
-            // The map holds only weak references, so inactive actor keys do not retain
-            // mutexes forever. Clear their stale entries while the map is already locked.
-            locks.retain(|_, execution| execution.strong_count() > 0);
-
-            match locks.get(storage_key).and_then(Weak::upgrade) {
-                Some(execution) => execution,
-                None => {
-                    let execution = Arc::new(AsyncMutex::new(()));
-                    locks.insert(storage_key.clone(), Arc::downgrade(&execution));
-                    execution
-                }
-            }
+    pub async fn admit(&self, storage_key: &ActorStorageKey) -> Result<ActorExecutionAdmission> {
+        let gate = self.gate(storage_key)?;
+        let admission = match gate.admissions.clone().try_acquire_owned() {
+            Ok(admission) => admission,
+            Err(_) => return Ok(ActorExecutionAdmission::Full),
         };
+        let execution = gate.execution.clone().lock_owned().await;
+        Ok(ActorExecutionAdmission::Acquired(ActorExecutionGuard {
+            _gate: gate,
+            _execution: execution,
+            _admission: admission,
+        }))
+    }
 
-        Ok(execution.lock_owned().await)
+    #[cfg(test)]
+    pub async fn acquire(&self, storage_key: &ActorStorageKey) -> Result<ActorExecutionGuard> {
+        match self.admit(storage_key).await? {
+            ActorExecutionAdmission::Acquired(guard) => Ok(guard),
+            ActorExecutionAdmission::Full => anyhow::bail!("actor execution queue is full"),
+        }
+    }
+
+    fn gate(&self, storage_key: &ActorStorageKey) -> Result<Arc<ActorExecutionGate>> {
+        let mut locks = self
+            .locks
+            .lock()
+            .map_err(|_| anyhow::anyhow!("actor execution-lock map poisoned"))?;
+
+        locks.retain(|_, gate| gate.strong_count() > 0);
+        Ok(match locks.get(storage_key).and_then(Weak::upgrade) {
+            Some(gate) => gate,
+            None => {
+                let gate = Arc::new(ActorExecutionGate {
+                    execution: Arc::new(AsyncMutex::new(())),
+                    admissions: Arc::new(Semaphore::new(MAX_ADMITTED_INVOCATIONS_PER_ACTOR)),
+                });
+                locks.insert(storage_key.clone(), Arc::downgrade(&gate));
+                gate
+            }
+        })
     }
 }

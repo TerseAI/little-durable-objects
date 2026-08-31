@@ -1,17 +1,3 @@
-//! Zonal LTX persistence in a GCS Rapid appendable object.
-//!
-//! Every ownership epoch is split into bounded append-only log generations.
-//! Individual commit bundles remain logically immutable records inside a log, while one warm
-//! `BidiWriteObject` stream avoids an object creation for every SQLite commit.
-//!
-//! PostgreSQL remains authoritative: callers advance the manifest only after
-//! `flush()` returns the persisted offset. Bytes beyond the PostgreSQL tip are
-//! therefore harmless after an ambiguous write or a fenced manifest CAS.
-//!
-//! A separately supervised durability worker finalizes closed generations, copies
-//! them to multi-region archive storage, and advances PostgreSQL watermarks before garbage
-//! collection.
-
 use std::{
     collections::{HashMap, VecDeque},
     ops::Range,

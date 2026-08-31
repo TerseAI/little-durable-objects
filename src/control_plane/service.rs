@@ -7,22 +7,30 @@ use crate::{
     actor_state::ActorStorageKey,
     durability::{ActorDurabilityStore, VersionedActorManifest},
     grpc::proto::{
-        ControlPlaneReply, ControlPlaneRequest, ResolveActorHostRequest, ResolvedActorHost,
+        ControlPlaneReply, ControlPlaneRequest, EnsureNamespaceReply, EnsureNamespaceRequest,
+        GetJwksReply, GetJwksRequest, IssueWorkflowTokenReply, IssueWorkflowTokenRequest,
+        RegisterLaunchSpecReply, RegisterLaunchSpecRequest, ResolveActorHostRequest,
+        ResolvedActorHost,
+        actor_admin_service_server::{ActorAdminService, ActorAdminServiceServer},
         actor_control_plane_service_server::{
             ActorControlPlaneService, ActorControlPlaneServiceServer,
         },
     },
     host::{ActorProcessRole, HostId},
     host_leases::HostLeaseStore,
-    sandbox::{EnsureHostRequest, SandboxProvider},
+    sandbox::{EnsureHostRequest, HostSandboxRuntimeConfig, SandboxProvider},
     telemetry::{ActorTelemetry, noop_actor_telemetry},
 };
 
 use super::{
     MAX_CONTROL_PLANE_MESSAGE_BYTES,
+    admin::{AdminRegistry, HostLaunchSpec},
     auth::{ActorJwtVerifier, ActorPrincipal},
+    issuer::ActorJwtIssuer,
     protocol::{ControlPlaneCommand, ControlPlaneCommandReply, decode_command, encode_reply},
 };
+
+const HOST_TOKEN_RENEWAL_WINDOW_SECONDS: i64 = 10 * 60;
 
 /// Stateless ownership and durability gateway. Any replica can serve any request;
 /// host reachability lives in the lease store and actor bytes live in the configured
@@ -34,6 +42,15 @@ pub struct ControlPlaneService {
     auth: ActorJwtVerifier,
     telemetry: Arc<dyn ActorTelemetry>,
     sandbox_provider: Option<Arc<dyn SandboxProvider>>,
+    sandbox_runtime: Option<HostSandboxRuntimeConfig>,
+    admin: Option<AdminDependencies>,
+}
+
+#[derive(Clone)]
+struct AdminDependencies {
+    token: String,
+    registry: Arc<dyn AdminRegistry>,
+    issuer: ActorJwtIssuer,
 }
 
 impl ControlPlaneService {
@@ -48,6 +65,8 @@ impl ControlPlaneService {
             auth,
             telemetry: noop_actor_telemetry(),
             sandbox_provider: None,
+            sandbox_runtime: None,
+            admin: None,
         }
     }
 
@@ -61,10 +80,37 @@ impl ControlPlaneService {
         self
     }
 
+    pub fn with_sandbox_runtime(mut self, runtime: HostSandboxRuntimeConfig) -> Self {
+        self.sandbox_runtime = Some(runtime);
+        self
+    }
+
+    pub fn with_admin(
+        mut self,
+        token: String,
+        registry: Arc<dyn AdminRegistry>,
+        issuer: ActorJwtIssuer,
+    ) -> Result<Self> {
+        ensure!(
+            !token.is_empty() && token.trim() == token,
+            "DURABLE_OBJECT_ADMIN_TOKEN must be non-empty without surrounding whitespace"
+        );
+        self.admin = Some(AdminDependencies {
+            token,
+            registry,
+            issuer,
+        });
+        Ok(self)
+    }
+
     pub fn into_service(self) -> ActorControlPlaneServiceServer<Self> {
         ActorControlPlaneServiceServer::new(self)
             .max_decoding_message_size(MAX_CONTROL_PLANE_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_CONTROL_PLANE_MESSAGE_BYTES)
+    }
+
+    pub fn into_admin_service(self) -> ActorAdminServiceServer<Self> {
+        ActorAdminServiceServer::new(self)
     }
 
     async fn execute_command(
@@ -84,8 +130,36 @@ impl ControlPlaneService {
                     "lease session does not match the authenticated host session"
                 );
                 validate_host_route(&request.route)?;
+                let lease = self.leases.register(&request).await?;
+                let replacement_token = if principal.expires_at.saturating_sub(unix_seconds()?)
+                    <= HOST_TOKEN_RENEWAL_WINDOW_SECONDS
+                {
+                    let admin = self
+                        .admin
+                        .as_ref()
+                        .context("system JWT issuer is not configured")?;
+                    let code_revision = principal
+                        .code_revision
+                        .as_deref()
+                        .context("host token is missing its code revision")?;
+                    Some(
+                        admin
+                            .issuer
+                            .issue_host(
+                                &principal.scope.namespace_id,
+                                &principal.host_id,
+                                &principal.session_id,
+                                code_revision,
+                                &principal.region,
+                            )?
+                            .token,
+                    )
+                } else {
+                    None
+                };
                 Ok(ControlPlaneCommandReply::Lease {
-                    lease: self.leases.register(&request).await?,
+                    lease,
+                    replacement_token,
                 })
             }
             ControlPlaneCommand::GetLeaseStatus { host_id } => {
@@ -243,13 +317,52 @@ impl ControlPlaneService {
             .code_revision
             .as_ref()
             .context("workflow credential is missing its code revision")?;
+        let admin = self
+            .admin
+            .as_ref()
+            .context("admin registry is not configured")?;
+        let spec = admin
+            .registry
+            .launch_spec(&principal.scope.namespace_id, code_revision)
+            .await?
+            .context("no launch spec is registered for this namespace and revision")?;
+        let runtime = self
+            .sandbox_runtime
+            .as_ref()
+            .context("sandbox runtime configuration is missing")?;
+        let host_id = HostId::new(format!(
+            "host.v1.{}.{}",
+            principal.scope.namespace_id,
+            uuid::Uuid::new_v4()
+        ));
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let host_token = admin
+            .issuer
+            .issue_host(
+                &principal.scope.namespace_id,
+                &host_id,
+                &session_id,
+                code_revision,
+                target_region,
+            )?
+            .token;
         let provisioned = provider
             .ensure_host(&EnsureHostRequest {
                 namespace_id: principal.scope.namespace_id.clone(),
-                principal_id: principal.host_id.as_str().to_owned(),
-                credential_id: principal.token_id.clone(),
                 code_revision: code_revision.clone(),
                 canonical_region: target_region.to_owned(),
+                host_id: host_id.clone(),
+                session_id,
+                host_token,
+                jwt_public_keys: admin.issuer.verifier_keys_json()?,
+                control_plane_url: runtime.control_plane_url.clone(),
+                jwt_issuer: runtime.jwt_issuer.clone(),
+                invocation_jwt_audience: runtime.invocation_jwt_audience.clone(),
+                modal_image_id: spec.modal_image_id,
+                working_directory: spec.working_directory,
+                actor_entrypoint: spec.actor_entrypoint,
+                actor_idle_timeout_ms: runtime.actor_idle_timeout_ms,
+                host_idle_timeout_ms: runtime.host_idle_timeout_ms,
             })
             .await?;
         principal.validate_namespace_host_id(provisioned.host_id.as_str())?;
@@ -272,6 +385,141 @@ impl ControlPlaneService {
         );
         Ok(ResolvedActorHost { route: lease.route })
     }
+}
+
+#[tonic::async_trait]
+impl ActorAdminService for ControlPlaneService {
+    async fn ensure_namespace(
+        &self,
+        request: Request<EnsureNamespaceRequest>,
+    ) -> Result<Response<EnsureNamespaceReply>, Status> {
+        let admin = self.authenticate_admin(&request)?;
+        let created = admin
+            .registry
+            .ensure_namespace(&request.get_ref().namespace_id)
+            .await
+            .map_err(admin_error)?;
+        Ok(Response::new(EnsureNamespaceReply { created }))
+    }
+
+    async fn register_launch_spec(
+        &self,
+        request: Request<RegisterLaunchSpecRequest>,
+    ) -> Result<Response<RegisterLaunchSpecReply>, Status> {
+        let admin = self.authenticate_admin(&request)?;
+        let request = request.into_inner();
+        let created = admin
+            .registry
+            .register_launch_spec(&HostLaunchSpec {
+                namespace_id: request.namespace_id,
+                code_revision: request.code_revision,
+                modal_image_id: request.modal_image_id,
+                working_directory: request.working_directory,
+                actor_entrypoint: request.actor_entrypoint,
+            })
+            .await
+            .map_err(admin_error)?;
+        Ok(Response::new(RegisterLaunchSpecReply { created }))
+    }
+
+    async fn issue_workflow_token(
+        &self,
+        request: Request<IssueWorkflowTokenRequest>,
+    ) -> Result<Response<IssueWorkflowTokenReply>, Status> {
+        let admin = self.authenticate_admin(&request)?;
+        let request = request.into_inner();
+        if admin
+            .registry
+            .launch_spec(&request.namespace_id, &request.code_revision)
+            .await
+            .map_err(admin_error)?
+            .is_none()
+        {
+            return Err(Status::failed_precondition(
+                "no launch spec is registered for this namespace and revision",
+            ));
+        }
+        validate_workflow_token_request(&request).map_err(admin_error)?;
+        let issued = admin
+            .issuer
+            .issue_workflow(
+                &request.namespace_id,
+                &request.execution_id,
+                &request.code_revision,
+                &request.region,
+                request.deadline_unix_ms,
+            )
+            .map_err(admin_error)?;
+        Ok(Response::new(IssueWorkflowTokenReply {
+            token: issued.token,
+            expires_at_ms: issued.expires_at_ms,
+        }))
+    }
+
+    async fn get_jwks(
+        &self,
+        _request: Request<GetJwksRequest>,
+    ) -> Result<Response<GetJwksReply>, Status> {
+        let admin = self
+            .admin
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("admin service is not configured"))?;
+        Ok(Response::new(GetJwksReply {
+            jwks_json: admin.issuer.jwks_json().map_err(internal)?,
+        }))
+    }
+}
+
+impl ControlPlaneService {
+    fn authenticate_admin<T>(&self, request: &Request<T>) -> Result<&AdminDependencies, Status> {
+        let admin = self
+            .admin
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("admin service is not configured"))?;
+        let authorization = request
+            .metadata()
+            .get("authorization")
+            .ok_or_else(|| Status::unauthenticated("admin credential is required"))?
+            .to_str()
+            .map_err(|_| Status::unauthenticated("admin credential is invalid"))?;
+        let token = authorization.strip_prefix("Bearer ").ok_or_else(|| {
+            Status::unauthenticated("admin credential must use Bearer authentication")
+        })?;
+        if !bool::from(subtle::ConstantTimeEq::ct_eq(
+            token.as_bytes(),
+            admin.token.as_bytes(),
+        )) {
+            return Err(Status::unauthenticated("admin credential is invalid"));
+        }
+        Ok(admin)
+    }
+}
+
+fn validate_workflow_token_request(request: &IssueWorkflowTokenRequest) -> Result<()> {
+    ensure!(
+        !request.execution_id.is_empty() && request.execution_id.len() <= 255,
+        "workflow execution ID must contain between 1 and 255 bytes"
+    );
+    ensure!(
+        !request.region.is_empty()
+            && request.region.len() <= 64
+            && request.region.bytes().all(|byte| byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'.' | b'_' | b'-')),
+        "workflow region is invalid"
+    );
+    Ok(())
+}
+
+fn admin_error(error: impl std::fmt::Display) -> Status {
+    Status::failed_precondition(error.to_string())
+}
+
+fn unix_seconds() -> Result<i64> {
+    let duration = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?;
+    i64::try_from(duration.as_secs()).context("system clock exceeds supported JWT range")
 }
 
 #[tonic::async_trait]
@@ -341,9 +589,13 @@ mod tests {
         rand::SystemRandom,
         signature::{Ed25519KeyPair, KeyPair},
     };
-    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use base64::{
+        Engine,
+        engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    };
     use tempfile::TempDir;
 
+    use crate::control_plane::{ActorTokenPurpose, LocalAdminRegistry};
     use crate::{
         actor::ActorScope,
         actor_state::ActorStorageKey,
@@ -360,7 +612,8 @@ mod tests {
     use super::*;
 
     struct RecordingProvisioner {
-        provisioned: ActorHostHandle,
+        route: String,
+        leases: Arc<LocalHostLeaseStore>,
         regions: Mutex<Vec<String>>,
     }
 
@@ -371,7 +624,20 @@ mod tests {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("activation recorder poisoned"))?
                 .push(request.canonical_region.clone());
-            Ok(self.provisioned.clone())
+            self.leases
+                .register(&HostLeaseRequest {
+                    id: request.host_id.clone(),
+                    session_id: request.session_id.clone(),
+                    route: self.route.clone(),
+                    duration_ms: 60_000,
+                })
+                .await?;
+            Ok(ActorHostHandle {
+                host_id: request.host_id.clone(),
+                route: self.route.clone(),
+                canonical_region: request.canonical_region.clone(),
+                cache_source: CacheSource::DurableStorage,
+            })
         }
     }
 
@@ -400,17 +666,55 @@ mod tests {
         )
     }
 
+    fn test_issuer() -> Result<ActorJwtIssuer> {
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())?;
+        ActorJwtIssuer::from_base64_pkcs8(
+            &STANDARD.encode(pkcs8.as_ref()),
+            "test-key",
+            "durable-object-control-plane",
+            "durable-object-authority",
+            "durable-object-invoke",
+            Duration::from_secs(1_800),
+        )
+    }
+
+    async fn with_test_provisioning(
+        base: ControlPlaneService,
+        provider: Arc<dyn SandboxProvider>,
+    ) -> Result<ControlPlaneService> {
+        let registry = Arc::new(LocalAdminRegistry::default());
+        registry.ensure_namespace("namespace-1").await?;
+        registry
+            .register_launch_spec(&HostLaunchSpec {
+                namespace_id: "namespace-1".into(),
+                code_revision: "revision-1".into(),
+                modal_image_id: "im-test".into(),
+                working_directory: "/workspace".into(),
+                actor_entrypoint: Some("src/durable-objects.ts".into()),
+            })
+            .await?;
+        base.with_sandbox_provider(provider)
+            .with_sandbox_runtime(HostSandboxRuntimeConfig {
+                control_plane_url: "https://control-plane.example.com/".into(),
+                jwt_issuer: "durable-object-control-plane".into(),
+                invocation_jwt_audience: "durable-object-invoke".into(),
+                actor_idle_timeout_ms: 60_000,
+                host_idle_timeout_ms: 300_000,
+            })
+            .with_admin("admin-token".into(), registry, test_issuer()?)
+    }
+
     fn principal(node: &str, session: &str) -> ActorPrincipal {
         ActorPrincipal {
             scope: ActorScope {
                 namespace_id: "namespace-1".into(),
             },
-            token_id: "project-token-1".into(),
             host_id: HostId::new(node),
             session_id: session.into(),
             process_role: ActorProcessRole::Host,
             region: "default".into(),
             code_revision: None,
+            expires_at: i64::MAX,
         }
     }
 
@@ -454,6 +758,95 @@ mod tests {
                 },
             )
             .await?;
+        Ok(())
+    }
+
+    fn admin_request<T>(value: T) -> Result<Request<T>> {
+        let mut request = Request::new(value);
+        request.metadata_mut().insert(
+            "authorization",
+            "Bearer admin-token".parse().context("admin metadata")?,
+        );
+        Ok(request)
+    }
+
+    #[tokio::test]
+    async fn admin_credential_registers_a_project_and_issues_its_single_workflow_jwt() -> Result<()>
+    {
+        let root = TempDir::new()?;
+        let store = Arc::new(LocalActorStore::new(root.path().join("objects")));
+        let leases = Arc::new(LocalHostLeaseStore::new(root.path().join("leases")).await?);
+        let registry = Arc::new(LocalAdminRegistry::default());
+        let issuer = test_issuer()?;
+        let service = ControlPlaneService::new(store, leases, test_verifier()?).with_admin(
+            "admin-token".into(),
+            registry,
+            issuer.clone(),
+        )?;
+
+        let unauthenticated = service
+            .ensure_namespace(Request::new(EnsureNamespaceRequest {
+                namespace_id: "project-1".into(),
+            }))
+            .await
+            .expect_err("admin RPCs must require the backend credential");
+        assert_eq!(unauthenticated.code(), tonic::Code::Unauthenticated);
+
+        let ensured = service
+            .ensure_namespace(admin_request(EnsureNamespaceRequest {
+                namespace_id: "project-1".into(),
+            })?)
+            .await?
+            .into_inner();
+        assert!(ensured.created);
+        let registered = service
+            .register_launch_spec(admin_request(RegisterLaunchSpecRequest {
+                namespace_id: "project-1".into(),
+                code_revision: "revision-1".into(),
+                modal_image_id: "im-actor".into(),
+                working_directory: "/workspace".into(),
+                actor_entrypoint: Some("src/durable-objects.ts".into()),
+            })?)
+            .await?
+            .into_inner();
+        assert!(registered.created);
+        let issued = service
+            .issue_workflow_token(admin_request(IssueWorkflowTokenRequest {
+                namespace_id: "project-1".into(),
+                execution_id: "execution-1".into(),
+                code_revision: "revision-1".into(),
+                region: "north-america-east".into(),
+                deadline_unix_ms: unix_seconds()?.saturating_mul(1_000) + 60_000,
+            })?)
+            .await?
+            .into_inner();
+
+        let keys = issuer.verifier_keys_json()?;
+        for (audience, purpose) in [
+            ("durable-object-authority", ActorTokenPurpose::ControlPlane),
+            ("durable-object-invoke", ActorTokenPurpose::Invocation),
+        ] {
+            let verifier = ActorJwtVerifier::for_scope(
+                &keys,
+                "durable-object-control-plane",
+                audience,
+                purpose,
+                Duration::from_secs(1_800),
+            )?;
+            let mut request = Request::new(());
+            request.metadata_mut().insert(
+                "authorization",
+                format!("Bearer {}", issued.token)
+                    .parse()
+                    .context("workflow metadata")?,
+            );
+            let principal = verifier
+                .authenticate(&request)
+                .await
+                .map_err(|status| anyhow::anyhow!(status.to_string()))?;
+            assert_eq!(principal.scope.namespace_id, "project-1");
+            assert_eq!(principal.process_role, ActorProcessRole::Workflow);
+        }
         Ok(())
     }
 
@@ -648,25 +1041,13 @@ mod tests {
         let root = TempDir::new()?;
         let store = Arc::new(LocalActorStore::new(root.path().join("objects")));
         let leases = Arc::new(LocalHostLeaseStore::new(root.path().join("leases")).await?);
-        let host = ActorPrincipal {
-            region: "us-east".into(),
-            ..principal(
-                "host.v1.namespace-1.00000000-0000-4000-8000-000000000001",
-                "00000000-0000-4000-8000-000000000011",
-            )
-        };
-        let base = ControlPlaneService::new(store, leases, test_verifier()?);
-        register(&base, &host, 60_000).await?;
+        let base = ControlPlaneService::new(store, leases.clone(), test_verifier()?);
         let provisioner = Arc::new(RecordingProvisioner {
-            provisioned: ActorHostHandle {
-                host_id: host.host_id.clone(),
-                route: "https://actor-host.example.com".into(),
-                canonical_region: "us-east".into(),
-                cache_source: CacheSource::DurableStorage,
-            },
+            route: "https://actor-host.example.com".into(),
+            leases,
             regions: Mutex::new(Vec::new()),
         });
-        let service = base.with_sandbox_provider(provisioner.clone());
+        let service = with_test_provisioning(base, provisioner.clone()).await?;
 
         let resolved = service
             .resolve_actor_host(&caller("us-east"), resolve_request())
@@ -689,14 +1070,7 @@ mod tests {
                 "00000000-0000-4000-8000-000000000011",
             )
         };
-        let next_host = ActorPrincipal {
-            region: "eu-west".into(),
-            ..principal(
-                "host.v1.namespace-1.00000000-0000-4000-8000-000000000002",
-                "00000000-0000-4000-8000-000000000012",
-            )
-        };
-        let base = ControlPlaneService::new(store, leases, test_verifier()?);
+        let base = ControlPlaneService::new(store, leases.clone(), test_verifier()?);
         register(&base, &old_host, 50).await?;
         let ControlPlaneCommandReply::Claim {
             result: OwnershipClaimResult::Acquired(_),
@@ -714,17 +1088,12 @@ mod tests {
             anyhow::bail!("initial claim did not acquire the actor")
         };
         tokio::time::sleep(Duration::from_millis(60)).await;
-        register(&base, &next_host, 60_000).await?;
         let provisioner = Arc::new(RecordingProvisioner {
-            provisioned: ActorHostHandle {
-                host_id: next_host.host_id.clone(),
-                route: "https://actor-host.example.com".into(),
-                canonical_region: "eu-west".into(),
-                cache_source: CacheSource::DurableStorage,
-            },
+            route: "https://actor-host.example.com".into(),
+            leases,
             regions: Mutex::new(Vec::new()),
         });
-        let service = base.with_sandbox_provider(provisioner.clone());
+        let service = with_test_provisioning(base, provisioner.clone()).await?;
 
         let resolved = service
             .resolve_actor_host(&caller("us-east"), resolve_request())

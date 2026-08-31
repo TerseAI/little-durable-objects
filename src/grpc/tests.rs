@@ -52,6 +52,7 @@ fn protobuf_encodes_every_actor_result() -> Result<()> {
             },
         },
         ActorExecutionResult::Reroute,
+        ActorExecutionResult::HostUnavailable,
     ];
 
     for result in results {

@@ -75,6 +75,8 @@ pub(crate) enum ControlPlaneCommandReply {
     Unit,
     Lease {
         lease: HostLease,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replacement_token: Option<String>,
     },
     LeaseStatus {
         status: HostLeaseStatus,

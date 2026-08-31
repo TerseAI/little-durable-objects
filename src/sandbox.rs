@@ -1,29 +1,34 @@
-//! Sandbox-provider boundary owned by the durable-object control plane.
-
-use std::time::Duration;
+use std::{collections::HashMap, process::Stdio, time::Duration};
 
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
-use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
+use tokio::{io::AsyncWriteExt, process::Command};
 
 use crate::host::HostId;
 
-const PROVIDER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const PROVIDER_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Provider-neutral request to start or reuse a regional actor host.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EnsureHostRequest {
     pub namespace_id: String,
-    pub principal_id: String,
-    pub credential_id: String,
     pub code_revision: String,
     pub canonical_region: String,
+    pub host_id: HostId,
+    pub session_id: String,
+    pub host_token: String,
+    pub jwt_public_keys: String,
+    pub control_plane_url: String,
+    pub jwt_issuer: String,
+    pub invocation_jwt_audience: String,
+    pub modal_image_id: String,
+    pub working_directory: String,
+    pub actor_entrypoint: Option<String>,
+    pub actor_idle_timeout_ms: u64,
+    pub host_idle_timeout_ms: u64,
 }
 
-/// A running host returned by a sandbox provider.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActorHostHandle {
@@ -33,7 +38,6 @@ pub struct ActorHostHandle {
     pub cache_source: CacheSource,
 }
 
-/// Describes how a host populated its local disposable SQLite cache.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CacheSource {
@@ -47,62 +51,121 @@ pub trait SandboxProvider: Send + Sync {
     async fn ensure_host(&self, request: &EnsureHostRequest) -> Result<ActorHostHandle>;
 }
 
-/// Protocol client for adapters implemented outside this Rust process. The first
-/// adapter is Modal/TypeScript; future adapters can implement the same endpoint.
-pub struct HttpSandboxProvider {
-    client: Client,
-    endpoint: Url,
-    credential: String,
+#[derive(Clone)]
+pub struct HostSandboxRuntimeConfig {
+    pub control_plane_url: String,
+    pub jwt_issuer: String,
+    pub invocation_jwt_audience: String,
+    pub actor_idle_timeout_ms: u64,
+    pub host_idle_timeout_ms: u64,
 }
 
-impl HttpSandboxProvider {
-    pub fn new(endpoint: impl AsRef<str>, credential: String) -> Result<Self> {
-        let endpoint = Url::parse(endpoint.as_ref())
-            .context("DURABLE_OBJECT_SANDBOX_PROVIDER_URL must be a valid URL")?;
+pub struct CommandSandboxProvider {
+    command: String,
+    environment: HashMap<String, String>,
+}
+
+impl CommandSandboxProvider {
+    pub fn new(
+        command: String,
+        modal_token_id: String,
+        modal_token_secret: String,
+    ) -> Result<Self> {
         ensure!(
-            matches!(endpoint.scheme(), "http" | "https"),
-            "DURABLE_OBJECT_SANDBOX_PROVIDER_URL must use HTTP or HTTPS"
+            !command.is_empty() && command.trim() == command,
+            "DURABLE_OBJECT_MODAL_COMMAND must be non-empty without surrounding whitespace"
         );
         ensure!(
-            !credential.is_empty() && credential.trim() == credential,
-            "DURABLE_OBJECT_SANDBOX_PROVIDER_TOKEN must be non-empty without surrounding whitespace"
+            !modal_token_id.is_empty() && modal_token_id.trim() == modal_token_id,
+            "MODAL_TOKEN_ID must be non-empty without surrounding whitespace"
         );
+        ensure!(
+            !modal_token_secret.is_empty() && modal_token_secret.trim() == modal_token_secret,
+            "MODAL_TOKEN_SECRET must be non-empty without surrounding whitespace"
+        );
+        let mut environment = HashMap::from([
+            ("MODAL_TOKEN_ID".into(), modal_token_id),
+            ("MODAL_TOKEN_SECRET".into(), modal_token_secret),
+        ]);
+        if let Ok(path) = std::env::var("PATH") {
+            environment.insert("PATH".into(), path);
+        }
         Ok(Self {
-            client: Client::builder()
-                .connect_timeout(PROVIDER_CONNECT_TIMEOUT)
-                .timeout(PROVIDER_REQUEST_TIMEOUT)
-                .build()
-                .context("configure sandbox-provider client")?,
-            endpoint,
-            credential,
+            command,
+            environment,
         })
+    }
+
+    async fn execute<Request: Serialize, Reply: for<'de> Deserialize<'de>>(
+        &self,
+        operation: &str,
+        request: &Request,
+    ) -> Result<Reply> {
+        let mut child = Command::new(&self.command)
+            .env_clear()
+            .envs(&self.environment)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("start bundled Modal command {:?}", self.command))?;
+        let document = serde_json::to_vec(&ProviderCommand { operation, request })?;
+        let mut stdin = child.stdin.take().context("open Modal command stdin")?;
+        stdin
+            .write_all(&document)
+            .await
+            .context("write Modal command request")?;
+        stdin
+            .shutdown()
+            .await
+            .context("close Modal command stdin")?;
+        drop(stdin);
+        let output = tokio::time::timeout(PROVIDER_REQUEST_TIMEOUT, child.wait_with_output())
+            .await
+            .context("bundled Modal command timed out")??;
+        ensure!(
+            output.status.success(),
+            "bundled Modal command failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        serde_json::from_slice(&output.stdout).context("decode bundled Modal command response")
     }
 }
 
+#[derive(Serialize)]
+struct ProviderCommand<'a, Request> {
+    operation: &'a str,
+    request: &'a Request,
+}
+
 #[async_trait]
-impl SandboxProvider for HttpSandboxProvider {
+impl SandboxProvider for CommandSandboxProvider {
     async fn ensure_host(&self, request: &EnsureHostRequest) -> Result<ActorHostHandle> {
-        let response = self
-            .client
-            .post(self.endpoint.clone())
-            .bearer_auth(&self.credential)
-            .json(request)
-            .send()
-            .await
-            .context("request a host from the configured sandbox provider")?
-            .error_for_status()
-            .context("sandbox provider rejected the host request")?
-            .json::<ActorHostHandle>()
-            .await
-            .context("decode sandbox-provider response")?;
+        let response: ActorHostHandle = self.execute("ensure_host", request).await?;
         ensure!(
             response.canonical_region == request.canonical_region,
-            "sandbox provider returned a host in the wrong canonical region"
+            "Modal command returned a host in the wrong canonical region"
         );
         ensure!(
             !response.host_id.as_str().is_empty() && !response.route.is_empty(),
-            "sandbox provider returned an invalid host"
+            "Modal command returned an invalid host"
         );
         Ok(response)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_ambiguous_command_configuration() {
+        assert!(CommandSandboxProvider::new("".into(), "id".into(), "secret".into()).is_err());
+        assert!(CommandSandboxProvider::new("modal".into(), "".into(), "secret".into()).is_err());
+        assert!(
+            CommandSandboxProvider::new("modal".into(), "id".into(), " secret".into()).is_err()
+        );
     }
 }

@@ -1,12 +1,12 @@
 import * as grpc from "@grpc/grpc-js"
 import assert from "node:assert/strict"
-import { createServer as createHttpServer } from "node:http"
-import type { AddressInfo } from "node:net"
 import { test } from "node:test"
+
+import { ActorInvocationError } from "../shared/errors.js"
 
 import { RemoteActorClient, actorGrpcProtocolForTests as protocol } from "./remoteClient.js"
 
-test("remote actor client resolves every invocation, invokes directly, and reroutes before execution", async () => {
+test("remote actor client uses one token and preserves its request ID across proven pre-execution retries", async () => {
     const requestIds: string[] = []
     const authorization: string[] = []
     let resolutions = 0
@@ -44,6 +44,10 @@ test("remote actor client resolves every invocation, invokes directly, and rerou
                 requestIds.push(requestId)
                 assert.deepEqual(JSON.parse((call.request.argsJson as Buffer).toString("utf8")), [2])
                 if (invocations === 1) {
+                    callback(null, { failed: { code: "host_unavailable", message: "host is draining" } })
+                    return
+                }
+                if (invocations === 2) {
                     callback(null, { reroute: {} })
                     return
                 }
@@ -55,46 +59,69 @@ test("remote actor client resolves every invocation, invokes directly, and rerou
     let grpcOrigin = ""
     const grpcPort = await bind(grpcServer)
     grpcOrigin = `http://127.0.0.1:${grpcPort}`
-    const tokenServer = createHttpServer((request, response) => {
-        assert.equal(request.method, "POST")
-        assert.equal(request.url, "/credentials")
-        assert.equal(request.headers.authorization, "Bearer bootstrap-credential")
-        response.writeHead(200, { "content-type": "application/json" })
-        response.end(
-            JSON.stringify({
-                namespaceId: "namespace-1",
-                processId: "workflow.v1.namespace-1.00000000-0000-4000-8000-000000000099",
-                sessionId: "00000000-0000-4000-8000-000000000099",
-                authorityToken: "authority-token",
-                invokeToken: "invoke-token",
-                expiresAtMs: Date.now() + 60_000
-            })
-        )
-    })
-    await new Promise<void>(resolve => tokenServer.listen(0, "127.0.0.1", resolve))
-    const tokenPort = (tokenServer.address() as AddressInfo).port
-
     RemoteActorClient.configure({
-        credential: "bootstrap-credential",
-        credentialsUrl: `http://127.0.0.1:${tokenPort}/credentials`,
+        token: "workflow-token",
+        namespaceId: "namespace-1",
         controlPlaneUrl: grpcOrigin,
-        codeRevision: "revision-1",
-        region: "us-east",
         invocationTimeoutMs: 5_000
     })
 
     try {
         assert.equal(await RemoteActorClient.getInstance().invoke("Counter", "counter-1", "increment", [2]), 7)
         assert.equal(await RemoteActorClient.getInstance().invoke("Counter", "counter-1", "increment", [2]), 7)
-        assert.equal(resolutions, 3)
-        assert.equal(invocations, 3)
+        assert.equal(resolutions, 4)
+        assert.equal(invocations, 4)
         assert.equal(requestIds[0], requestIds[1], "a routing retry must preserve the idempotency key")
-        assert.notEqual(requestIds[1], requestIds[2], "a separate invocation must use a new idempotency key")
-        assert.deepEqual(authorization, ["Bearer authority-token", "Bearer invoke-token", "Bearer authority-token", "Bearer invoke-token", "Bearer authority-token", "Bearer invoke-token"])
+        assert.equal(requestIds[1], requestIds[2], "every pre-execution retry must preserve the idempotency key")
+        assert.notEqual(requestIds[2], requestIds[3], "a separate invocation must use a new idempotency key")
+        assert.deepEqual(
+            authorization,
+            Array.from({ length: 8 }, () => "Bearer workflow-token")
+        )
     } finally {
         RemoteActorClient.resetForTests()
         grpcServer.forceShutdown()
-        await new Promise<void>((resolve, reject) => tokenServer.close(error => (error ? reject(error) : resolve())))
+    }
+})
+
+test("does not retry a transport failure after invocation dispatch", async () => {
+    let resolutions = 0
+    let invocations = 0
+    const grpcServer = new grpc.Server()
+    grpcServer.addService(
+        {
+            resolveActorHost: unaryDefinition("/durable_object.v1.ActorControlPlaneService/ResolveActorHost", protocol.resolveActorHostRequestType, protocol.resolvedActorHostType)
+        },
+        {
+            resolveActorHost(_call: grpc.ServerUnaryCall<Record<string, unknown>, Record<string, unknown>>, callback: grpc.sendUnaryData<Record<string, unknown>>) {
+                resolutions += 1
+                callback(null, { route: grpcOrigin })
+            }
+        }
+    )
+    grpcServer.addService(
+        {
+            invoke: unaryDefinition("/durable_object.v1.ActorHostService/Invoke", protocol.invokeActorRequestType, protocol.invokeActorReplyType)
+        },
+        {
+            invoke(_call: grpc.ServerUnaryCall<Record<string, unknown>, Record<string, unknown>>, callback: grpc.sendUnaryData<Record<string, unknown>>) {
+                invocations += 1
+                callback(serviceError(grpc.status.UNAVAILABLE, "connection was lost"))
+            }
+        }
+    )
+    let grpcOrigin = ""
+    const grpcPort = await bind(grpcServer)
+    grpcOrigin = `http://127.0.0.1:${grpcPort}`
+    RemoteActorClient.configure({ token: "workflow-token", namespaceId: "namespace-1", controlPlaneUrl: grpcOrigin, invocationTimeoutMs: 5_000 })
+
+    try {
+        await assert.rejects(RemoteActorClient.getInstance().invoke("Counter", "counter-1", "increment", [2]), error => error instanceof ActorInvocationError && error.code === "outcome_unknown")
+        assert.equal(resolutions, 1)
+        assert.equal(invocations, 1)
+    } finally {
+        RemoteActorClient.resetForTests()
+        grpcServer.forceShutdown()
     }
 })
 
@@ -117,5 +144,13 @@ function bind(server: grpc.Server): Promise<number> {
             if (error) reject(error)
             else resolve(port)
         })
+    })
+}
+
+function serviceError(code: grpc.status, message: string): grpc.ServiceError {
+    return Object.assign(new Error(message), {
+        code,
+        details: message,
+        metadata: new grpc.Metadata()
     })
 }

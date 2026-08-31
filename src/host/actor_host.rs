@@ -1,5 +1,3 @@
-//! Actor execution, ownership, and durability inside one host.
-
 use std::{
     future::Future,
     ops::Deref,
@@ -10,12 +8,12 @@ use std::{
 use crate::{
     actor::{
         ActorExecutionResult, ActorExecutor, ActorInvocation, ActorInvocationDeadline,
-        ActorInvocationFailure, ActorMethodCancellation, ActorMethodInvocation, ActorMethodOutcome,
-        ActorScope,
+        ActorInvocationFailure, ActorMethodCancellation, ActorMethodEviction,
+        ActorMethodInvocation, ActorMethodOutcome, ActorScope,
     },
     actor_state::{
-        ActorDatabaseStore, ActorExecutionLocks, ActorOwner, ActorRestoreCache, ActorStorageKey,
-        SqliteActorDatabase,
+        ActorDatabaseStore, ActorExecutionAdmission, ActorExecutionGuard, ActorExecutionLocks,
+        ActorOwner, ActorRestoreCache, ActorStorageKey, SqliteActorDatabase,
     },
     clock::{Clock, SystemClock},
     durability::{
@@ -31,7 +29,7 @@ use crate::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{OwnedMutexGuard, watch};
+use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
 use super::{ConfirmedLeaseState, HostEndpoint, HostId};
@@ -44,6 +42,7 @@ const DEFAULT_ACTOR_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) enum ActorDrainReason {
     Shutdown,
     LeaseLost,
+    Idle,
 }
 
 impl ActorDrainReason {
@@ -51,6 +50,7 @@ impl ActorDrainReason {
         match self {
             Self::Shutdown => "the actor host is shutting down",
             Self::LeaseLost => "the actor host lost its lease",
+            Self::Idle => "the actor host reached its idle timeout",
         }
     }
 }
@@ -112,7 +112,7 @@ enum ActorInvocationStep<T> {
 }
 
 struct ActorLockAdmission {
-    guard: OwnedMutexGuard<()>,
+    guard: ActorExecutionGuard,
     queue_wait_ms: f64,
     execution_started: Instant,
 }
@@ -287,6 +287,10 @@ impl ActorHost {
         }
     }
 
+    pub(crate) fn activity(&self) -> watch::Receiver<usize> {
+        self.actor_tasks.activity.subscribe()
+    }
+
     fn open_actor_database(&self, object: &ActorStorageKey) -> Result<SqliteActorDatabase> {
         self.databases.open(object)
     }
@@ -323,11 +327,11 @@ impl ActorHost {
         let task = match self.actor_tasks.start()? {
             ActorTaskAdmission::Start(task) => task,
             ActorTaskAdmission::Draining(reason) => {
-                return Ok(ActorExecutionResult::Failed {
-                    failure: ActorInvocationFailure::cancelled_before_execution(
-                        reason.description(),
-                    ),
-                });
+                debug!(
+                    ?reason,
+                    "rejected actor invocation because the host is draining"
+                );
+                return Ok(ActorExecutionResult::HostUnavailable);
             }
         };
         let host = self.clone();
@@ -481,11 +485,11 @@ impl ActorHost {
     ) -> Result<ActorInvocationStep<ActorLockAdmission>> {
         let queued_at = Instant::now();
         debug!("waiting for exclusive actor execution gate");
-        let guard =
-            match before_actor_execution(deadline, drain, self.execution_locks.acquire(object))
+        let admission =
+            match before_actor_execution(deadline, drain, self.execution_locks.admit(object))
                 .await?
             {
-                BeforeActorExecution::Completed(guard) => guard,
+                BeforeActorExecution::Completed(admission) => admission,
                 BeforeActorExecution::DeadlineExceeded => {
                     debug!("actor invocation expired in the execution queue");
                     return Ok(ActorInvocationStep::Complete(
@@ -498,6 +502,16 @@ impl ActorHost {
                     )));
                 }
             };
+        let guard = match admission {
+            ActorExecutionAdmission::Acquired(guard) => guard,
+            ActorExecutionAdmission::Full => {
+                return Ok(ActorInvocationStep::Complete(
+                    OwnershipGuardResult::Completed(ActorLocalResult::Failed {
+                        failure: ActorInvocationFailure::resource_exhausted_before_execution(),
+                    }),
+                ));
+            }
+        };
         let queue_wait_ms = queued_at.elapsed().as_secs_f64() * 1_000.0;
         debug!(queue_wait_ms, "acquired exclusive actor execution gate");
         Ok(ActorInvocationStep::Continue(ActorLockAdmission {
@@ -695,6 +709,11 @@ impl ActorHost {
             ActorMethodOutcome::Completed { result, state } => {
                 (ActorLocalResult::Completed { result }, Some(state))
             }
+            ActorMethodOutcome::Failed(failure) if failure.code == "resource_exhausted" => {
+                return Ok(ActorInvocationStep::Complete(
+                    OwnershipGuardResult::Completed(ActorLocalResult::Failed { failure }),
+                ));
+            }
             ActorMethodOutcome::Failed(failure) => (ActorLocalResult::Failed { failure }, None),
         };
         let initializes_state = state.is_none() && proposed_state.is_some();
@@ -819,6 +838,7 @@ impl ActorHost {
                 ),
             }
         }
+        self.evict_actor_instance(executor, &invocation.actor).await;
     }
 
     async fn persist_actor_invocation(
@@ -838,7 +858,9 @@ impl ActorHost {
         } = durability;
         if deadline.is_elapsed() {
             warn!("actor deadline expired after JavaScript completed but before durable staging");
-            return Ok(self.abandon_actor_with_unknown_outcome(object).await);
+            return Ok(self
+                .abandon_actor_with_unknown_outcome(object, &invocation.actor)
+                .await);
         }
         if let Err(error) =
             Self::stage_actor_transition(&database, invocation, &mut receipts, &execution)
@@ -847,17 +869,23 @@ impl ActorHost {
                 error = %format!("{:#}", error.context("stage actor state transition and idempotency receipt in SQLite")),
                 "actor execution completed but local durability staging failed"
             );
-            return Ok(self.abandon_actor_with_unknown_outcome(object).await);
+            return Ok(self
+                .abandon_actor_with_unknown_outcome(object, &invocation.actor)
+                .await);
         }
 
         let Some(captured) = self.capture_actor_transition(object, deadline).await else {
-            return Ok(self.abandon_actor_with_unknown_outcome(object).await);
+            return Ok(self
+                .abandon_actor_with_unknown_outcome(object, &invocation.actor)
+                .await);
         };
         let Some(published) = self
             .publish_actor_transition(object, &manifest, &captured.value, deadline)
             .await
         else {
-            return Ok(self.abandon_actor_with_unknown_outcome(object).await);
+            return Ok(self
+                .abandon_actor_with_unknown_outcome(object, &invocation.actor)
+                .await);
         };
         let checkpoint_ms = self
             .checkpoint_actor_transition(object, &captured.value, &published.value)
@@ -875,6 +903,9 @@ impl ActorHost {
             }
         }
         if !self.confirm_actor_ownership_after_publication().await {
+            if let Some(executor) = &self.actor_executor {
+                self.evict_actor_instance(executor, &invocation.actor).await;
+            }
             return Ok(OwnershipGuardResult::Completed(ActorLocalResult::Failed {
                 failure: ActorInvocationFailure::outcome_unknown_after_execution(),
             }));
@@ -1208,11 +1239,35 @@ impl ActorHost {
     async fn abandon_actor_with_unknown_outcome(
         &self,
         object: &ActorStorageKey,
+        actor: &crate::actor::ActorKey,
     ) -> OwnershipGuardResult<ActorLocalResult> {
         self.abandon_unpublished_actor_state(object).await;
+        if let Some(executor) = &self.actor_executor {
+            self.evict_actor_instance(executor, actor).await;
+        }
         OwnershipGuardResult::Completed(ActorLocalResult::Failed {
             failure: ActorInvocationFailure::outcome_unknown_after_execution(),
         })
+    }
+
+    async fn evict_actor_instance(
+        &self,
+        executor: &Arc<dyn ActorExecutor>,
+        actor: &crate::actor::ActorKey,
+    ) {
+        if let Err(error) = executor
+            .evict(ActorMethodEviction {
+                actor: actor.clone(),
+            })
+            .await
+        {
+            warn!(
+                actor_type = %actor.actor_type,
+                actor_id = %actor.actor_id,
+                error = %format!("{error:#}"),
+                "could not evict the resident actor instance"
+            );
+        }
     }
 
     async fn abandon_unpublished_actor_state(&self, object: &ActorStorageKey) {

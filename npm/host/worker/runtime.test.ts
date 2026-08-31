@@ -59,7 +59,7 @@ const forwarderIdentity = {
 const counterDefinition = registerActorClass(Counter)
 const forwarderDefinition = registerActorClass(Forwarder)
 
-test("executes one-shot actor classes from supplied durable state", async () => {
+test("keeps a successful actor instance resident and restores it after failure", async () => {
     const runtime = new ActorRuntime(counterDefinition)
     assert.deepEqual(
         await runtime.handle({
@@ -95,7 +95,7 @@ test("executes one-shot actor classes from supplied durable state", async () => 
             state: { count: 2 },
             timeout_ms: 30_000
         }),
-        { type: "invoked", result: 2, state: { count: 2 } }
+        { type: "invoked", result: 5, state: { count: 5 } }
     )
 
     assert.deepEqual(
@@ -108,7 +108,7 @@ test("executes one-shot actor classes from supplied durable state", async () => 
             state: { count: 2 },
             timeout_ms: 30_000
         }),
-        { type: "invoked", result: "counter-1", state: { count: 2 } }
+        { type: "invoked", result: "counter-1", state: { count: 5 } }
     )
 
     assert.deepEqual(
@@ -122,6 +122,18 @@ test("executes one-shot actor classes from supplied durable state", async () => 
             timeout_ms: 30_000
         }),
         { type: "failed", code: "actor_method_failed", message: "boom" }
+    )
+    assert.deepEqual(
+        await runtime.handle({
+            type: "invoke",
+            request_id: "request-6",
+            actor: actorIdentity,
+            method: "getCount",
+            args: [],
+            state: { count: 2 },
+            timeout_ms: 30_000
+        }),
+        { type: "invoked", result: 2, state: { count: 2 } }
     )
 })
 

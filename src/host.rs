@@ -1,6 +1,5 @@
 mod actor_host;
 mod confirmed_lease;
-mod credentials;
 mod lease_maintenance;
 mod leased_host;
 mod process;

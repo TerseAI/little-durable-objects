@@ -1,5 +1,3 @@
-//! Registration and renewal of one actor-host lease.
-
 use std::{
     sync::{
         Arc,

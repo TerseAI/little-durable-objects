@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use tonic::transport::Server;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::{
     durability::{
@@ -29,26 +29,31 @@ use super::{ActorJwtVerifier, CONTROL_PLANE_REQUEST_TIMEOUT, ControlPlaneService
 
 const DEFAULT_ACTOR_JWT_ISSUER: &str = "durable-object-control-plane";
 const DEFAULT_ACTOR_JWT_AUDIENCE: &str = "durable-object-authority";
+const DEFAULT_INVOCATION_JWT_AUDIENCE: &str = "durable-object-invoke";
 const DEFAULT_ACTOR_JWT_MAX_TTL_SECONDS: u64 = 1_800;
-const JWKS_INITIAL_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
-const JWKS_INITIAL_RETRY_DELAY: Duration = Duration::from_millis(250);
-const JWKS_MAX_RETRY_DELAY: Duration = Duration::from_secs(2);
-const JWKS_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const CONTROL_PLANE_HEALTH_INTERVAL: Duration = Duration::from_secs(60);
+const DEFAULT_ACTOR_IDLE_TIMEOUT_MS: u64 = 60_000;
+const DEFAULT_HOST_IDLE_TIMEOUT_MS: u64 = 300_000;
+const MAX_IDLE_TIMEOUT_MS: u64 = 86_400_000;
 
 pub struct ControlPlaneProcessConfig {
     pub bind: SocketAddr,
-    pub jwt_jwks_url: String,
+    pub jwt_signing_key: String,
+    pub jwt_key_id: String,
     pub jwt_issuer: String,
     pub jwt_audience: String,
+    pub invocation_jwt_audience: String,
     pub jwt_max_lifetime: std::time::Duration,
+    pub admin_token: String,
     pub storage: ControlPlaneStorageConfig,
     pub sandbox_provider: Option<SandboxProviderConfig>,
 }
 
 pub struct SandboxProviderConfig {
-    pub url: String,
-    pub secret: String,
+    pub command: String,
+    pub modal_token_id: String,
+    pub modal_token_secret: String,
+    pub runtime: crate::sandbox::HostSandboxRuntimeConfig,
 }
 
 pub enum ControlPlaneStorageConfig {
@@ -72,14 +77,14 @@ impl ControlPlaneProcessConfig {
             .unwrap_or_else(|| "127.0.0.1:7100".into())
             .parse()
             .context("DURABLE_OBJECT_CONTROL_PLANE_BIND must be a socket address")?;
-        let jwt_jwks_url = validated_http_url(
-            &required(&mut get, "DURABLE_OBJECT_JWKS_URL")?,
-            "DURABLE_OBJECT_JWKS_URL",
-        )?;
+        let jwt_signing_key = required(&mut get, "DURABLE_OBJECT_JWT_SIGNING_KEY")?;
+        let jwt_key_id = get("DURABLE_OBJECT_JWT_KEY_ID").unwrap_or_else(|| "primary".into());
         let jwt_issuer =
             get("DURABLE_OBJECT_JWT_ISSUER").unwrap_or_else(|| DEFAULT_ACTOR_JWT_ISSUER.into());
         let jwt_audience = get("DURABLE_OBJECT_AUTHORITY_JWT_AUDIENCE")
             .unwrap_or_else(|| DEFAULT_ACTOR_JWT_AUDIENCE.into());
+        let invocation_jwt_audience = get("DURABLE_OBJECT_INVOKE_JWT_AUDIENCE")
+            .unwrap_or_else(|| DEFAULT_INVOCATION_JWT_AUDIENCE.into());
         let jwt_max_lifetime = std::time::Duration::from_secs(
             get("DURABLE_OBJECT_JWT_MAX_TTL_SECONDS")
                 .map(|value| value.parse::<u64>())
@@ -90,6 +95,11 @@ impl ControlPlaneProcessConfig {
         ensure!(
             !jwt_max_lifetime.is_zero(),
             "DURABLE_OBJECT_JWT_MAX_TTL_SECONDS must be positive"
+        );
+        let admin_token = required(&mut get, "DURABLE_OBJECT_ADMIN_TOKEN")?;
+        ensure!(
+            admin_token.trim() == admin_token,
+            "DURABLE_OBJECT_ADMIN_TOKEN must not contain surrounding whitespace"
         );
         let storage = match get("DURABLE_OBJECT_STORAGE").as_deref().unwrap_or("rapid") {
             "local" => ControlPlaneStorageConfig::Local {
@@ -112,31 +122,46 @@ impl ControlPlaneProcessConfig {
             }
             backend => anyhow::bail!("unsupported DURABLE_OBJECT_STORAGE {backend:?}"),
         };
-        let sandbox_provider = match (
-            get("DURABLE_OBJECT_SANDBOX_PROVIDER_URL"),
-            get("DURABLE_OBJECT_SANDBOX_PROVIDER_TOKEN"),
-        ) {
-            (Some(url), Some(secret)) => {
-                ensure!(
-                    !secret.trim().is_empty() && secret.trim() == secret,
-                    "DURABLE_OBJECT_SANDBOX_PROVIDER_TOKEN must not be empty or contain surrounding whitespace"
-                );
+        let sandbox_provider = match (get("MODAL_TOKEN_ID"), get("MODAL_TOKEN_SECRET")) {
+            (Some(modal_token_id), Some(modal_token_secret)) => {
+                let control_plane_url = validated_http_url(
+                    &required(&mut get, "DURABLE_OBJECT_CONTROL_PLANE_URL")?,
+                    "DURABLE_OBJECT_CONTROL_PLANE_URL",
+                )?;
                 Some(SandboxProviderConfig {
-                    url: validated_http_url(&url, "DURABLE_OBJECT_SANDBOX_PROVIDER_URL")?,
-                    secret,
+                    command: get("DURABLE_OBJECT_MODAL_COMMAND")
+                        .unwrap_or_else(|| "terse-durable-objects-modal".into()),
+                    modal_token_id,
+                    modal_token_secret,
+                    runtime: crate::sandbox::HostSandboxRuntimeConfig {
+                        control_plane_url,
+                        jwt_issuer: jwt_issuer.clone(),
+                        invocation_jwt_audience: invocation_jwt_audience.clone(),
+                        actor_idle_timeout_ms: idle_timeout_ms(
+                            &mut get,
+                            "DURABLE_OBJECT_ACTOR_IDLE_TIMEOUT_MS",
+                            DEFAULT_ACTOR_IDLE_TIMEOUT_MS,
+                        )?,
+                        host_idle_timeout_ms: idle_timeout_ms(
+                            &mut get,
+                            "DURABLE_OBJECT_HOST_IDLE_TIMEOUT_MS",
+                            DEFAULT_HOST_IDLE_TIMEOUT_MS,
+                        )?,
+                    },
                 })
             }
             (None, None) => None,
-            _ => anyhow::bail!(
-                "DURABLE_OBJECT_SANDBOX_PROVIDER_URL and DURABLE_OBJECT_SANDBOX_PROVIDER_TOKEN must both be set"
-            ),
+            _ => anyhow::bail!("MODAL_TOKEN_ID and MODAL_TOKEN_SECRET must both be set"),
         };
         Ok(Self {
             bind,
-            jwt_jwks_url,
+            jwt_signing_key,
+            jwt_key_id,
             jwt_issuer,
             jwt_audience,
+            invocation_jwt_audience,
             jwt_max_lifetime,
+            admin_token,
             storage,
             sandbox_provider,
         })
@@ -149,41 +174,50 @@ pub async fn serve_control_plane(
 ) -> Result<()> {
     let process_started = Instant::now();
     let telemetry = actor_telemetry_from_env()?;
-    let auth = configure_actor_jwt_verifier(
-        &config.jwt_jwks_url,
-        &config.jwt_issuer,
-        &config.jwt_audience,
+    let issuer = super::ActorJwtIssuer::from_base64_pkcs8(
+        &config.jwt_signing_key,
+        config.jwt_key_id,
+        config.jwt_issuer.clone(),
+        config.jwt_audience.clone(),
+        config.invocation_jwt_audience,
         config.jwt_max_lifetime,
-    )
-    .await?;
-    let (durability, leases) = connect_control_plane_stores(config.storage).await?;
-    let jwks_refresh_auth = auth.clone();
-    let mut service =
-        ControlPlaneService::new(durability, leases, auth).with_telemetry(telemetry.clone());
+    )?;
+    let auth = ActorJwtVerifier::for_scope(
+        issuer.verifier_keys_json()?,
+        config.jwt_issuer,
+        config.jwt_audience,
+        super::ActorTokenPurpose::ControlPlane,
+        config.jwt_max_lifetime,
+    )?;
+    let (durability, leases, registry) = connect_control_plane_stores(config.storage).await?;
+    let mut service = ControlPlaneService::new(durability, leases, auth)
+        .with_telemetry(telemetry.clone())
+        .with_admin(config.admin_token, registry, issuer)?;
     if let Some(provider) = config.sandbox_provider {
-        service = service.with_sandbox_provider(Arc::new(
-            crate::sandbox::HttpSandboxProvider::new(provider.url, provider.secret)?,
-        ));
+        service = service
+            .with_sandbox_provider(Arc::new(crate::sandbox::CommandSandboxProvider::new(
+                provider.command,
+                provider.modal_token_id,
+                provider.modal_token_secret,
+            )?))
+            .with_sandbox_runtime(provider.runtime);
     }
+    let admin_service = service.clone().into_admin_service();
     let service = service.into_service();
     let mut server = Server::builder().timeout(CONTROL_PLANE_REQUEST_TIMEOUT);
     info!(bind = %config.bind, "actor control plane is ready");
     publish_control_plane_health(telemetry.as_ref(), process_started, true, 0);
     let (background_shutdown, background_shutdown_rx) = tokio::sync::watch::channel(false);
-    let health_task = spawn_control_plane_health(
-        telemetry.clone(),
-        process_started,
-        background_shutdown_rx.clone(),
-    );
-    let jwks_refresh_task = spawn_jwks_refresh(jwks_refresh_auth, background_shutdown_rx);
+    let health_task =
+        spawn_control_plane_health(telemetry.clone(), process_started, background_shutdown_rx);
     let serve_result = server
         .add_service(service)
+        .add_service(admin_service)
         .serve_with_shutdown(config.bind, shutdown)
         .await
         .context("serve actor control plane");
     let _ = background_shutdown.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(1), health_task).await;
-    let _ = tokio::time::timeout(Duration::from_secs(1), jwks_refresh_task).await;
     publish_control_plane_health(
         telemetry.as_ref(),
         process_started,
@@ -197,11 +231,16 @@ pub async fn serve_control_plane(
 
 async fn connect_control_plane_stores(
     config: ControlPlaneStorageConfig,
-) -> Result<(Arc<dyn ActorDurabilityStore>, Arc<dyn HostLeaseStore>)> {
+) -> Result<(
+    Arc<dyn ActorDurabilityStore>,
+    Arc<dyn HostLeaseStore>,
+    Arc<dyn super::AdminRegistry>,
+)> {
     match config {
         ControlPlaneStorageConfig::Local { root } => Ok((
             Arc::new(LocalActorStore::new(root.join("objects"))),
             Arc::new(LocalHostLeaseStore::new(root.join("nodes")).await?),
+            Arc::new(super::LocalAdminRegistry::default()),
         )),
         ControlPlaneStorageConfig::Distributed {
             postgres_url,
@@ -210,6 +249,9 @@ async fn connect_control_plane_stores(
         } => {
             let database = PostgresDatabase::connect(&postgres_url).await?;
             let leases = Arc::new(PostgresHostLeaseStore::from_database(database.clone()));
+            let registry = Arc::new(super::PostgresAdminRegistry::from_database(
+                database.clone(),
+            ));
             let archives = connect_archive_stores(archive_buckets).await?;
             let mut commits = HashMap::<String, Arc<dyn CommitStore>>::new();
             for (region, bucket) in rapid_buckets {
@@ -225,7 +267,7 @@ async fn connect_control_plane_stores(
                 commits,
                 archives,
             )?);
-            Ok((durability, leases))
+            Ok((durability, leases, registry))
         }
     }
 }
@@ -253,75 +295,6 @@ fn spawn_control_plane_health(
             }
         }
     })
-}
-
-fn spawn_jwks_refresh(
-    auth: ActorJwtVerifier,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut ticks = tokio::time::interval_at(
-            tokio::time::Instant::now() + JWKS_REFRESH_INTERVAL,
-            JWKS_REFRESH_INTERVAL,
-        );
-        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tokio::select! {
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        return;
-                    }
-                }
-                _ = ticks.tick() => {
-                    if let Err(error) = auth.refresh_jwks().await {
-                        warn!(
-                            error = %format!("{error:#}"),
-                            "failed to refresh actor JWKS; retaining the last verified key set"
-                        );
-                    }
-                }
-            }
-        }
-    })
-}
-
-async fn configure_actor_jwt_verifier(
-    url: &str,
-    issuer: &str,
-    audience: &str,
-    max_lifetime: Duration,
-) -> Result<ActorJwtVerifier> {
-    let started = Instant::now();
-    let mut retry_delay = JWKS_INITIAL_RETRY_DELAY;
-    loop {
-        match ActorJwtVerifier::from_jwks_url(url, issuer, audience, max_lifetime).await {
-            Ok(verifier) => {
-                info!(
-                    jwks_url = url,
-                    "loaded actor JWT verification keys from JWKS"
-                );
-                return Ok(verifier);
-            }
-            Err(error) if started.elapsed() >= JWKS_INITIAL_RETRY_TIMEOUT => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "load actor JWT verification keys from {url} within {} seconds",
-                        JWKS_INITIAL_RETRY_TIMEOUT.as_secs()
-                    )
-                });
-            }
-            Err(error) => {
-                warn!(
-                    jwks_url = url,
-                    retry_in_ms = retry_delay.as_millis(),
-                    error = %format!("{error:#}"),
-                    "actor JWKS is not available yet"
-                );
-                tokio::time::sleep(retry_delay).await;
-                retry_delay = retry_delay.saturating_mul(2).min(JWKS_MAX_RETRY_DELAY);
-            }
-        }
-    }
 }
 
 fn publish_control_plane_health(
@@ -357,6 +330,23 @@ fn validated_http_url(value: &str, name: &str) -> Result<String> {
     );
     ensure!(url.host_str().is_some(), "{name} must include a host");
     Ok(url.to_string())
+}
+
+fn idle_timeout_ms(
+    get: &mut impl FnMut(&str) -> Option<String>,
+    name: &str,
+    default: u64,
+) -> Result<u64> {
+    let value = get(name)
+        .map(|value| value.parse::<u64>())
+        .transpose()
+        .with_context(|| format!("{name} must be an integer number of milliseconds"))?
+        .unwrap_or(default);
+    ensure!(
+        (1..=MAX_IDLE_TIMEOUT_MS).contains(&value),
+        "{name} must be between 1 and {MAX_IDLE_TIMEOUT_MS}"
+    );
+    Ok(value)
 }
 
 fn regional_buckets(configured: String) -> Result<HashMap<String, String>> {
@@ -429,24 +419,23 @@ mod tests {
 
     use super::*;
 
-    fn parse(values: HashMap<&str, &str>) -> Result<ControlPlaneProcessConfig> {
+    fn parse(mut values: HashMap<&str, &str>) -> Result<ControlPlaneProcessConfig> {
+        values
+            .entry("DURABLE_OBJECT_JWT_SIGNING_KEY")
+            .or_insert("c2lnbmluZw==");
+        values
+            .entry("DURABLE_OBJECT_ADMIN_TOKEN")
+            .or_insert("admin-token");
         ControlPlaneProcessConfig::from_lookup(|name| values.get(name).map(|value| (*value).into()))
     }
 
     #[test]
-    fn parses_the_required_jwks_url() -> Result<()> {
-        let config = parse(HashMap::from([
-            ("DURABLE_OBJECT_STORAGE", "local"),
-            (
-                "DURABLE_OBJECT_JWKS_URL",
-                "https://keys.example.com/actors/jwks.json",
-            ),
-        ]))?;
+    fn parses_system_signing_and_admin_credentials() -> Result<()> {
+        let config = parse(HashMap::from([("DURABLE_OBJECT_STORAGE", "local")]))?;
 
-        assert_eq!(
-            config.jwt_jwks_url,
-            "https://keys.example.com/actors/jwks.json"
-        );
+        assert_eq!(config.jwt_signing_key, "c2lnbmluZw==");
+        assert_eq!(config.jwt_key_id, "primary");
+        assert_eq!(config.admin_token, "admin-token");
         Ok(())
     }
 
@@ -455,22 +444,26 @@ mod tests {
         let config = parse(HashMap::from([
             ("DURABLE_OBJECT_STORAGE", "local"),
             (
-                "DURABLE_OBJECT_JWKS_URL",
-                "https://keys.example.com/actors/jwks.json",
+                "DURABLE_OBJECT_CONTROL_PLANE_URL",
+                "https://actors.example.com",
             ),
-            (
-                "DURABLE_OBJECT_SANDBOX_PROVIDER_URL",
-                "https://api.example.com/internal/actor-host/activate",
-            ),
-            ("DURABLE_OBJECT_SANDBOX_PROVIDER_TOKEN", "activation-secret"),
+            ("MODAL_TOKEN_ID", "modal-token-id"),
+            ("MODAL_TOKEN_SECRET", "modal-token-secret"),
+            ("DURABLE_OBJECT_MODAL_COMMAND", "./modal-cli"),
+            ("DURABLE_OBJECT_ACTOR_IDLE_TIMEOUT_MS", "60000"),
+            ("DURABLE_OBJECT_HOST_IDLE_TIMEOUT_MS", "300000"),
         ]))?;
 
         let activation = config.sandbox_provider.expect("sandbox provider config");
+        assert_eq!(activation.command, "./modal-cli");
+        assert_eq!(activation.modal_token_id, "modal-token-id");
+        assert_eq!(activation.modal_token_secret, "modal-token-secret");
         assert_eq!(
-            activation.url,
-            "https://api.example.com/internal/actor-host/activate"
+            activation.runtime.control_plane_url,
+            "https://actors.example.com/"
         );
-        assert_eq!(activation.secret, "activation-secret");
+        assert_eq!(activation.runtime.actor_idle_timeout_ms, 60_000);
+        assert_eq!(activation.runtime.host_idle_timeout_ms, 300_000);
         Ok(())
     }
 
@@ -478,38 +471,30 @@ mod tests {
     fn rejects_partial_actor_host_provisioning_configuration() {
         let result = parse(HashMap::from([
             ("DURABLE_OBJECT_STORAGE", "local"),
-            (
-                "DURABLE_OBJECT_JWKS_URL",
-                "https://keys.example.com/actors/jwks.json",
-            ),
-            (
-                "DURABLE_OBJECT_SANDBOX_PROVIDER_URL",
-                "https://api.example.com/internal/actor-host/activate",
-            ),
+            ("MODAL_TOKEN_ID", "modal-token-id"),
         ]));
 
         assert!(result.is_err());
     }
 
     #[test]
-    fn rejects_a_missing_jwks_url() {
-        let result = parse(HashMap::from([("DURABLE_OBJECT_STORAGE", "local")]));
+    fn rejects_missing_system_credentials() {
+        let values = HashMap::from([("DURABLE_OBJECT_STORAGE", "local")]);
+        let result = ControlPlaneProcessConfig::from_lookup(|name| {
+            values.get(name).map(|value| (*value).into())
+        });
 
-        let error = result.err().expect("missing JWKS URL must fail");
+        let error = result.err().expect("missing signing key must fail");
         assert!(
             error
                 .to_string()
-                .contains("DURABLE_OBJECT_JWKS_URL is required")
+                .contains("DURABLE_OBJECT_JWT_SIGNING_KEY is required")
         );
     }
 
     #[test]
     fn parses_matching_rapid_and_standard_region_maps() -> Result<()> {
         let config = parse(HashMap::from([
-            (
-                "DURABLE_OBJECT_JWKS_URL",
-                "https://keys.example.com/actors/jwks.json",
-            ),
             ("DURABLE_OBJECT_STORAGE", "rapid"),
             (
                 "DURABLE_OBJECT_POSTGRES_URL",
@@ -541,10 +526,6 @@ mod tests {
     #[test]
     fn rejects_removed_single_bucket_settings() {
         let error = parse(HashMap::from([
-            (
-                "DURABLE_OBJECT_JWKS_URL",
-                "https://keys.example.com/actors/jwks.json",
-            ),
             ("DURABLE_OBJECT_STORAGE", "rapid"),
             (
                 "DURABLE_OBJECT_POSTGRES_URL",

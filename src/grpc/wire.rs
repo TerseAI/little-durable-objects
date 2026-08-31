@@ -1,5 +1,3 @@
-//! Checked conversion between generated protobuf messages and the core command protocol.
-
 use anyhow::{Context, Result};
 
 use super::proto;
@@ -49,6 +47,10 @@ impl From<ActorExecutionResult> for proto::InvokeActorReply {
                 message: failure.message,
             }),
             ActorExecutionResult::Reroute => Result::Reroute(proto::Reroute {}),
+            ActorExecutionResult::HostUnavailable => Result::Failed(proto::ActorFailed {
+                code: "host_unavailable".into(),
+                message: "actor host is draining".into(),
+            }),
         };
         Self {
             result: Some(result),

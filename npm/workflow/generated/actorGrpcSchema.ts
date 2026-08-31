@@ -27,6 +27,129 @@ const actorGrpcSchema: INamespace = {
                                 }
                             }
                         },
+                        ActorAdminService: {
+                            methods: {
+                                EnsureNamespace: {
+                                    requestType: "EnsureNamespaceRequest",
+                                    responseType: "EnsureNamespaceReply"
+                                },
+                                RegisterLaunchSpec: {
+                                    requestType: "RegisterLaunchSpecRequest",
+                                    responseType: "RegisterLaunchSpecReply"
+                                },
+                                IssueWorkflowToken: {
+                                    requestType: "IssueWorkflowTokenRequest",
+                                    responseType: "IssueWorkflowTokenReply"
+                                },
+                                GetJwks: {
+                                    requestType: "GetJwksRequest",
+                                    responseType: "GetJwksReply"
+                                }
+                            }
+                        },
+                        EnsureNamespaceRequest: {
+                            fields: {
+                                namespaceId: {
+                                    type: "string",
+                                    id: 1
+                                }
+                            }
+                        },
+                        EnsureNamespaceReply: {
+                            fields: {
+                                created: {
+                                    type: "bool",
+                                    id: 1
+                                }
+                            }
+                        },
+                        RegisterLaunchSpecRequest: {
+                            oneofs: {
+                                _actorEntrypoint: {
+                                    oneof: ["actorEntrypoint"]
+                                }
+                            },
+                            fields: {
+                                namespaceId: {
+                                    type: "string",
+                                    id: 1
+                                },
+                                codeRevision: {
+                                    type: "string",
+                                    id: 2
+                                },
+                                modalImageId: {
+                                    type: "string",
+                                    id: 3
+                                },
+                                workingDirectory: {
+                                    type: "string",
+                                    id: 4
+                                },
+                                actorEntrypoint: {
+                                    type: "string",
+                                    id: 5,
+                                    options: {
+                                        proto3_optional: true
+                                    }
+                                }
+                            }
+                        },
+                        RegisterLaunchSpecReply: {
+                            fields: {
+                                created: {
+                                    type: "bool",
+                                    id: 1
+                                }
+                            }
+                        },
+                        IssueWorkflowTokenRequest: {
+                            fields: {
+                                namespaceId: {
+                                    type: "string",
+                                    id: 1
+                                },
+                                executionId: {
+                                    type: "string",
+                                    id: 2
+                                },
+                                codeRevision: {
+                                    type: "string",
+                                    id: 3
+                                },
+                                region: {
+                                    type: "string",
+                                    id: 4
+                                },
+                                deadlineUnixMs: {
+                                    type: "int64",
+                                    id: 5
+                                }
+                            }
+                        },
+                        IssueWorkflowTokenReply: {
+                            fields: {
+                                token: {
+                                    type: "string",
+                                    id: 1
+                                },
+                                expiresAtMs: {
+                                    type: "int64",
+                                    id: 2
+                                }
+                            }
+                        },
+                        GetJwksRequest: {
+                            fields: {}
+                        },
+                        GetJwksReply: {
+                            fields: {
+                                jwksJson: {
+                                    type: "bytes",
+                                    id: 1
+                                }
+                            }
+                        },
                         ResolveActorHostRequest: {
                             fields: {
                                 actor: {

@@ -1,136 +1,136 @@
 # Durable object runtime
 
-This directory is a standalone durable-object system. Terse integrates with it, but the runtime does not depend on Terse projects, deployments, credentials, or backend APIs.
+This repository contains a standalone durable-object system. Terse uses it by mapping each Terse project ID to a runtime namespace, but the runtime supports any integration that can supply namespace IDs.
 
-It contains one Rust crate and a companion npm package:
+The system has two deliverables:
 
-- `durable-object-runtime` runs the control plane, regional hosts, and durability maintenance.
-- [`npm/`](npm/) publishes `@terse/durable-objects`: the actor API, JavaScript host executor, canonical region catalog, provider contract, and Modal adapter.
-
-The directory is intentionally self-contained so it can move to its own repository without changing its protocol or runtime architecture.
+- `durable-object-runtime`, a Rust binary that runs the control plane, regional hosts, and durability maintenance;
+- `@terse/durable-objects`, the actor API, workflow client, JavaScript host executor, region catalog, and Modal command.
 
 ## Architecture
 
 ```text
-application
-    |
-    | resolve through control plane, then invoke host directly
-    v
-durable-object control plane
-    |-- verifies namespace-scoped JWKS credentials
-    |-- owns placement, leases, routing, and fencing
-    |-- calls a configured SandboxProvider
-    `-- coordinates Postgres + object storage durability
-                 |
-                 v
-        regional Modal host sandbox
-        |-- Rust runtime
-        |-- JavaScript executor
-        |-- SQLite cache on a regional Modal Volume
-        `-- canonical LTX history in durable storage
+trusted backend                                      Modal
+  |                                                    ^
+  | admin token                                        | local TypeScript command
+  | EnsureNamespace / RegisterLaunchSpec               | (Modal SDK, no server)
+  | IssueWorkflowToken                                 |
+  v                                                    |
+durable-object control plane --------------------------+
+  | owns Ed25519 signing, JWKS, placement, leases, and durability
+  | injects a host JWT when it creates a host sandbox
+  |
+  | project-scoped workflow JWT
+  v
+workflow sandbox -- ResolveActorHost --> control plane
+  |
+  `---------------- Invoke ------------> regional host sandbox
+                                           | Rust host + gRPC
+                                           | resident JS actor Workers
+                                           | SQLite cache on Modal Volume
+                                           ` LTX -> Rapid -> Standard storage
 ```
 
-The sandbox provider starts or reuses one host for a `(namespace, code revision, canonical region)` tuple. A host multiplexes many objects. The control plane remains the authority for leases and routing; the provider volume is only a disposable SQLite cache.
+The control plane calls a bundled TypeScript executable over stdin/stdout when it needs Modal. There is no sandbox-provider web service. Rust passes a complete launch request; the command uses the Modal TypeScript SDK to create or reuse the sandbox and returns its handle.
 
-## Object identity
+## Terse integration
 
-An object is identified by `(namespace_id, actor_type, actor_id)`. The runtime does not know about organizations or projects. An integration maps its own tenancy model to a namespace.
+Terse needs one trusted backend credential: the value of `DURABLE_OBJECT_ADMIN_TOKEN` on the control plane. Keep the same value in the Terse backend environment. Workflows never receive it.
 
-The first claim fixes an object's canonical home region. Provider-specific locations never appear in object identity or manifests. The Modal adapter and storage configuration map the canonical region independently.
+For each project deployment, the Terse backend calls `durable_object.v1.ActorAdminService`:
 
-## Lifecycle
+1. `EnsureNamespace({ namespace_id: project.id })`.
+2. `RegisterLaunchSpec({ namespace_id: project.id, code_revision, modal_image_id, working_directory, actor_entrypoint })`.
+3. Before each workflow execution, `IssueWorkflowToken({ namespace_id: project.id, execution_id, code_revision, region, deadline_unix_ms })`.
+4. Inject the reply token and three runtime values into the workflow sandbox:
 
-Runtime and cache state are separate from durable existence:
-
-- `serving`: a live host has a valid lease.
-- `warm`: no host is serving, but its regional provider volume remains.
-- `cold`: no host or local cache exists; activation restores from durable storage.
-- `deleted`: the durable object has been tombstoned.
-
-`SandboxProvider.deactivate()` stops compute while preserving the cache. `removeLocalCache()` stops compute and deletes the provider volume, making the next activation cold. Neither operation deletes durable history.
-
-## Modal adapter
-
-`@terse/durable-objects/modal` implements the sandbox lifecycle. The caller supplies two integration hooks:
-
-```ts
-import { ModalSandboxProvider } from "@terse/durable-objects/modal"
-import { startSandboxProviderServer } from "@terse/durable-objects/provider-http"
-
-const provider = new ModalSandboxProvider({
-  tokenId: process.env.MODAL_TOKEN_ID!,
-  tokenSecret: process.env.MODAL_TOKEN_SECRET!,
-  controlPlaneUrl: "https://objects.example.com",
-  credentialsUrl: "https://identity.example.com/host-credentials",
-  hooks: {
-    resolveArtifact: async request => ({
-      imageId: await imageForRevision(request.codeRevision),
-      workingDirectory: "/workspace",
-    }),
-    issueHostBootstrap: async request => ({
-      credential: await bootstrapCredential(request.namespaceId),
-    }),
-  },
-})
-
-await startSandboxProviderServer({
-  provider,
-  token: process.env.DURABLE_OBJECT_SANDBOX_PROVIDER_TOKEN!,
-})
+```text
+DURABLE_OBJECT_TOKEN=<issued workflow JWT>
+DURABLE_OBJECT_NAMESPACE_ID=<Terse project ID>
+DURABLE_OBJECT_CONTROL_PLANE_URL=https://objects.example.com
+DURABLE_OBJECT_INVOCATION_TIMEOUT_MS=30000  # optional
 ```
 
-Point `DURABLE_OBJECT_SANDBOX_PROVIDER_URL` at the server's `/hosts/ensure` endpoint. Provider credentials stay in the provider process and never enter workflow sandboxes.
+All three mutating admin RPCs use `authorization: Bearer <DURABLE_OBJECT_ADMIN_TOKEN>`. `GetJwks` is public so hosts and diagnostics can read the system's verification keys. Launch specs are immutable for a `(namespace, code revision)` pair; a changed image or entrypoint needs a new revision.
 
-Application processes may use environment variables or configure the client directly:
+Application code can rely on the injected environment or configure the client directly:
 
 ```ts
-import { configureDurableObjects } from "@terse/durable-objects"
+import { Actor, configureDurableObjects } from "@terse/durable-objects"
 
 configureDurableObjects({
-  credential: process.env.OBJECT_CREDENTIAL!,
-  credentialsUrl: "https://identity.example.com/workflow-credentials",
-  controlPlaneUrl: "https://objects.example.com",
-  codeRevision: "git-sha",
-  region: "north-america-east",
+    token: process.env.DURABLE_OBJECT_TOKEN!,
+    namespaceId: process.env.DURABLE_OBJECT_NAMESPACE_ID!,
+    controlPlaneUrl: process.env.DURABLE_OBJECT_CONTROL_PLANE_URL!
 })
+
+export class Counter extends Actor {
+    count = 0
+
+    increment(): number {
+        return ++this.count
+    }
+}
+
+await Counter.get("account-1").increment()
 ```
+
+The SDK sends the same short-lived JWT for route resolution and direct invocation. It retries only when the runtime proves execution did not start, preserving the same request ID. A transport failure after dispatch returns `outcome_unknown` and is never retried automatically.
 
 ## Authentication
 
-The Rust control plane and hosts verify Ed25519 JWTs through JWKS. Credentials use the portable namespace, host, session, region, code-revision, and action-scope claims defined by the runtime. The credential issuer remains an integration boundary.
+The control plane owns one Ed25519 signing key supplied as base64-encoded PKCS#8 in `DURABLE_OBJECT_JWT_SIGNING_KEY`. It issues:
 
-The control plane accepts authority credentials. Hosts accept separate invocation credentials. A host exchanges its bootstrap credential through `DURABLE_OBJECT_CREDENTIALS_URL`; the bootstrap credential is never sent to the control plane.
+- a workflow JWT scoped to one namespace, execution, revision, region, and workflow deadline, with `actor:resolve actor:invoke`;
+- a host JWT scoped to one namespace, host ID, session, revision, and region, with `actor:authority`.
 
-## Storage
+The initial host JWT and verification keys are injected when Modal creates the sandbox. The control plane returns a replacement host JWT through lease renewal before expiration. Modal credentials stay in the control-plane process and its short-lived local command; they never enter workflow or host sandboxes.
 
-The first production adapter uses:
+## Lifecycle
 
-- PostgreSQL for manifests and host leases.
-- A zonal GCS Rapid bucket for synchronous commit logs in each canonical region.
-- A Standard multi-region GCS bucket for asynchronous archives and consolidated checkpoints.
+Object memory and host compute recycle independently:
 
-The storage traits remain public Rust boundaries. Rapid and GCS are adapters and durability-policy choices, not part of object identity.
+- A successful actor instance remains resident for `DURABLE_OBJECT_ACTOR_IDLE_TIMEOUT_MS`, default `60000`. The host then terminates its Worker and restores it from durable state on the next call.
+- The Rust host exits after `DURABLE_OBJECT_HOST_IDLE_TIMEOUT_MS` without active invocations, default `300000`. Because Rust is Modal's main sandbox process, this deactivates compute while preserving the volume cache.
+- Both values must be between `1` and `86400000` milliseconds. Active work is never evicted or stopped.
+- A host keeps at most 32 resident actor Workers. Each actor is serial and admits at most 32 queued calls; excess calls get a retryable pre-execution `resource_exhausted` result.
 
-## Run locally
+The provider cache states remain separate from in-memory residency:
+
+```text
+serving -- host idle exit --> warm -- remove local cache --> cold
+   ^                            |                            |
+   `----------- next invocation restores or reuses --------'
+```
+
+None of these transitions deletes canonical object history.
+
+## Control-plane setup
+
+Install or bundle the npm package so `terse-durable-objects-modal` is on `PATH`, then configure the control plane:
 
 ```sh
 DURABLE_OBJECT_PROCESS_ROLE=control-plane \
-DURABLE_OBJECT_JWKS_URL=http://127.0.0.1:3001/.well-known/jwks.json \
 DURABLE_OBJECT_STORAGE=local \
 DURABLE_OBJECT_LOCAL_STORE_ROOT=.local/control-plane \
+DURABLE_OBJECT_JWT_SIGNING_KEY='<base64 PKCS#8 Ed25519 key>' \
+DURABLE_OBJECT_ADMIN_TOKEN='<shared backend admin token>' \
+DURABLE_OBJECT_CONTROL_PLANE_URL=https://objects.example.com \
+MODAL_TOKEN_ID='<modal token id>' \
+MODAL_TOKEN_SECRET='<modal token secret>' \
 cargo run
 ```
 
-The local store is intended for development and tests. A usable application also needs a credential issuer and either a sandbox-provider endpoint or an already running host.
+Set `DURABLE_OBJECT_MODAL_COMMAND` when the compiled command is not on `PATH`. The command receives only `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET`, and `PATH` from Rust; launch credentials and runtime values travel in its JSON request.
 
-See [configuration](docs/configuration.md) for every environment variable.
+Production storage uses PostgreSQL for manifests, leases, namespaces, and launch specs; a zonal GCS Rapid bucket for synchronous commit logs in each canonical region; and Standard multi-region buckets for archives and consolidated checkpoints.
 
 ## Build and test
 
 ```sh
 cargo build --release
 cargo test --no-fail-fast
-pnpm --filter @terse/durable-objects build
+pnpm --dir npm test
 ```
 
-The normal Rust suite uses filesystem-backed stores. Set `DURABLE_OBJECT_TEST_POSTGRES_URL` to run the PostgreSQL integration suite against a real database.
+Set `DURABLE_OBJECT_TEST_POSTGRES_URL` to run the PostgreSQL integration suite against a real database.

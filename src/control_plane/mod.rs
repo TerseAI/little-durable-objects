@@ -1,5 +1,7 @@
+mod admin;
 mod auth;
 mod client;
+mod issuer;
 mod process;
 mod protocol;
 mod service;
@@ -16,7 +18,9 @@ pub use self::process::{
     ControlPlaneProcessConfig, ControlPlaneStorageConfig, serve_control_plane,
 };
 pub(crate) use self::{
+    admin::{AdminRegistry, LocalAdminRegistry, PostgresAdminRegistry},
     auth::{ActorJwtVerifier, ActorTokenPurpose},
     client::ControlPlaneClient,
+    issuer::ActorJwtIssuer,
     service::ControlPlaneService,
 };

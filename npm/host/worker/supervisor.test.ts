@@ -43,18 +43,15 @@ async function exerciseHardCancellation(entrypoint: string): Promise<void> {
     })
     await Promise.resolve()
 
-    assert.deepEqual(
-        await runtime.handle({
-            type: "invoke",
-            request_id: "parallel-request",
-            actor: actorIdentity,
-            method: "increment",
-            args: [2],
-            state: { count: 4 },
-            timeout_ms: 30_000
-        }),
-        { type: "invoked", result: 6, state: { count: 6 } }
-    )
+    const queued = runtime.handle({
+        type: "invoke",
+        request_id: "parallel-request",
+        actor: actorIdentity,
+        method: "increment",
+        args: [2],
+        state: { count: 4 },
+        timeout_ms: 30_000
+    })
 
     assert.deepEqual(
         await runtime.handle({
@@ -69,16 +66,17 @@ async function exerciseHardCancellation(entrypoint: string): Promise<void> {
         code: "actor_worker_terminated",
         message: "actor invocation did not terminate within 20ms of cancellation"
     })
+    assert.deepEqual(await queued, { type: "invoked", result: 6, state: { count: 6 } })
     const recovered = await runtime.handle({
         type: "invoke",
         request_id: "recovered-request",
         actor: actorIdentity,
         method: "increment",
         args: [2],
-        state: { count: 4 },
+        state: { count: 0 },
         timeout_ms: 30_000
     })
-    assert.deepEqual(recovered, { type: "invoked", result: 6, state: { count: 6 } })
+    assert.deepEqual(recovered, { type: "invoked", result: 8, state: { count: 8 } })
 }
 
 async function createTypeScriptConsumer(): Promise<string> {

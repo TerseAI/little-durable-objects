@@ -1,9 +1,3 @@
-//! Immutable SQLite checkpoints in Standard multi-region Cloud Storage.
-//!
-//! This store is intentionally absent from the synchronous commit path. The
-//! durability worker uploads a complete SQLite image and only then installs its
-//! metadata through the PostgreSQL manifest CAS.
-
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, ensure};

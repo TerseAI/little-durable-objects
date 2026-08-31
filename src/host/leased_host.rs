@@ -1,5 +1,3 @@
-//! Actor-host execution paired with its renewable host lease.
-
 use std::{sync::Arc, time::Duration};
 
 use anyhow::Result;
@@ -14,8 +12,6 @@ use super::{
 pub(crate) const HOST_ACTOR_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const HOST_UNREGISTER_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// A running actor host plus the renewal task that self-fences it when its registered
-/// lease can no longer be kept alive.
 pub(crate) struct LeasedActorHost {
     host: Arc<ActorHost>,
     lease: Arc<HostLeaseMaintainer>,
@@ -61,6 +57,10 @@ impl LeasedActorHost {
 
     pub(crate) fn host(&self) -> Arc<ActorHost> {
         self.host.clone()
+    }
+
+    pub(crate) fn activity(&self) -> watch::Receiver<usize> {
+        self.host.activity()
     }
 
     pub(crate) fn consecutive_lease_failures(&self) -> u64 {

@@ -1,5 +1,3 @@
-//! Errors raised while capturing or replicating LTX.
-
 use crate::{actor_state::ActorDatabaseError, ltx::wal::WalError};
 use std::{fmt, io, path::PathBuf};
 

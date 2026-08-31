@@ -10,6 +10,8 @@ import { loadActorEntrypoint, resolveActorEntrypoint } from "./actorModule.js"
 import { ActorWorkerSupervisor } from "./worker/supervisor.js"
 
 const DEFAULT_ACTOR_STARTUP_TIMEOUT_MS = 10_000
+const DEFAULT_ACTOR_IDLE_TIMEOUT_MS = 60_000
+const MAX_IDLE_TIMEOUT_MS = 86_400_000
 const MAX_MESSAGE_BYTES = 16 * 1024 * 1024
 
 const actorSessionSettingsSchema = z.object({
@@ -35,7 +37,11 @@ class ActorSession {
         const settings = ActorSessionSettings.getInstance()
         const actorEntrypointUrl = await resolveActorEntrypoint(settings.actorEntrypoint)
         const actorTypes = await loadActorEntrypoint(actorEntrypointUrl)
-        const supervisor = new ActorWorkerSupervisor({ actorEntrypointUrl, cancellationGraceMs: this.cancellationGraceMs })
+        const supervisor = new ActorWorkerSupervisor({
+            actorEntrypointUrl,
+            cancellationGraceMs: this.cancellationGraceMs,
+            actorIdleTimeoutMs: settings.actorIdleTimeoutMs
+        })
         const commandHandler = (command: ActorExecutorCommand): Promise<ActorExecutorReply> => supervisor.handle(command)
         this.connection = await ActorSessionConnection.open(settings.socketPath, actorTypes, commandHandler, settings.startupTimeoutMs)
     }
@@ -72,7 +78,7 @@ class ActorSessionConnection {
         if (actorTypes.length === 0) throw new ActorSessionError("the actor entrypoint does not export any actor classes")
         const socket = await connectSocket(socketPath)
         const connection = new ActorSessionConnection(socket, commandHandler)
-        connection.send({ type: "attach", protocol: 8, actor_types: actorTypes })
+        connection.send({ type: "attach", protocol: 9, actor_types: actorTypes })
         await connection.waitUntilAttached(timeoutMs)
         return connection
     }
@@ -198,13 +204,23 @@ function parseStartupTimeout(value: string | undefined): number {
     return parsed
 }
 
+function parseActorIdleTimeout(value: string | undefined): number {
+    if (value === undefined) return DEFAULT_ACTOR_IDLE_TIMEOUT_MS
+    const parsed = Number(value)
+    if (!Number.isInteger(parsed) || parsed <= 0 || parsed > MAX_IDLE_TIMEOUT_MS) {
+        throw new ActorConfigurationError(`DURABLE_OBJECT_ACTOR_IDLE_TIMEOUT_MS must be an integer between 1 and ${MAX_IDLE_TIMEOUT_MS}`)
+    }
+    return parsed
+}
+
 class ActorSessionSettings {
     private static instance: ActorSessionSettings | undefined
 
     private constructor(
         readonly socketPath: string,
         readonly actorEntrypoint: string | undefined,
-        readonly startupTimeoutMs: number
+        readonly startupTimeoutMs: number,
+        readonly actorIdleTimeoutMs: number
     ) {}
 
     static getInstance(): ActorSessionSettings {
@@ -219,7 +235,12 @@ class ActorSessionSettings {
     static fromEnvironment(environment: NodeJS.ProcessEnv): ActorSessionSettings {
         const result = actorSessionSettingsSchema.safeParse(environment)
         if (!result.success) throw new ActorConfigurationError(`actor-host session settings are invalid: ${result.error.message}`)
-        return new ActorSessionSettings(result.data.DURABLE_OBJECT_EXECUTOR_SOCKET, result.data.DURABLE_OBJECT_ENTRYPOINT, parseStartupTimeout(environment.DURABLE_OBJECT_HOST_STARTUP_MS))
+        return new ActorSessionSettings(
+            result.data.DURABLE_OBJECT_EXECUTOR_SOCKET,
+            result.data.DURABLE_OBJECT_ENTRYPOINT,
+            parseStartupTimeout(environment.DURABLE_OBJECT_HOST_STARTUP_MS),
+            parseActorIdleTimeout(environment.DURABLE_OBJECT_ACTOR_IDLE_TIMEOUT_MS)
+        )
     }
 }
 

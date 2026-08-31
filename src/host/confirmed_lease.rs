@@ -1,5 +1,3 @@
-//! Last host lease confirmed by this process, used for local self-fencing.
-
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::HostId;
@@ -17,14 +15,11 @@ impl ConfirmedLeaseState {
         }
     }
 
-    /// Record a confirmed window only after its lease-store write succeeds.
     pub(crate) fn record_renewal(&self, valid_until_ms: u64) {
         self.lease_valid_until_ms
             .store(valid_until_ms, Ordering::SeqCst);
     }
 
-    /// `None` means this process has not locally confirmed a lease and the durable
-    /// lease store remains the fallback. `Some(false)` is an explicit local fence.
     pub(crate) fn lease_is_active(&self, host: &HostId, now_ms: u64) -> Option<bool> {
         if host != &self.host {
             return None;

@@ -1,9 +1,19 @@
 interface EnsureHostRequest {
     readonly namespaceId: string
-    readonly principalId: string
-    readonly credentialId: string
     readonly codeRevision: string
     readonly canonicalRegion: string
+    readonly hostId: string
+    readonly sessionId: string
+    readonly hostToken: string
+    readonly jwtPublicKeys: string
+    readonly controlPlaneUrl: string
+    readonly jwtIssuer: string
+    readonly invocationJwtAudience: string
+    readonly modalImageId: string
+    readonly workingDirectory: string
+    readonly actorEntrypoint?: string
+    readonly actorIdleTimeoutMs: number
+    readonly hostIdleTimeoutMs: number
 }
 
 interface ActorHostHandle {
@@ -20,19 +30,10 @@ interface SandboxProvider {
     removeLocalCache(request: EnsureHostRequest): Promise<void>
 }
 
-interface ActorHostArtifact {
-    readonly imageId: string
-    readonly workingDirectory: string
-    readonly actorEntrypoint?: string
-}
+type ModalSandboxCommand =
+    | { readonly operation: "ensure_host"; readonly request: EnsureHostRequest }
+    | { readonly operation: "status"; readonly request: EnsureHostRequest }
+    | { readonly operation: "deactivate"; readonly request: EnsureHostRequest }
+    | { readonly operation: "remove_local_cache"; readonly request: EnsureHostRequest }
 
-interface ActorHostBootstrap {
-    readonly credential: string
-}
-
-interface SandboxProviderHooks {
-    resolveArtifact(request: EnsureHostRequest): Promise<ActorHostArtifact>
-    issueHostBootstrap(request: EnsureHostRequest): Promise<ActorHostBootstrap>
-}
-
-export type { ActorHostArtifact, ActorHostBootstrap, ActorHostHandle, EnsureHostRequest, SandboxProvider, SandboxProviderHooks }
+export type { ActorHostHandle, EnsureHostRequest, ModalSandboxCommand, SandboxProvider }

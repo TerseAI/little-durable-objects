@@ -1009,14 +1009,7 @@ async fn host_drain_cancels_running_execution_and_rejects_new_admission() -> Res
     assert_eq!(executor.invocations.load(Ordering::SeqCst), 1);
 
     let rejected = execute(&host, invocation("after-host-drain", "increment", vec![])).await?;
-    assert_eq!(
-        rejected,
-        ActorExecutionResult::Failed {
-            failure: ActorInvocationFailure::cancelled_before_execution(
-                "the actor host is shutting down",
-            ),
-        }
-    );
+    assert_eq!(rejected, ActorExecutionResult::HostUnavailable);
     assert_eq!(executor.invocations.load(Ordering::SeqCst), 1);
     Ok(())
 }
@@ -1045,12 +1038,7 @@ async fn host_drain_timeout_does_not_release_an_unterminated_actor_lock() -> Res
         invocation("after-drain-timeout", "increment", vec![]),
     )
     .await?;
-    assert!(matches!(
-        rejected,
-        ActorExecutionResult::Failed {
-            failure: ActorInvocationFailure { ref code, .. }
-        } if code == "cancelled"
-    ));
+    assert_eq!(rejected, ActorExecutionResult::HostUnavailable);
     assert_eq!(executor.invocations.load(Ordering::SeqCst), 1);
 
     executor.release_first.notify_one();

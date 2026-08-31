@@ -1,5 +1,3 @@
-//! Authenticated direct-gRPC transport between durable-object processes.
-
 mod service;
 mod wire;
 

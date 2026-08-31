@@ -1,12 +1,9 @@
-//! Process-local readiness for restored ownership epochs.
-
 use std::{collections::HashMap, sync::Mutex};
 
 use anyhow::{Result, anyhow};
 
 use super::ActorStorageKey;
 
-/// Records which ownership epoch has completed restoration for each local actor.
 pub struct ActorRestoreCache {
     epochs: Mutex<HashMap<ActorStorageKey, u64>>,
 }

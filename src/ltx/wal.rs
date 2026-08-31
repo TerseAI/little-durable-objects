@@ -1,10 +1,3 @@
-//! A reader for the SQLite write-ahead log.
-//!
-//! The WAL format is documented at <https://sqlite.org/fileformat2.html#walformat>.
-//! Only *committed* transactions are ever surfaced: frames are validated against the
-//! WAL checksum chain, and a run of frames is only returned once the frame carrying a
-//! non-zero commit marker has been seen.
-
 use std::{
     fmt, fs,
     io::{self, Read, Seek, SeekFrom},

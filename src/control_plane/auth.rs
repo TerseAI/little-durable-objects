@@ -1,14 +1,9 @@
-use std::{
-    collections::HashMap,
-    sync::{Arc, RwLock},
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, ensure};
 use aws_lc_rs::signature::{ED25519, VerificationAlgorithm};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::Deserialize;
-use tokio::sync::Mutex;
 use tonic::{Request, Status, metadata::MetadataMap};
 
 use crate::actor::ActorScope;
@@ -16,9 +11,6 @@ use crate::host::{ActorProcessRole, HostId};
 
 const AUTHORIZATION: &str = "authorization";
 const CLOCK_SKEW: Duration = Duration::from_secs(5);
-const JWKS_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const JWKS_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-const JWKS_UNKNOWN_KEY_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ActorTokenPurpose {
@@ -27,10 +19,12 @@ pub(crate) enum ActorTokenPurpose {
 }
 
 impl ActorTokenPurpose {
-    fn claim(self) -> &'static str {
-        match self {
-            Self::ControlPlane => "actor:authority",
-            Self::Invocation => "actor:invoke",
+    fn claim(self, role: ActorProcessRole) -> &'static str {
+        match (self, role) {
+            (Self::ControlPlane, ActorProcessRole::Host) => "actor:authority",
+            (Self::ControlPlane, ActorProcessRole::Workflow) => "actor:resolve",
+            (Self::Invocation, ActorProcessRole::Workflow) => "actor:invoke",
+            (Self::Invocation, ActorProcessRole::Host) => "actor:invoke",
         }
     }
 }
@@ -38,12 +32,12 @@ impl ActorTokenPurpose {
 #[derive(Clone, Debug)]
 pub(crate) struct ActorPrincipal {
     pub scope: ActorScope,
-    pub token_id: String,
     pub host_id: HostId,
     pub session_id: String,
     pub process_role: ActorProcessRole,
     pub region: String,
     pub code_revision: Option<String>,
+    pub expires_at: i64,
 }
 
 impl ActorPrincipal {
@@ -78,40 +72,11 @@ impl ActorPrincipal {
 
 #[derive(Clone)]
 pub(crate) struct ActorJwtVerifier {
-    public_keys: Arc<RwLock<HashMap<String, Vec<u8>>>>,
+    public_keys: Arc<HashMap<String, Vec<u8>>>,
     issuer: String,
     audience: String,
     purpose: ActorTokenPurpose,
     max_lifetime: Duration,
-    jwks_source: Option<ActorJwksSource>,
-}
-
-#[derive(Clone)]
-struct ActorJwksSource {
-    client: reqwest::Client,
-    url: reqwest::Url,
-    refresh: Arc<Mutex<JwksRefreshState>>,
-}
-
-#[derive(Default)]
-struct JwksRefreshState {
-    last_attempt: Option<Instant>,
-}
-
-#[derive(Deserialize)]
-struct ActorJwksDocument {
-    keys: Vec<ActorJwk>,
-}
-
-#[derive(Deserialize)]
-struct ActorJwk {
-    alg: Option<String>,
-    crv: String,
-    kid: String,
-    kty: String,
-    #[serde(rename = "use")]
-    key_use: Option<String>,
-    x: String,
 }
 
 #[derive(Deserialize)]
@@ -125,9 +90,8 @@ struct JwtHeader {
 #[serde(rename_all = "camelCase")]
 struct ActorJwtClaims {
     iss: String,
-    aud: String,
+    aud: JwtAudience,
     sub: String,
-    token_id: String,
     namespace_id: String,
     #[serde(rename = "processId")]
     host_id: String,
@@ -141,6 +105,22 @@ struct ActorJwtClaims {
     iat: i64,
     nbf: i64,
     exp: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum JwtAudience {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl JwtAudience {
+    fn contains(&self, expected: &str) -> bool {
+        match self {
+            Self::One(audience) => audience == expected,
+            Self::Many(audiences) => audiences.iter().any(|audience| audience == expected),
+        }
+    }
 }
 
 impl ActorJwtVerifier {
@@ -168,39 +148,7 @@ impl ActorJwtVerifier {
         max_lifetime: Duration,
     ) -> Result<Self> {
         let public_keys = decode_public_keys(public_keys_json.as_ref())?;
-        Self::from_decoded_public_keys(public_keys, issuer, audience, purpose, max_lifetime, None)
-    }
-
-    pub(crate) async fn from_jwks_url(
-        jwks_url: impl AsRef<str>,
-        issuer: impl Into<String>,
-        audience: impl Into<String>,
-        max_lifetime: Duration,
-    ) -> Result<Self> {
-        let url = reqwest::Url::parse(jwks_url.as_ref())
-            .context("DURABLE_OBJECT_JWKS_URL must be a valid HTTP or HTTPS URL")?;
-        ensure!(
-            matches!(url.scheme(), "http" | "https"),
-            "DURABLE_OBJECT_JWKS_URL must use HTTP or HTTPS"
-        );
-        let source = ActorJwksSource {
-            client: reqwest::Client::builder()
-                .connect_timeout(JWKS_CONNECT_TIMEOUT)
-                .timeout(JWKS_REQUEST_TIMEOUT)
-                .build()
-                .context("configure actor JWKS HTTP client")?,
-            url,
-            refresh: Arc::new(Mutex::new(JwksRefreshState::default())),
-        };
-        let public_keys = source.fetch(false).await?;
-        Self::from_decoded_public_keys(
-            public_keys,
-            issuer,
-            audience,
-            ActorTokenPurpose::ControlPlane,
-            max_lifetime,
-            Some(source),
-        )
+        Self::from_decoded_public_keys(public_keys, issuer, audience, purpose, max_lifetime)
     }
 
     fn from_decoded_public_keys(
@@ -209,7 +157,6 @@ impl ActorJwtVerifier {
         audience: impl Into<String>,
         purpose: ActorTokenPurpose,
         max_lifetime: Duration,
-        jwks_source: Option<ActorJwksSource>,
     ) -> Result<Self> {
         ensure!(
             !max_lifetime.is_zero(),
@@ -224,12 +171,11 @@ impl ActorJwtVerifier {
         ensure!(!issuer.is_empty(), "actor JWT issuer must not be empty");
         ensure!(!audience.is_empty(), "actor JWT audience must not be empty");
         Ok(Self {
-            public_keys: Arc::new(RwLock::new(public_keys)),
+            public_keys: Arc::new(public_keys),
             issuer,
             audience,
             purpose,
             max_lifetime,
-            jwks_source,
         })
     }
 
@@ -240,75 +186,8 @@ impl ActorJwtVerifier {
         let token = bearer_token(request.metadata())?;
         let header =
             token_header(token).map_err(|error| Status::unauthenticated(format!("{error:#}")))?;
-        if !self
-            .contains_key(&header.kid)
-            .map_err(|error| Status::internal(format!("{error:#}")))?
-        {
-            self.refresh_for_unknown_key(&header.kid)
-                .await
-                .map_err(|error| {
-                    Status::unavailable(format!(
-                        "actor JWT verification keys are unavailable: {error:#}"
-                    ))
-                })?;
-        }
         self.verify_with_header(token, header)
             .map_err(|error| Status::unauthenticated(format!("{error:#}")))
-    }
-
-    pub(crate) async fn refresh_jwks(&self) -> Result<()> {
-        let source = self
-            .jwks_source
-            .as_ref()
-            .context("actor JWT verifier does not use JWKS discovery")?;
-        let mut refresh = source.refresh.lock().await;
-        refresh.last_attempt = Some(Instant::now());
-        let public_keys = source.fetch(true).await?;
-        self.replace_decoded_public_keys(public_keys)
-    }
-
-    pub(crate) fn replace_public_keys(&self, public_keys_json: impl AsRef<str>) -> Result<()> {
-        let public_keys = decode_public_keys(public_keys_json.as_ref())?;
-        self.replace_decoded_public_keys(public_keys)
-    }
-
-    fn replace_decoded_public_keys(&self, public_keys: HashMap<String, Vec<u8>>) -> Result<()> {
-        ensure!(
-            !public_keys.is_empty(),
-            "actor JWT public-key set must not be empty"
-        );
-        *self
-            .public_keys
-            .write()
-            .map_err(|_| anyhow::anyhow!("actor JWT public-key lock poisoned"))? = public_keys;
-        Ok(())
-    }
-
-    fn contains_key(&self, key_id: &str) -> Result<bool> {
-        Ok(self
-            .public_keys
-            .read()
-            .map_err(|_| anyhow::anyhow!("actor JWT public-key lock poisoned"))?
-            .contains_key(key_id))
-    }
-
-    async fn refresh_for_unknown_key(&self, key_id: &str) -> Result<()> {
-        let Some(source) = &self.jwks_source else {
-            return Ok(());
-        };
-        let mut refresh = source.refresh.lock().await;
-        if self.contains_key(key_id)? {
-            return Ok(());
-        }
-        if refresh
-            .last_attempt
-            .is_some_and(|last_attempt| last_attempt.elapsed() < JWKS_UNKNOWN_KEY_REFRESH_INTERVAL)
-        {
-            return Ok(());
-        }
-        refresh.last_attempt = Some(Instant::now());
-        let public_keys = source.fetch(true).await?;
-        self.replace_decoded_public_keys(public_keys)
     }
 
     #[cfg(test)]
@@ -333,11 +212,8 @@ impl ActorJwtVerifier {
             header.typ.as_deref().is_none_or(|value| value == "JWT"),
             "actor token has an invalid type"
         );
-        let public_keys = self
+        let public_key = self
             .public_keys
-            .read()
-            .map_err(|_| anyhow::anyhow!("actor JWT public-key lock poisoned"))?;
-        let public_key = public_keys
             .get(&header.kid)
             .with_context(|| format!("actor token uses unknown key ID {:?}", header.kid))?;
         let signature = URL_SAFE_NO_PAD
@@ -351,18 +227,23 @@ impl ActorJwtVerifier {
         let claims: ActorJwtClaims = decode_json_segment(encoded_claims, "claims")?;
         ensure!(claims.iss == self.issuer, "actor token issuer is invalid");
         ensure!(
-            claims.aud == self.audience,
+            claims.aud.contains(&self.audience),
             "actor token audience is invalid"
         );
         ensure!(
-            claims.scope == self.purpose.claim(),
+            claims
+                .scope
+                .split_ascii_whitespace()
+                .any(|scope| scope == self.purpose.claim(claims.process_role)),
             "actor token credential scope is invalid"
         );
-        ensure!(
-            claims.sub == claims.host_id,
-            "actor token subject does not match its host identity"
-        );
-        ensure!(!claims.token_id.is_empty(), "actor token ID is empty");
+        ensure!(!claims.sub.is_empty(), "actor token subject is empty");
+        if claims.process_role == ActorProcessRole::Host {
+            ensure!(
+                claims.sub == claims.host_id,
+                "host token subject does not match its process identity"
+            );
+        }
         ensure!(
             uuid::Uuid::parse_str(&claims.session_id).is_ok(),
             "actor token session ID is invalid"
@@ -399,20 +280,23 @@ impl ActorJwtVerifier {
             scope: ActorScope {
                 namespace_id: claims.namespace_id,
             },
-            token_id: claims.token_id,
             host_id: HostId::new(claims.host_id),
             session_id: claims.session_id,
             process_role: claims.process_role,
             region: claims.region,
             code_revision: claims.code_revision,
+            expires_at: claims.exp,
         };
         principal.scope.validate()?;
+        let process_prefix = match principal.process_role {
+            ActorProcessRole::Host => principal.host_id_prefix(),
+            ActorProcessRole::Workflow => {
+                format!("workflow.v1.{}.", principal.scope.namespace_id)
+            }
+        };
         ensure!(
-            principal
-                .host_id
-                .as_str()
-                .starts_with(&principal.host_id_prefix()),
-            "actor token host does not belong to its namespace"
+            principal.host_id.as_str().starts_with(&process_prefix),
+            "actor token process does not belong to its namespace"
         );
         ensure!(
             !principal.region.is_empty()
@@ -437,26 +321,6 @@ impl ActorJwtVerifier {
     }
 }
 
-impl ActorJwksSource {
-    async fn fetch(&self, force_refresh: bool) -> Result<HashMap<String, Vec<u8>>> {
-        let mut request = self.client.get(self.url.clone());
-        if force_refresh {
-            request = request.header(reqwest::header::CACHE_CONTROL, "no-cache");
-        }
-        let response = request
-            .send()
-            .await
-            .with_context(|| format!("fetch actor JWKS from {}", self.url))?
-            .error_for_status()
-            .with_context(|| format!("fetch actor JWKS from {}", self.url))?;
-        let document = response
-            .json::<ActorJwksDocument>()
-            .await
-            .with_context(|| format!("decode actor JWKS from {}", self.url))?;
-        decode_jwks(document)
-    }
-}
-
 fn token_header(token: &str) -> Result<JwtHeader> {
     let encoded_header = token
         .split('.')
@@ -465,50 +329,6 @@ fn token_header(token: &str) -> Result<JwtHeader> {
     let header: JwtHeader = decode_json_segment(encoded_header, "header")?;
     ensure!(!header.kid.is_empty(), "actor token key ID is empty");
     Ok(header)
-}
-
-fn decode_jwks(document: ActorJwksDocument) -> Result<HashMap<String, Vec<u8>>> {
-    ensure!(
-        !document.keys.is_empty(),
-        "actor JWKS must contain at least one key"
-    );
-    let mut decoded = HashMap::with_capacity(document.keys.len());
-    for key in document.keys {
-        ensure!(!key.kid.is_empty(), "actor JWKS key ID must not be empty");
-        ensure!(
-            key.kty == "OKP" && key.crv == "Ed25519",
-            "actor JWKS key {:?} must be an Ed25519 OKP key",
-            key.kid
-        );
-        ensure!(
-            key.alg
-                .as_deref()
-                .is_none_or(|algorithm| algorithm == "EdDSA"),
-            "actor JWKS key {:?} has an unsupported algorithm",
-            key.kid
-        );
-        ensure!(
-            key.key_use
-                .as_deref()
-                .is_none_or(|key_use| key_use == "sig"),
-            "actor JWKS key {:?} is not a signing key",
-            key.kid
-        );
-        let public_key = URL_SAFE_NO_PAD
-            .decode(&key.x)
-            .with_context(|| format!("decode actor JWKS public key {:?}", key.kid))?;
-        ensure!(
-            public_key.len() == 32,
-            "actor JWKS public key {:?} must be a 32-byte Ed25519 key",
-            key.kid
-        );
-        ensure!(
-            decoded.insert(key.kid.clone(), public_key).is_none(),
-            "actor JWKS contains duplicate key ID {:?}",
-            key.kid
-        );
-    }
-    Ok(decoded)
 }
 
 fn decode_public_keys(public_keys_json: &str) -> Result<HashMap<String, Vec<u8>>> {
@@ -565,21 +385,11 @@ fn unix_seconds() -> Result<i64> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc, Mutex as StdMutex,
-        atomic::{AtomicUsize, Ordering},
-    };
-
     use aws_lc_rs::{
         rand::SystemRandom,
         signature::{Ed25519KeyPair, KeyPair},
     };
     use serde_json::json;
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpListener,
-        task::JoinHandle,
-    };
 
     use super::*;
 
@@ -618,7 +428,6 @@ mod tests {
             "iss": "durable-object-control-plane",
             "aud": "durable-object-authority",
             "sub": "host.v1.namespace-1.00000000-0000-4000-8000-000000000001",
-            "tokenId": "token-1",
             "namespaceId": "namespace-1",
             "processId": "host.v1.namespace-1.00000000-0000-4000-8000-000000000001",
             "sessionId": "00000000-0000-4000-8000-000000000002",
@@ -629,75 +438,6 @@ mod tests {
             "nbf": now,
             "exp": now + 60
         })
-    }
-
-    fn jwks(key_id: &str, key_pair: &Ed25519KeyPair) -> Result<String> {
-        Ok(serde_json::to_string(&json!({
-            "keys": [{
-                "alg": "EdDSA",
-                "crv": "Ed25519",
-                "kid": key_id,
-                "kty": "OKP",
-                "use": "sig",
-                "x": URL_SAFE_NO_PAD.encode(key_pair.public_key().as_ref())
-            }]
-        }))?)
-    }
-
-    struct TestJwksServer {
-        body: Arc<StdMutex<String>>,
-        requests: Arc<AtomicUsize>,
-        task: JoinHandle<()>,
-        url: String,
-    }
-
-    impl TestJwksServer {
-        async fn start(body: String) -> Result<Self> {
-            let listener = TcpListener::bind("127.0.0.1:0").await?;
-            let address = listener.local_addr()?;
-            let body = Arc::new(StdMutex::new(body));
-            let requests = Arc::new(AtomicUsize::new(0));
-            let serve_body = body.clone();
-            let serve_requests = requests.clone();
-            let task = tokio::spawn(async move {
-                loop {
-                    let Ok((mut connection, _)) = listener.accept().await else {
-                        return;
-                    };
-                    let body = serve_body.clone();
-                    let requests = serve_requests.clone();
-                    tokio::spawn(async move {
-                        let mut request = [0_u8; 4096];
-                        if connection.read(&mut request).await.is_err() {
-                            return;
-                        }
-                        requests.fetch_add(1, Ordering::SeqCst);
-                        let body = body.lock().expect("JWKS body lock").clone();
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                            body.len()
-                        );
-                        let _ = connection.write_all(response.as_bytes()).await;
-                    });
-                }
-            });
-            Ok(Self {
-                body,
-                requests,
-                task,
-                url: format!("http://{address}/.well-known/jwks.json"),
-            })
-        }
-
-        fn replace(&self, body: String) {
-            *self.body.lock().expect("JWKS body lock") = body;
-        }
-    }
-
-    impl Drop for TestJwksServer {
-        fn drop(&mut self) {
-            self.task.abort();
-        }
     }
 
     #[test]
@@ -711,7 +451,6 @@ mod tests {
         )?)?;
 
         assert_eq!(principal.scope.namespace_id, "namespace-1");
-        assert_eq!(principal.token_id, "token-1");
         assert_eq!(
             principal.host_id,
             HostId::new("host.v1.namespace-1.00000000-0000-4000-8000-000000000001")
@@ -746,6 +485,8 @@ mod tests {
         claims["aud"] = json!("durable-object-invoke");
         claims["scope"] = json!("actor:invoke");
         claims["processRole"] = json!("workflow");
+        claims["sub"] = json!("execution-1");
+        claims["processId"] = json!("workflow.v1.namespace-1.00000000-0000-4000-8000-000000000001");
         claims["codeRevision"] = json!("revision-1");
         let token = token(
             &key_pair,
@@ -779,7 +520,6 @@ mod tests {
                 "iss": "durable-object-control-plane",
                 "aud": "somewhere-else",
                 "sub": "host.v1.namespace-1.00000000-0000-4000-8000-000000000001",
-                "tokenId": "token-1",
                 "namespaceId": "namespace-1",
                 "processId": "host.v1.namespace-1.00000000-0000-4000-8000-000000000001",
                 "sessionId": "00000000-0000-4000-8000-000000000002",
@@ -798,7 +538,6 @@ mod tests {
                 "iss": "durable-object-control-plane",
                 "aud": "durable-object-authority",
                 "sub": "host.v1.namespace-1.00000000-0000-4000-8000-000000000001",
-                "tokenId": "token-1",
                 "namespaceId": "namespace-1",
                 "processId": "host.v1.namespace-1.00000000-0000-4000-8000-000000000001",
                 "sessionId": "00000000-0000-4000-8000-000000000002",
@@ -824,7 +563,6 @@ mod tests {
                 "iss": "durable-object-control-plane",
                 "aud": "durable-object-authority",
                 "sub": "host.v1.namespace-1.00000000-0000-4000-8000-000000000001",
-                "tokenId": "token-1",
                 "namespaceId": "namespace-1",
                 "processId": "host.v1.namespace-1.00000000-0000-4000-8000-000000000001",
                 "sessionId": "00000000-0000-4000-8000-000000000002",
@@ -835,65 +573,6 @@ mod tests {
             }),
         )?;
         assert!(verifier.verify(&too_long).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn replaces_the_invocation_verification_key_set_during_rotation() -> Result<()> {
-        let (verifier, _old_key) = verifier_and_key_pair()?;
-        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())?;
-        let new_key = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref())?;
-        let rotated = token(
-            &new_key,
-            json!({ "alg": "EdDSA", "kid": "new-key", "typ": "JWT" }),
-            valid_claims(unix_seconds()?),
-        )?;
-        assert!(verifier.verify(&rotated).is_err());
-
-        verifier.replace_public_keys(serde_json::to_string(&HashMap::from([(
-            "new-key",
-            URL_SAFE_NO_PAD.encode(new_key.public_key().as_ref()),
-        )]))?)?;
-
-        assert!(verifier.verify(&rotated).is_ok());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn loads_jwks_and_refreshes_once_for_an_unknown_key_id() -> Result<()> {
-        let old_pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())?;
-        let old_key = Ed25519KeyPair::from_pkcs8(old_pkcs8.as_ref())?;
-        let new_pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())?;
-        let new_key = Ed25519KeyPair::from_pkcs8(new_pkcs8.as_ref())?;
-        let server = TestJwksServer::start(jwks("old-key", &old_key)?).await?;
-        let verifier = ActorJwtVerifier::from_jwks_url(
-            &server.url,
-            "durable-object-control-plane",
-            "durable-object-authority",
-            Duration::from_secs(60),
-        )
-        .await?;
-        server.replace(jwks("new-key", &new_key)?);
-        let rotated = token(
-            &new_key,
-            json!({ "alg": "EdDSA", "kid": "new-key", "typ": "JWT" }),
-            valid_claims(unix_seconds()?),
-        )?;
-        let mut request = Request::new(());
-        request.metadata_mut().insert(
-            AUTHORIZATION,
-            format!("Bearer {rotated}")
-                .parse()
-                .context("bearer metadata")?,
-        );
-
-        let principal = verifier
-            .authenticate(&request)
-            .await
-            .map_err(|status| anyhow::anyhow!(status.to_string()))?;
-        assert_eq!(principal.scope.namespace_id, "namespace-1");
-        assert_eq!(server.requests.load(Ordering::SeqCst), 2);
-        assert!(verifier.verify(&rotated).is_ok());
         Ok(())
     }
 }
