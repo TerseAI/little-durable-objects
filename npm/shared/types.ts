@@ -27,21 +27,15 @@ const invokeCommandSchema = z.object({
     timeout_ms: z.number().int().positive().max(MAX_ACTOR_INVOCATION_TIMEOUT_MS)
 })
 
-const cancelCommandSchema = z.object({
-    type: z.literal("cancel"),
-    request_id: actorComponentSchema,
-    actor: actorIdentitySchema
-})
-
 const evictCommandSchema = z.object({
     type: z.literal("evict"),
     actor: actorIdentitySchema
 })
 
-const executorCommandSchema = z.discriminatedUnion("type", [invokeCommandSchema, cancelCommandSchema, evictCommandSchema])
+const executorCommandSchema = z.discriminatedUnion("type", [invokeCommandSchema, evictCommandSchema])
 
 const actorSessionServerMessageSchema = z.discriminatedUnion("type", [
-    z.object({ type: z.literal("attached"), protocol: z.literal(9) }),
+    z.object({ type: z.literal("attached"), protocol: z.literal(10) }),
     z.object({
         type: z.literal("command"),
         message_id: z.number().int().nonnegative(),
@@ -127,16 +121,15 @@ function isJsonObject(value: JsonValue): value is JsonObject {
 }
 
 type InvokeCommand = z.infer<typeof invokeCommandSchema>
-type CancelCommand = z.infer<typeof cancelCommandSchema>
 type EvictCommand = z.infer<typeof evictCommandSchema>
 type ActorExecutorCommand = z.infer<typeof executorCommandSchema>
 type ActorSessionServerMessage = z.infer<typeof actorSessionServerMessageSchema>
-type ActorExecutorReply = InvokedReply | FailedReply | CancelledReply | EvictedReply
+type ActorExecutorReply = InvokedReply | FailedReply | EvictedReply
 type ActorSessionClientMessage = AttachMessage | ReplyMessage
 
 interface AttachMessage {
     readonly type: "attach"
-    readonly protocol: 9
+    readonly protocol: 10
     readonly actor_types: readonly string[]
 }
 
@@ -158,10 +151,6 @@ interface FailedReply {
     readonly message: string
 }
 
-interface CancelledReply {
-    readonly type: "cancelled"
-}
-
 interface EvictedReply {
     readonly type: "evicted"
 }
@@ -171,7 +160,7 @@ interface ActorWorkerData {
     readonly moduleUrl: string
 }
 
-type ActorWorkerRequest = { readonly type: "invoke"; readonly command: InvokeCommand } | { readonly type: "cancel"; readonly command: CancelCommand }
+type ActorWorkerRequest = { readonly type: "invoke"; readonly command: InvokeCommand }
 
 export { JsonActorStateSerializer, MAX_ACTOR_INVOCATION_TIMEOUT_MS, errorMessage, failedReply, parseActorSessionServerMessage, validateActorComponent }
 export type {
@@ -181,7 +170,6 @@ export type {
     ActorSessionServerMessage,
     ActorWorkerData,
     ActorWorkerRequest,
-    CancelCommand,
     EvictCommand,
     InvokeCommand,
     JsonObject,

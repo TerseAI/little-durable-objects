@@ -11,7 +11,6 @@ include = ["/src/**", "/tests/**", "/proto/**", "/build.rs", "/README.md", "/LIC
 
 [dependencies]
 bytes = "1"
-clap = { version = "4.6.6", features = ["derive", "env"] }
 prost = "0.14"
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["net"] }
@@ -20,12 +19,10 @@ tonic-prost = "0.14"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-litetx = "0.1.0"
 google-cloud-storage = { version = "1.17.0", features = ["unstable-stream"] }
-crc32c = "0.6"
+google-cloud-auth = "1.15.0"
 anyhow = "1.0.104"
 async-trait = "0.1.92"
 aws-lc-rs = { version = "1.18.0", default-features = false, features = ["non-fips"] }

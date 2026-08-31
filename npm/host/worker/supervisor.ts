@@ -2,26 +2,20 @@ import { Worker } from "node:worker_threads"
 
 import { findActorDefinition } from "../../shared/actor.js"
 import { errorMessage, failedReply } from "../../shared/types.js"
-import type { ActorExecutorCommand, ActorExecutorReply, ActorWorkerData, ActorWorkerRequest, CancelCommand, EvictCommand, InvokeCommand } from "../../shared/types.js"
+import type { ActorExecutorCommand, ActorExecutorReply, ActorWorkerData, ActorWorkerRequest, EvictCommand, InvokeCommand } from "../../shared/types.js"
 
-const DEFAULT_CANCELLATION_GRACE_MS = 1_000
 const DEFAULT_ACTOR_IDLE_TIMEOUT_MS = 60_000
 const MAX_RESIDENT_ACTORS = 32
 const MAX_QUEUED_INVOCATIONS_PER_ACTOR = 32
 
 class ActorWorkerSupervisor {
     private readonly actorEntrypointUrl: string
-    private readonly cancellationGraceMs: number
     private readonly actorIdleTimeoutMs: number
     private readonly actors = new Map<string, ResidentActorWorker>()
 
     constructor(options: ActorWorkerSupervisorOptions) {
         this.actorEntrypointUrl = options.actorEntrypointUrl
-        this.cancellationGraceMs = options.cancellationGraceMs ?? DEFAULT_CANCELLATION_GRACE_MS
         this.actorIdleTimeoutMs = options.actorIdleTimeoutMs ?? DEFAULT_ACTOR_IDLE_TIMEOUT_MS
-        if (!Number.isInteger(this.cancellationGraceMs) || this.cancellationGraceMs <= 0) {
-            throw new Error("actor cancellation grace must be a positive integer")
-        }
         if (!Number.isInteger(this.actorIdleTimeoutMs) || this.actorIdleTimeoutMs <= 0) {
             throw new Error("actor idle timeout must be a positive integer")
         }
@@ -31,8 +25,6 @@ class ActorWorkerSupervisor {
         switch (command.type) {
             case "invoke":
                 return this.invoke(command)
-            case "cancel":
-                return this.cancel(command)
             case "evict":
                 return this.evict(command)
             default:
@@ -54,18 +46,12 @@ class ActorWorkerSupervisor {
             actor = new ResidentActorWorker({
                 actorType: definition.actorType,
                 moduleUrl: this.actorEntrypointUrl,
-                cancellationGraceMs: this.cancellationGraceMs,
                 idleTimeoutMs: this.actorIdleTimeoutMs,
                 onIdle: candidate => this.removeIfCurrent(key, candidate)
             })
             this.actors.set(key, actor)
         }
         return actor.invoke(command)
-    }
-
-    private cancel(command: CancelCommand): ActorExecutorReply {
-        this.actors.get(actorKey(command))?.cancel(command)
-        return { type: "cancelled" }
     }
 
     private evict(command: EvictCommand): ActorExecutorReply {
@@ -97,21 +83,17 @@ class ActorWorkerSupervisor {
 class ResidentActorWorker {
     readonly actorType: string
     readonly moduleUrl: string
-    readonly cancellationGraceMs: number
     readonly idleTimeoutMs: number
     readonly onIdle: (actor: ResidentActorWorker) => void
     lastCompletedAt = Date.now()
     private worker: ActorWorker | undefined
     private tail = Promise.resolve()
     private outstanding = 0
-    private activeRequestId: string | undefined
-    private terminationTimer: NodeJS.Timeout | undefined
     private idleTimer: NodeJS.Timeout | undefined
 
     constructor(options: ResidentActorWorkerOptions) {
         this.actorType = options.actorType
         this.moduleUrl = options.moduleUrl
-        this.cancellationGraceMs = options.cancellationGraceMs
         this.idleTimeoutMs = options.idleTimeoutMs
         this.onIdle = options.onIdle
     }
@@ -130,28 +112,17 @@ class ResidentActorWorker {
         return invocation
     }
 
-    cancel(command: CancelCommand): void {
-        if (this.activeRequestId !== command.request_id || this.worker === undefined) return
-        this.worker.cancel(command)
-        this.terminationTimer ??= setTimeout(() => {
-            if (this.activeRequestId !== command.request_id || this.worker === undefined) return
-            this.worker.terminate(`actor invocation did not terminate within ${this.cancellationGraceMs}ms of cancellation`)
-        }, this.cancellationGraceMs)
-    }
-
     isIdle(): boolean {
         return this.outstanding === 0
     }
 
     terminate(reason: string): void {
         if (this.idleTimer !== undefined) clearTimeout(this.idleTimer)
-        if (this.terminationTimer !== undefined) clearTimeout(this.terminationTimer)
         this.worker?.terminate(reason)
         this.worker = undefined
     }
 
     private async invokeNext(command: InvokeCommand): Promise<ActorExecutorReply> {
-        this.activeRequestId = command.request_id
         this.worker ??= new ActorWorker({ actorType: this.actorType, moduleUrl: this.moduleUrl })
         let reply: ActorExecutorReply
         try {
@@ -159,9 +130,6 @@ class ResidentActorWorker {
         } catch (error) {
             reply = failedReply(error instanceof ActorWorkerTerminatedError ? "actor_worker_terminated" : "actor_worker_failed", errorMessage(error))
         } finally {
-            if (this.terminationTimer !== undefined) clearTimeout(this.terminationTimer)
-            this.terminationTimer = undefined
-            this.activeRequestId = undefined
             this.outstanding -= 1
             this.lastCompletedAt = Date.now()
         }
@@ -204,10 +172,6 @@ class ActorWorker {
         } finally {
             if (this.replyResolve === undefined) this.worker.unref()
         }
-    }
-
-    cancel(command: CancelCommand): void {
-        if (this.terminalError === undefined) this.post({ type: "cancel", command })
     }
 
     terminate(reason: string): void {
@@ -254,17 +218,15 @@ function actorKey(command: Pick<InvokeCommand | EvictCommand, "actor">): string 
 
 interface ActorWorkerSupervisorOptions {
     readonly actorEntrypointUrl: string
-    readonly cancellationGraceMs?: number
     readonly actorIdleTimeoutMs?: number
 }
 
 interface ResidentActorWorkerOptions {
     readonly actorType: string
     readonly moduleUrl: string
-    readonly cancellationGraceMs: number
     readonly idleTimeoutMs: number
     readonly onIdle: (actor: ResidentActorWorker) => void
 }
 
-export { ActorWorkerSupervisor, DEFAULT_ACTOR_IDLE_TIMEOUT_MS, DEFAULT_CANCELLATION_GRACE_MS, MAX_QUEUED_INVOCATIONS_PER_ACTOR, MAX_RESIDENT_ACTORS }
+export { ActorWorkerSupervisor, DEFAULT_ACTOR_IDLE_TIMEOUT_MS, MAX_QUEUED_INVOCATIONS_PER_ACTOR, MAX_RESIDENT_ACTORS }
 export type { ActorWorkerSupervisorOptions }

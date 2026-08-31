@@ -22,7 +22,7 @@ use tracing::{debug, info};
 
 use super::{ActorInvocationFailure, ActorKey};
 
-const ACTOR_EXECUTOR_PROTOCOL_VERSION: u32 = 9;
+const ACTOR_EXECUTOR_PROTOCOL_VERSION: u32 = 10;
 pub(crate) const MAX_ACTOR_EXECUTOR_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Serialize)]
@@ -33,12 +33,6 @@ pub struct ActorMethodInvocation {
     pub args: Vec<Value>,
     pub state: Option<Value>,
     pub timeout_ms: u64,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ActorMethodCancellation {
-    pub request_id: String,
-    pub actor: ActorKey,
 }
 
 #[derive(Debug, Serialize)]
@@ -57,8 +51,6 @@ pub trait ActorExecutor: Send + Sync {
     fn supports(&self, actor_type: &str) -> bool;
 
     async fn invoke(&self, invocation: ActorMethodInvocation) -> Result<ActorMethodOutcome>;
-
-    async fn cancel(&self, cancellation: ActorMethodCancellation) -> Result<()>;
 
     async fn evict(&self, _eviction: ActorMethodEviction) -> Result<()> {
         Ok(())
@@ -200,26 +192,8 @@ impl ActorExecutor for JsActorExecutor {
                     message,
                 }))
             }
-            ExecutorReply::Cancelled => {
-                anyhow::bail!("actor executor returned cancellation reply to invocation")
-            }
             ExecutorReply::Evicted => {
                 anyhow::bail!("actor executor returned eviction reply to invocation")
-            }
-        }
-    }
-
-    async fn cancel(&self, cancellation: ActorMethodCancellation) -> Result<()> {
-        match self.exchange(ExecutorCommand::Cancel(cancellation)).await? {
-            ExecutorReply::Cancelled => Ok(()),
-            ExecutorReply::Failed { code, message } => {
-                anyhow::bail!("actor executor rejected cancellation ({code}): {message}")
-            }
-            ExecutorReply::Invoked { .. } => {
-                anyhow::bail!("actor executor returned invocation reply to cancellation")
-            }
-            ExecutorReply::Evicted => {
-                anyhow::bail!("actor executor returned eviction reply to cancellation")
             }
         }
     }
@@ -230,7 +204,7 @@ impl ActorExecutor for JsActorExecutor {
             ExecutorReply::Failed { code, message } => {
                 anyhow::bail!("actor executor rejected eviction ({code}): {message}")
             }
-            ExecutorReply::Invoked { .. } | ExecutorReply::Cancelled => {
+            ExecutorReply::Invoked { .. } => {
                 anyhow::bail!("actor executor returned the wrong reply to eviction")
             }
         }
@@ -430,7 +404,6 @@ enum ActorExecutorClientMessage {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ExecutorCommand {
     Invoke(ActorMethodInvocation),
-    Cancel(ActorMethodCancellation),
     Evict(ActorMethodEviction),
 }
 
@@ -439,7 +412,6 @@ enum ExecutorCommand {
 enum ExecutorReply {
     Invoked { result: Value, state: Value },
     Failed { code: String, message: String },
-    Cancelled,
     Evicted,
 }
 
@@ -498,9 +470,11 @@ mod tests {
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
         writer
-            .write_all(b"{\"type\":\"attach\",\"protocol\":9,\"actor_types\":[\"counter\"]}\n")
+            .write_all(b"{\"type\":\"attach\",\"protocol\":10,\"actor_types\":[\"counter\"]}\n")
             .await?;
-        ensure!(read_json_line(&mut reader).await? == json!({ "type": "attached", "protocol": 9 }));
+        ensure!(
+            read_json_line(&mut reader).await? == json!({ "type": "attached", "protocol": 10 })
+        );
 
         let invocation = read_json_line(&mut reader).await?;
         let invocation_id = invocation["message_id"]

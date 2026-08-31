@@ -1,42 +1,16 @@
 # System architecture
 
-- Why am I SQLite?
-- SQlite DB
-- NDJSON --> { id: 1234, name: "ASDF" } --->
-
-Actor.get("")
-
 ```text
-+----------------------+       admin token       +-------------------------+
-| Terse API            |------------------------>| Rust control plane      |
-| - Terse project ID   | EnsureNamespace         | - JWT issuer + JWKS     |
-| - image + revision   | RegisterLaunchSpec      | - leases + fencing      |
-| - workflow deadline  | IssueWorkflowToken      | - manifests + LTX       |
-+----------+-----------+                         +-----------+-------------+
-           |                                                 |
-           | inject project JWT                              | JSON over stdin/stdout
-           v                                                 v
-+----------------------+                         +-------------------------+
-| Workflow sandbox     |                         | Sandbox provider command|
-| - Actor.get() proxy  |---- ResolveActorHost -->| - selected globally     |
-| - one workflow JWT   |                         | - Modal adapter today   |
-+----------+-----------+                         +-----------+-------------+
-           |                                                 |
-           | direct Invoke gRPC                              | create/reuse
-           v                                                 v
-                              +------------------------------+-------------+
-                              | Regional durable-object host sandbox       |
-                              | - Rust host is the provider's main process  |
-                              | - JS resident actor Workers                 |
-                              | - SQLite cache on provider volume          |
-                              +----------------------+---------------------+
-                                                     |
-                                                     | synchronous LTX publish
-                                                     v
-                              +----------------------+---------------------+
-                              | PostgreSQL + object storage                |
-                              | - namespaces, launch specs, leases         |
-                              | - manifests and ownership epochs           |
-                              | - Rapid logs + Standard checkpoints        |
-                              +--------------------------------------------+
+trusted backend -- admin env token --> control plane
+       |                                  |
+       | project JWT                      | ensure one regional host
+       v                                  v
+workflow -- Invoke(project JWT) --> control plane -- Invoke(host JWT) --> actor host
+                                      |                               |
+                                      | ownership + lease             | signed GET/conditional PUT
+                                      v                               v
+                                  Postgres                    regional GCS bucket
+                                                                    NDJSON state
 ```
+
+The workflow talks only to the control plane. The control plane selects the host and issues short-lived, object-specific storage URLs. Actor code receives neither the admin credential nor GCP credentials.

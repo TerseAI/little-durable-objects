@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 
-use super::{HostLease, HostLeaseRequest, HostLeaseStatus, HostLeaseStore};
+use super::{HostLease, HostLeaseRegistry, HostLeaseRequest, HostLeaseStatus, HostLeaseStore};
 use crate::{host::HostId, postgres::PostgresDatabase};
 
 const REGISTRY_NOW_MS: &str = "(extract(epoch FROM clock_timestamp()) * 1000)::bigint";
@@ -21,7 +21,7 @@ impl PostgresHostLeaseStore {
 }
 
 #[async_trait]
-impl HostLeaseStore for PostgresHostLeaseStore {
+impl HostLeaseRegistry for PostgresHostLeaseStore {
     async fn register(&self, request: &HostLeaseRequest) -> Result<HostLease> {
         request.validate_duration()?;
         let duration_ms = i64::try_from(request.duration_ms)
@@ -59,6 +59,21 @@ impl HostLeaseStore for PostgresHostLeaseStore {
         })
     }
 
+    async fn unregister(&self, id: &HostId, session_id: &str) -> Result<()> {
+        self.database
+            .client()
+            .execute(
+                "DELETE FROM durable_object_host_leases WHERE host_id = $1 AND session_id = $2",
+                &[&id.as_str(), &session_id],
+            )
+            .await
+            .context("unregister PostgreSQL host lease")?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl HostLeaseStore for PostgresHostLeaseStore {
     async fn lease_status(&self, id: &HostId) -> Result<HostLeaseStatus> {
         let row = self
             .database
@@ -97,17 +112,5 @@ impl HostLeaseStore for PostgresHostLeaseStore {
             lease,
             store_now_ms,
         })
-    }
-
-    async fn unregister(&self, id: &HostId, session_id: &str) -> Result<()> {
-        self.database
-            .client()
-            .execute(
-                "DELETE FROM durable_object_host_leases WHERE host_id = $1 AND session_id = $2",
-                &[&id.as_str(), &session_id],
-            )
-            .await
-            .context("unregister PostgreSQL host lease")?;
-        Ok(())
     }
 }

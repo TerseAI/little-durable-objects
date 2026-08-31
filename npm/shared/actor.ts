@@ -1,7 +1,6 @@
 import { actorClient } from "../workflow/client.js"
 
 import { ActorDefinitionError } from "./errors.js"
-import { currentActorInvocation } from "./invocationContext.js"
 import { MAX_ACTOR_INVOCATION_TIMEOUT_MS, validateActorComponent } from "./types.js"
 
 const actorMetadata = new WeakMap<object, ActorMetadata>()
@@ -18,12 +17,6 @@ abstract class Actor {
 
     protected get id(): string {
         return metadataFor(this).actorId
-    }
-
-    protected get signal(): AbortSignal {
-        const signal = currentActorInvocation()?.signal
-        if (signal === undefined) throw new ActorDefinitionError("actor cancellation signal is unavailable outside an actor invocation")
-        return signal
     }
 }
 

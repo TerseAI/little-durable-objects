@@ -101,8 +101,6 @@ impl ActorJwtIssuer {
         &self,
         namespace_id: &str,
         execution_id: &str,
-        code_revision: &str,
-        region: &str,
         deadline_unix_ms: i64,
     ) -> Result<IssuedActorToken> {
         let now_ms = unix_millis()?;
@@ -126,9 +124,9 @@ impl ActorJwtIssuer {
             process_id,
             session_id: uuid::Uuid::new_v4().to_string(),
             process_role: ActorProcessRole::Workflow,
-            region: region.to_owned(),
-            code_revision: Some(code_revision.to_owned()),
-            scope: "actor:resolve actor:invoke".into(),
+            region: "auto".into(),
+            code_revision: None,
+            scope: "actor:invoke".into(),
             iat: now_ms / 1000,
             nbf: now_ms / 1000,
             exp: expires_at_ms / 1000,
@@ -147,7 +145,10 @@ impl ActorJwtIssuer {
         let expires_at_ms = now_ms.saturating_add(duration_millis(self.max_lifetime)?);
         self.issue(ActorJwtClaims {
             iss: self.issuer.clone(),
-            aud: vec![self.authority_audience.clone()],
+            aud: vec![
+                self.authority_audience.clone(),
+                self.invocation_audience.clone(),
+            ],
             sub: host_id.as_str().to_owned(),
             namespace_id: namespace_id.to_owned(),
             process_id: host_id.as_str().to_owned(),
@@ -155,7 +156,7 @@ impl ActorJwtIssuer {
             process_role: ActorProcessRole::Host,
             region: region.to_owned(),
             code_revision: Some(code_revision.to_owned()),
-            scope: "actor:authority".into(),
+            scope: "actor:authority actor:invoke".into(),
             iat: now_ms / 1000,
             nbf: now_ms / 1000,
             exp: expires_at_ms / 1000,

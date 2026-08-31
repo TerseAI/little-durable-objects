@@ -10,16 +10,16 @@ const actorGrpcSchema: INamespace = {
                         ActorHostService: {
                             methods: {
                                 Invoke: {
-                                    requestType: "InvokeActorRequest",
+                                    requestType: "HostInvokeActorRequest",
                                     responseType: "InvokeActorReply"
                                 }
                             }
                         },
                         ActorControlPlaneService: {
                             methods: {
-                                ResolveActorHost: {
-                                    requestType: "ResolveActorHostRequest",
-                                    responseType: "ResolvedActorHost"
+                                Invoke: {
+                                    requestType: "InvokeActorRequest",
+                                    responseType: "InvokeActorReply"
                                 },
                                 Execute: {
                                     requestType: "ControlPlaneRequest",
@@ -113,14 +113,6 @@ const actorGrpcSchema: INamespace = {
                                     type: "string",
                                     id: 2
                                 },
-                                codeRevision: {
-                                    type: "string",
-                                    id: 3
-                                },
-                                region: {
-                                    type: "string",
-                                    id: 4
-                                },
                                 deadlineUnixMs: {
                                     type: "int64",
                                     id: 5
@@ -150,32 +142,11 @@ const actorGrpcSchema: INamespace = {
                                 }
                             }
                         },
-                        ResolveActorHostRequest: {
-                            fields: {
-                                actor: {
-                                    type: "ActorKey",
-                                    id: 1
-                                }
-                            }
-                        },
-                        ResolvedActorHost: {
-                            fields: {
-                                route: {
-                                    type: "string",
-                                    id: 1
-                                }
-                            }
-                        },
                         ControlPlaneRequest: {
                             fields: {
                                 commandJson: {
                                     type: "bytes",
                                     id: 1
-                                },
-                                binaryPayloads: {
-                                    rule: "repeated",
-                                    type: "bytes",
-                                    id: 2
                                 }
                             }
                         },
@@ -184,11 +155,6 @@ const actorGrpcSchema: INamespace = {
                                 replyJson: {
                                     type: "bytes",
                                     id: 1
-                                },
-                                binaryPayloads: {
-                                    rule: "repeated",
-                                    type: "bytes",
-                                    id: 2
                                 }
                             }
                         },
@@ -229,6 +195,22 @@ const actorGrpcSchema: INamespace = {
                                 timeoutMs: {
                                     type: "uint64",
                                     id: 5
+                                }
+                            }
+                        },
+                        HostInvokeActorRequest: {
+                            fields: {
+                                invocation: {
+                                    type: "InvokeActorRequest",
+                                    id: 1
+                                },
+                                ownerEpoch: {
+                                    type: "uint64",
+                                    id: 2
+                                },
+                                stateReadUrl: {
+                                    type: "string",
+                                    id: 3
                                 }
                             }
                         },

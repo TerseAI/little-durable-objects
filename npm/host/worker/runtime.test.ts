@@ -27,14 +27,10 @@ export class Counter extends Actor {
         throw new CounterExplosionError()
     }
 
-    async waitForCancellation(): Promise<never> {
-        return new Promise((_, reject) => {
-            if (this.signal.aborted) {
-                reject(this.signal.reason)
-                return
-            }
-            this.signal.addEventListener("abort", () => reject(this.signal.reason), { once: true })
-        })
+    async incrementAfter(delayMs: number, amount = 1): Promise<number> {
+        await new Promise(resolve => setTimeout(resolve, delayMs))
+        this.count += amount
+        return this.count
     }
 }
 
@@ -213,32 +209,20 @@ test("the injected invoker remains available inside actor unit tests", async () 
     }
 })
 
-test("running actor methods receive cooperative cancellation through AbortSignal", async () => {
+test("an actor method continues after its caller deadline", async () => {
     const runtime = new ActorRuntime(counterDefinition)
-    const invocation = runtime.handle({
-        type: "invoke",
-        request_id: "cancel-request",
-        actor: actorIdentity,
-        method: "waitForCancellation",
-        args: [],
-        state: { count: 2 },
-        timeout_ms: 30_000
-    })
-    await Promise.resolve()
-
     assert.deepEqual(
         await runtime.handle({
-            type: "cancel",
-            request_id: "cancel-request",
-            actor: actorIdentity
+            type: "invoke",
+            request_id: "slow-request",
+            actor: actorIdentity,
+            method: "incrementAfter",
+            args: [10, 3],
+            state: { count: 2 },
+            timeout_ms: 1
         }),
-        { type: "cancelled" }
+        { type: "invoked", result: 5, state: { count: 5 } }
     )
-    assert.deepEqual(await invocation, {
-        type: "failed",
-        code: "actor_method_failed",
-        message: "actor invocation cancelled after its deadline expired"
-    })
 })
 
 class CounterExplosionError extends Error {

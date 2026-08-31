@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::{
     collections::{HashMap, HashSet},
     sync::Mutex,
@@ -46,24 +47,23 @@ impl HostLaunchSpec {
 pub(crate) trait AdminRegistry: Send + Sync {
     async fn ensure_namespace(&self, namespace_id: &str) -> Result<bool>;
     async fn register_launch_spec(&self, spec: &HostLaunchSpec) -> Result<bool>;
-    async fn launch_spec(
-        &self,
-        namespace_id: &str,
-        code_revision: &str,
-    ) -> Result<Option<HostLaunchSpec>>;
+    async fn launch_spec(&self, namespace_id: &str) -> Result<Option<HostLaunchSpec>>;
 }
 
+#[cfg(test)]
 #[derive(Default)]
 pub(crate) struct LocalAdminRegistry {
     state: Mutex<LocalAdminState>,
 }
 
+#[cfg(test)]
 #[derive(Default)]
 struct LocalAdminState {
     namespaces: HashSet<String>,
-    launch_specs: HashMap<(String, String), HostLaunchSpec>,
+    launch_specs: HashMap<String, HostLaunchSpec>,
 }
 
+#[cfg(test)]
 #[async_trait]
 impl AdminRegistry for LocalAdminRegistry {
     async fn ensure_namespace(&self, namespace_id: &str) -> Result<bool> {
@@ -86,35 +86,21 @@ impl AdminRegistry for LocalAdminRegistry {
             state.namespaces.contains(&spec.namespace_id),
             "namespace must be ensured before registering a launch spec"
         );
-        let key = (spec.namespace_id.clone(), spec.code_revision.clone());
-        match state.launch_specs.get(&key) {
-            Some(existing) => {
-                ensure!(
-                    existing == spec,
-                    "a different launch spec is already registered for this namespace and revision"
-                );
-                Ok(false)
-            }
-            None => {
-                state.launch_specs.insert(key, spec.clone());
-                Ok(true)
-            }
-        }
+        let changed = state.launch_specs.get(&spec.namespace_id) != Some(spec);
+        state
+            .launch_specs
+            .insert(spec.namespace_id.clone(), spec.clone());
+        Ok(changed)
     }
 
-    async fn launch_spec(
-        &self,
-        namespace_id: &str,
-        code_revision: &str,
-    ) -> Result<Option<HostLaunchSpec>> {
+    async fn launch_spec(&self, namespace_id: &str) -> Result<Option<HostLaunchSpec>> {
         validate_namespace(namespace_id)?;
-        validate_component("code revision", code_revision, 128)?;
         Ok(self
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("admin registry lock poisoned"))?
             .launch_specs
-            .get(&(namespace_id.to_owned(), code_revision.to_owned()))
+            .get(namespace_id)
             .cloned())
     }
 }
@@ -147,13 +133,20 @@ impl AdminRegistry for PostgresAdminRegistry {
 
     async fn register_launch_spec(&self, spec: &HostLaunchSpec) -> Result<bool> {
         spec.validate()?;
-        let inserted = self
+        if self.launch_spec(&spec.namespace_id).await?.as_ref() == Some(spec) {
+            return Ok(false);
+        }
+        self
             .database
             .client()
             .execute(
-                "INSERT INTO durable_object_launch_specs \
+                "INSERT INTO durable_object_project_specs \
                  (namespace_id, code_revision, image_ref, working_directory, actor_entrypoint) \
-                 VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
+                 VALUES ($1, $2, $3, $4, $5) \
+                 ON CONFLICT (namespace_id) DO UPDATE SET \
+                   code_revision = EXCLUDED.code_revision, image_ref = EXCLUDED.image_ref, \
+                   working_directory = EXCLUDED.working_directory, actor_entrypoint = EXCLUDED.actor_entrypoint, \
+                   updated_at = clock_timestamp()",
                 &[
                     &spec.namespace_id,
                     &spec.code_revision,
@@ -163,43 +156,28 @@ impl AdminRegistry for PostgresAdminRegistry {
                 ],
             )
             .await
-            .context("register PostgreSQL host launch spec")?;
-        if inserted == 1 {
-            return Ok(true);
-        }
-        ensure!(
-            self.launch_spec(&spec.namespace_id, &spec.code_revision)
-                .await?
-                .as_ref()
-                == Some(spec),
-            "a different launch spec is already registered for this namespace and revision"
-        );
-        Ok(false)
+            .context("replace PostgreSQL project launch spec")?;
+        Ok(true)
     }
 
-    async fn launch_spec(
-        &self,
-        namespace_id: &str,
-        code_revision: &str,
-    ) -> Result<Option<HostLaunchSpec>> {
+    async fn launch_spec(&self, namespace_id: &str) -> Result<Option<HostLaunchSpec>> {
         validate_namespace(namespace_id)?;
-        validate_component("code revision", code_revision, 128)?;
         Ok(self
             .database
             .client()
             .query_opt(
-                "SELECT image_ref, working_directory, actor_entrypoint \
-                 FROM durable_object_launch_specs WHERE namespace_id = $1 AND code_revision = $2",
-                &[&namespace_id, &code_revision],
+                "SELECT code_revision, image_ref, working_directory, actor_entrypoint \
+                 FROM durable_object_project_specs WHERE namespace_id = $1",
+                &[&namespace_id],
             )
             .await
             .context("load PostgreSQL host launch spec")?
             .map(|row| HostLaunchSpec {
                 namespace_id: namespace_id.to_owned(),
-                code_revision: code_revision.to_owned(),
-                image_ref: row.get(0),
-                working_directory: row.get(1),
-                actor_entrypoint: row.get(2),
+                code_revision: row.get(0),
+                image_ref: row.get(1),
+                working_directory: row.get(2),
+                actor_entrypoint: row.get(3),
             }))
     }
 }
@@ -241,17 +219,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registration_is_immutable_and_idempotent() -> Result<()> {
+    async fn registration_replaces_the_projects_active_revision() -> Result<()> {
         let registry = LocalAdminRegistry::default();
         assert!(registry.ensure_namespace("project-1").await?);
         assert!(!registry.ensure_namespace("project-1").await?);
         assert!(registry.register_launch_spec(&spec("im-1")).await?);
         assert!(!registry.register_launch_spec(&spec("im-1")).await?);
-        assert!(registry.register_launch_spec(&spec("im-2")).await.is_err());
-        assert_eq!(
-            registry.launch_spec("project-1", "revision-1").await?,
-            Some(spec("im-1"))
-        );
+        let mut replacement = spec("im-2");
+        replacement.code_revision = "revision-2".into();
+        assert!(registry.register_launch_spec(&replacement).await?);
+        assert_eq!(registry.launch_spec("project-1").await?, Some(replacement));
         Ok(())
     }
 }

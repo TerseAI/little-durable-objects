@@ -1,21 +1,12 @@
 mod actor_host;
-mod confirmed_lease;
 mod lease_maintenance;
-mod leased_host;
 mod process;
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
 pub use self::process::{ActorHostConfig, serve_actor_host};
-pub(crate) use self::{
-    actor_host::{ActorHost, ActorHostDependencies},
-    lease_maintenance::{HostLeaseMaintainer, LeaseRenewalTask},
-    leased_host::LeasedActorHost,
-};
-pub(crate) use actor_host::ActorDrainReason;
-pub(crate) use confirmed_lease::ConfirmedLeaseState;
-pub(crate) use leased_host::HOST_ACTOR_DRAIN_TIMEOUT;
+pub(crate) use self::{actor_host::ActorHost, lease_maintenance::HostLeaseMaintainer};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

@@ -18,19 +18,10 @@ try {
     const runtime = new ActorRuntime(definition)
 
     port.on("message", (message: ActorWorkerRequest) => {
-        switch (message.type) {
-            case "invoke":
-                void runtime.handle(message.command).then(
-                    reply => post(reply),
-                    error => post(failedReply("actor_worker_failed", errorMessage(error)))
-                )
-                break
-            case "cancel":
-                void runtime.handle(message.command)
-                break
-            default:
-                throw message satisfies never
-        }
+        void runtime.handle(message.command).then(
+            reply => post(reply),
+            error => post(failedReply("actor_worker_failed", errorMessage(error)))
+        )
     })
 } catch (error) {
     post(failedReply("actor_worker_failed", errorMessage(error)))

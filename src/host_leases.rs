@@ -1,3 +1,4 @@
+#[cfg(test)]
 mod local;
 mod postgres;
 
@@ -6,7 +7,7 @@ use anyhow::{Result, ensure};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-pub use self::{local::LocalHostLeaseStore, postgres::PostgresHostLeaseStore};
+pub use self::postgres::PostgresHostLeaseStore;
 
 pub const MAX_HOST_LEASE_DURATION_MS: u64 = 60_000;
 
@@ -53,12 +54,14 @@ impl HostLeaseStatus {
 }
 
 #[async_trait]
-pub trait HostLeaseStore: Send + Sync {
+pub trait HostLeaseRegistry: Send + Sync {
     async fn register(&self, request: &HostLeaseRequest) -> Result<HostLease>;
-
-    async fn lease_status(&self, id: &HostId) -> Result<HostLeaseStatus>;
-
     async fn unregister(&self, id: &HostId, session_id: &str) -> Result<()>;
+}
+
+#[async_trait]
+pub trait HostLeaseStore: HostLeaseRegistry {
+    async fn lease_status(&self, id: &HostId) -> Result<HostLeaseStatus>;
 }
 
 #[cfg(test)]

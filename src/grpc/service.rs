@@ -1,19 +1,23 @@
 use std::sync::Arc;
 
 use tonic::{Request, Response, Status};
-use tracing::{debug, error, warn};
+use tracing::{error, warn};
 
 use super::proto::{
-    InvokeActorReply, InvokeActorRequest,
+    HostInvokeActorRequest, InvokeActorReply,
     actor_host_service_server::{ActorHostService, ActorHostServiceServer},
 };
 use crate::{
-    actor::{ActorInvocation, MAX_ACTOR_EXECUTOR_MESSAGE_BYTES},
+    actor::{
+        ActorExecutionResult, ActorInvocation, ActorInvocationFailure,
+        MAX_ACTOR_EXECUTOR_MESSAGE_BYTES,
+    },
     control_plane::ActorJwtVerifier,
-    host::{ActorHost, ActorProcessRole},
+    host::{ActorHost, ActorProcessRole, HostId},
 };
 
 pub(crate) struct ActorHostGrpcService {
+    host_id: HostId,
     host: Arc<ActorHost>,
     invocation_auth: ActorJwtVerifier,
 }
@@ -21,6 +25,7 @@ pub(crate) struct ActorHostGrpcService {
 impl ActorHostGrpcService {
     pub(crate) fn new(host: Arc<ActorHost>, auth: ActorJwtVerifier) -> Self {
         Self {
+            host_id: host.id().clone(),
             host,
             invocation_auth: auth,
         }
@@ -35,50 +40,65 @@ impl ActorHostGrpcService {
 
 #[tonic::async_trait]
 impl ActorHostService for ActorHostGrpcService {
-    #[tracing::instrument(name = "actor.host.invoke", skip(self, request))]
     async fn invoke(
         &self,
-        request: Request<InvokeActorRequest>,
+        request: Request<HostInvokeActorRequest>,
     ) -> Result<Response<InvokeActorReply>, Status> {
         let principal = self.invocation_auth.authenticate(&request).await?;
-        if principal.process_role != ActorProcessRole::Workflow {
+        if principal.process_role != ActorProcessRole::Host || principal.host_id != self.host_id {
             return Err(Status::permission_denied(
-                "actor invocation credential has the wrong process role",
+                "actor invocation credential is not for this host",
             ));
         }
-        let invocation: ActorInvocation = request.into_inner().try_into().map_err(|error| {
-            warn!(
-                error = %format!("{error:#}"),
-                "rejected invalid actor invocation"
-            );
-            Status::invalid_argument(format!("{error:#}"))
-        })?;
+        let request = request.into_inner();
+        let invocation: ActorInvocation = request
+            .invocation
+            .ok_or_else(|| Status::invalid_argument("actor invocation is required"))?
+            .try_into()
+            .map_err(|error| Status::invalid_argument(format!("{error:#}")))?;
         if !principal.scope.contains(&invocation.actor) {
             return Err(Status::permission_denied(
                 "actor invocation crossed namespace scope",
             ));
         }
+        if request.owner_epoch == 0 || request.state_read_url.is_empty() {
+            return Err(Status::invalid_argument(
+                "actor ownership capability is incomplete",
+            ));
+        }
 
+        // The task is deliberately detached: a caller deadline stops waiting but
+        // never cancels an accepted actor method or releases its actor gate early.
+        let host = self.host.clone();
         let request_id = invocation.request_id.clone();
-        let reply = self
-            .host
-            .invoke_actor(invocation)
-            .await
-            .map_err(|execution_error| {
-                error!(
-                    request_id,
-                    caller_host_id = %principal.host_id,
-                    caller_session_id = %principal.session_id,
-                    error = %format!("{execution_error:#}"),
-                    "actor invocation failed"
-                );
-                Status::internal(format!("{execution_error:#}"))
-            })?;
-        debug!(
-            request_id,
-            caller_host_id = %principal.host_id,
-            "actor invocation completed"
-        );
-        Ok(Response::new(reply.into()))
+        let task_request_id = request_id.clone();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = match host
+                .invoke_actor(invocation, request.owner_epoch, request.state_read_url)
+                .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    warn!(request_id = task_request_id, error = %format!("{error:#}"), "actor invocation failed before execution");
+                    ActorExecutionResult::Failed {
+                        failure: ActorInvocationFailure {
+                            code: "unavailable".into(),
+                            message: "actor could not start because its state was unavailable"
+                                .into(),
+                        },
+                    }
+                }
+            };
+            let _ = reply_tx.send(InvokeActorReply::from(result));
+        });
+
+        match reply_rx.await {
+            Ok(reply) => Ok(Response::new(reply)),
+            Err(error) => {
+                error!(request_id, error = %error, "actor invocation task stopped without a reply");
+                Err(Status::internal("actor invocation task stopped"))
+            }
+        }
     }
 }

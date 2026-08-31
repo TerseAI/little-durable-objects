@@ -20,13 +20,10 @@ const actorSessionSettingsSchema = z.object({
 })
 
 class ActorSession {
-    private readonly cancellationGraceMs: number | undefined
     private startup: Promise<void> | undefined
     private connection: ActorSessionConnection | undefined
 
-    constructor(options: ActorSessionOptions = {}) {
-        this.cancellationGraceMs = options.cancellationGraceMs
-    }
+    constructor() {}
 
     start(): Promise<void> {
         this.startup ??= this.initialize()
@@ -39,7 +36,6 @@ class ActorSession {
         const actorTypes = await loadActorEntrypoint(actorEntrypointUrl)
         const supervisor = new ActorWorkerSupervisor({
             actorEntrypointUrl,
-            cancellationGraceMs: this.cancellationGraceMs,
             actorIdleTimeoutMs: settings.actorIdleTimeoutMs
         })
         const commandHandler = (command: ActorExecutorCommand): Promise<ActorExecutorReply> => supervisor.handle(command)
@@ -78,7 +74,7 @@ class ActorSessionConnection {
         if (actorTypes.length === 0) throw new ActorSessionError("the actor entrypoint does not export any actor classes")
         const socket = await connectSocket(socketPath)
         const connection = new ActorSessionConnection(socket, commandHandler)
-        connection.send({ type: "attach", protocol: 9, actor_types: actorTypes })
+        connection.send({ type: "attach", protocol: 10, actor_types: actorTypes })
         await connection.waitUntilAttached(timeoutMs)
         return connection
     }
@@ -256,11 +252,6 @@ async function runActorHost(): Promise<never> {
     throw new ActorSessionError("Rust host disconnected from actor session")
 }
 
-interface ActorSessionOptions {
-    readonly cancellationGraceMs?: number
-}
-
 type ActorCommandHandler = (command: ActorExecutorCommand) => Promise<ActorExecutorReply>
 
 export { ActorSession, ActorSessionSettings, runActorHost }
-export type { ActorSessionOptions }

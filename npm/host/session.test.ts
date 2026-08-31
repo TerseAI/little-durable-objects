@@ -22,7 +22,7 @@ test("the actor session carries only owned execution commands", async () => {
     const { ActorSession, ActorSessionSettings } = await import("./session.js")
     server.listen(socketPath)
     await once(server, "listening")
-    const session = new ActorSession({ cancellationGraceMs: 20 })
+    const session = new ActorSession()
     const startup = session.start()
 
     try {
@@ -32,10 +32,10 @@ test("the actor session carries only owned execution commands", async () => {
 
         assert.deepEqual(await readMessage(iterator), {
             type: "attach",
-            protocol: 9,
+            protocol: 10,
             actor_types: ["SessionCounter"]
         })
-        customerSocket.write(`${JSON.stringify({ type: "attached", protocol: 9 })}\n`)
+        customerSocket.write(`${JSON.stringify({ type: "attached", protocol: 10 })}\n`)
         await startup
 
         customerSocket.write(
@@ -68,41 +68,15 @@ test("the actor session carries only owned execution commands", async () => {
                 type: "command",
                 message_id: 2,
                 command: {
-                    type: "invoke",
-                    request_id: "spin-request",
-                    actor: actorIdentity(),
-                    method: "spinForever",
-                    args: [],
-                    state: { count: 4 },
-                    timeout_ms: 30_000
-                }
-            })}\n`
-        )
-        await new Promise(resolve => setTimeout(resolve, 75))
-        customerSocket.write(
-            `${JSON.stringify({
-                type: "command",
-                message_id: 3,
-                command: {
-                    type: "cancel",
-                    request_id: "spin-request",
+                    type: "evict",
                     actor: actorIdentity()
                 }
             })}\n`
         )
         assert.deepEqual(await readMessage(iterator), {
             type: "reply",
-            message_id: 3,
-            reply: { type: "cancelled" }
-        })
-        assert.deepEqual(await readMessage(iterator), {
-            type: "reply",
             message_id: 2,
-            reply: {
-                type: "failed",
-                code: "actor_worker_terminated",
-                message: "actor invocation did not terminate within 20ms of cancellation"
-            }
+            reply: { type: "evicted" }
         })
 
         customerSocket.end()

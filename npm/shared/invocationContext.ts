@@ -12,7 +12,6 @@ function currentActorInvocation(): ActorInvocationContext | undefined {
 
 interface ActorInvocationContext {
     readonly deadline: number
-    readonly signal: AbortSignal
 }
 
 export { currentActorInvocation, runInActorInvocation }

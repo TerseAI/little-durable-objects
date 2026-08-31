@@ -1,4 +1,4 @@
-use super::{HostLease, HostLeaseRequest, HostLeaseStatus, HostLeaseStore};
+use super::{HostLease, HostLeaseRegistry, HostLeaseRequest, HostLeaseStatus, HostLeaseStore};
 use crate::{
     clock::{Clock, SystemClock},
     host::HostId,
@@ -58,7 +58,7 @@ impl LocalHostLeaseStore {
 }
 
 #[async_trait]
-impl HostLeaseStore for LocalHostLeaseStore {
+impl HostLeaseRegistry for LocalHostLeaseStore {
     async fn register(&self, request: &HostLeaseRequest) -> Result<HostLease> {
         request.validate_duration()?;
         let _mutation = self.mutations.lock().await;
@@ -89,14 +89,6 @@ impl HostLeaseStore for LocalHostLeaseStore {
         Ok(lease)
     }
 
-    async fn lease_status(&self, id: &HostId) -> Result<HostLeaseStatus> {
-        let _mutation = self.mutations.lock().await;
-        Ok(HostLeaseStatus {
-            lease: self.load(id).await?,
-            store_now_ms: self.clock.now_ms()?,
-        })
-    }
-
     async fn unregister(&self, id: &HostId, session_id: &str) -> Result<()> {
         let _mutation = self.mutations.lock().await;
         let Some(lease) = self.load(id).await? else {
@@ -110,6 +102,17 @@ impl HostLeaseStore for LocalHostLeaseStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error.into()),
         }
+    }
+}
+
+#[async_trait]
+impl HostLeaseStore for LocalHostLeaseStore {
+    async fn lease_status(&self, id: &HostId) -> Result<HostLeaseStatus> {
+        let _mutation = self.mutations.lock().await;
+        Ok(HostLeaseStatus {
+            lease: self.load(id).await?,
+            store_now_ms: self.clock.now_ms()?,
+        })
     }
 }
 

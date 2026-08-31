@@ -51,14 +51,6 @@ impl ActorExecutionLocks {
         }))
     }
 
-    #[cfg(test)]
-    pub async fn acquire(&self, storage_key: &ActorStorageKey) -> Result<ActorExecutionGuard> {
-        match self.admit(storage_key).await? {
-            ActorExecutionAdmission::Acquired(guard) => Ok(guard),
-            ActorExecutionAdmission::Full => anyhow::bail!("actor execution queue is full"),
-        }
-    }
-
     fn gate(&self, storage_key: &ActorStorageKey) -> Result<Arc<ActorExecutionGate>> {
         let mut locks = self
             .locks

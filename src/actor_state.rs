@@ -1,25 +1,11 @@
-mod database;
-mod database_store;
 mod execution_locks;
-mod ownership;
-mod restore_cache;
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
 use anyhow::{Result, ensure};
 
-#[cfg(test)]
-pub(crate) use self::database::ActorDatabaseTestExt;
-pub use self::{
-    database::{ActorDatabaseError, SqliteActorDatabase},
-    database_store::ActorDatabaseStore,
-    ownership::ActorOwner,
-};
-pub(crate) use self::{
-    execution_locks::{ActorExecutionAdmission, ActorExecutionGuard, ActorExecutionLocks},
-    restore_cache::ActorRestoreCache,
-};
+pub(crate) use self::execution_locks::{ActorExecutionAdmission, ActorExecutionLocks};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ActorStorageKey(String);

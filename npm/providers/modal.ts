@@ -1,5 +1,5 @@
 import { AlreadyExistsError, ModalClient, NotFoundError } from "modal"
-import type { App, Sandbox, Volume } from "modal"
+import type { App, Sandbox } from "modal"
 import { createHash } from "node:crypto"
 
 import { canonicalRegionForModal, modalPlacement } from "../regions.js"
@@ -8,7 +8,6 @@ import type { CanonicalRegionCatalog } from "../regions.js"
 import type { ActorHostHandle, EnsureHostRequest, SandboxProvider } from "./types.js"
 
 const hostPort = 7101
-const cacheMount = "/var/cache/durable-objects"
 const hostRouteFile = "/tmp/durable-object-route"
 const readyFile = "/tmp/durable-object-ready"
 const maximumSandboxLifetimeMs = 24 * 60 * 60 * 1000
@@ -44,7 +43,7 @@ class ModalSandboxProvider implements SandboxProvider {
     private async ensureHostOnce(request: EnsureHostRequest, name: string): Promise<ActorHostHandle> {
         validateEnsureRequest(request)
         const placement = modalPlacement(request.canonicalRegion, this.options.catalog)
-        const [app, image, cache] = await Promise.all([this.modal.apps.fromName(this.appName, { createIfMissing: true }), this.modal.images.fromId(request.imageRef), this.cacheVolume(request)])
+        const [app, image] = await Promise.all([this.modal.apps.fromName(this.appName, { createIfMissing: true }), this.modal.images.fromId(request.imageRef)])
         const existing = await this.existing(app, name)
         if (existing) {
             try {
@@ -72,8 +71,7 @@ class ModalSandboxProvider implements SandboxProvider {
                 env: hostEnvironment(request),
                 h2Ports: [hostPort],
                 regions: [...placement.regions],
-                cloud: placement.cloud,
-                volumes: { [cacheMount]: cache.volume }
+                cloud: placement.cloud
             })
         } catch (error) {
             if (!(error instanceof AlreadyExistsError)) throw error
@@ -88,41 +86,9 @@ class ModalSandboxProvider implements SandboxProvider {
             throw new Error(`Modal placed host in ${observedCanonical ?? "an unknown region"}; expected ${request.canonicalRegion}`)
         }
 
-        const handle = await this.start(sandbox, request, cache.source)
+        const handle = await this.start(sandbox, request)
         await writeMetadata(sandbox, handle)
         return handle
-    }
-
-    async status(request: EnsureHostRequest): Promise<"serving" | "warm" | "cold"> {
-        const app = await this.modal.apps.fromName(this.appName, { createIfMissing: true })
-        if (await this.existing(app, resourceName("host", request))) return "serving"
-        try {
-            await this.modal.volumes.fromName(resourceName("cache", request))
-            return "warm"
-        } catch (error) {
-            if (error instanceof NotFoundError) return "cold"
-            throw error
-        }
-    }
-
-    async deactivate(request: EnsureHostRequest): Promise<void> {
-        const app = await this.modal.apps.fromName(this.appName, { createIfMissing: true })
-        await (await this.existing(app, resourceName("host", request)))?.terminate()
-    }
-
-    async removeLocalCache(request: EnsureHostRequest): Promise<void> {
-        await this.deactivate(request)
-        await this.modal.volumes.delete(resourceName("cache", request), { allowMissing: true })
-    }
-
-    private async cacheVolume(request: EnsureHostRequest): Promise<{ volume: Volume; source: ActorHostHandle["cacheSource"] }> {
-        const name = resourceName("cache", request)
-        try {
-            return { volume: await this.modal.volumes.fromName(name), source: "volume" }
-        } catch (error) {
-            if (!(error instanceof NotFoundError)) throw error
-            return { volume: await this.modal.volumes.fromName(name, { createIfMissing: true }), source: "durable_storage" }
-        }
     }
 
     private async existing(app: App, name: string): Promise<Sandbox | undefined> {
@@ -147,7 +113,7 @@ class ModalSandboxProvider implements SandboxProvider {
         return handle
     }
 
-    private async start(sandbox: Sandbox, request: EnsureHostRequest, cacheSource: ActorHostHandle["cacheSource"]): Promise<ActorHostHandle> {
+    private async start(sandbox: Sandbox, request: EnsureHostRequest): Promise<ActorHostHandle> {
         const route = (await sandbox.tunnels())[hostPort]?.url
         if (!route) throw new Error("Modal did not create the durable-object HTTP/2 tunnel")
         await writeFile(sandbox, hostRouteFile, route)
@@ -156,7 +122,7 @@ class ModalSandboxProvider implements SandboxProvider {
             await sandbox.terminate()
             throw new Error("durable-object host did not become ready")
         }
-        return { hostId: request.hostId, route, canonicalRegion: request.canonicalRegion, cacheSource }
+        return { hostId: request.hostId, route, canonicalRegion: request.canonicalRegion }
     }
 }
 
@@ -173,7 +139,6 @@ function hostEnvironment(request: EnsureHostRequest): Record<string, string> {
         DURABLE_OBJECT_SESSION_ID: request.sessionId,
         DURABLE_OBJECT_REGION: request.canonicalRegion,
         DURABLE_OBJECT_CODE_REVISION: request.codeRevision,
-        DURABLE_OBJECT_LOCAL_ROOT: `${cacheMount}/runtime`,
         DURABLE_OBJECT_EXECUTOR_SOCKET: "/tmp/durable-object-executor.sock",
         DURABLE_OBJECT_HOST_READY_FILE: readyFile,
         DURABLE_OBJECT_HOST_BIND: `0.0.0.0:${hostPort}`,

@@ -48,12 +48,34 @@ impl From<ActorExecutionResult> for proto::InvokeActorReply {
             }),
             ActorExecutionResult::Reroute => Result::Reroute(proto::Reroute {}),
             ActorExecutionResult::HostUnavailable => Result::Failed(proto::ActorFailed {
-                code: "host_unavailable".into(),
+                code: "unavailable".into(),
                 message: "actor host is draining".into(),
             }),
         };
         Self {
             result: Some(result),
+        }
+    }
+}
+
+impl TryFrom<proto::InvokeActorReply> for ActorExecutionResult {
+    type Error = anyhow::Error;
+
+    fn try_from(reply: proto::InvokeActorReply) -> Result<Self> {
+        use proto::invoke_actor_reply::Result as WireResult;
+
+        match reply.result.context("actor reply omitted its result")? {
+            WireResult::Completed(completed) => Ok(Self::Completed {
+                result: serde_json::from_slice(&completed.result_json)
+                    .context("actor result is not valid JSON")?,
+            }),
+            WireResult::Failed(failed) => Ok(Self::Failed {
+                failure: crate::actor::ActorInvocationFailure {
+                    code: failed.code,
+                    message: failed.message,
+                },
+            }),
+            WireResult::Reroute(_) => Ok(Self::Reroute),
         }
     }
 }

@@ -1,8 +1,8 @@
 # @terse/durable-objects
 
-The package provides the typed `Actor` API, direct gRPC workflow client, JavaScript host executor, canonical-region catalog, provider contract, and bundled Modal command.
+The package provides the typed `Actor` API, control-plane gRPC client, JavaScript host executor, canonical-region catalog, provider contract, and bundled Modal command.
 
-Workflow sandboxes receive one system-issued project JWT. The same token authorizes route resolution and direct host invocation:
+Workflow sandboxes receive one system-issued project JWT and use it only with the control plane:
 
 ```ts
 import { Actor, configureDurableObjects } from "@terse/durable-objects"
@@ -16,7 +16,7 @@ configureDurableObjects({
 export class Counter extends Actor {
   count = 0
 
-  increment(): number {
+  async increment(): Promise<number> {
     return ++this.count
   }
 }

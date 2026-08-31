@@ -75,8 +75,7 @@ test("creates Modal with the host as its main process and injects only runtime c
     assert.deepEqual(handle, {
         hostId: "host.v1.project-1.00000000-0000-4000-8000-000000000001",
         route: "https://host.example.com",
-        canonicalRegion: "north-america-east",
-        cacheSource: "durable_storage"
+        canonicalRegion: "north-america-east"
     })
     assert.equal(createOptions?.timeoutMs, 86_400_000)
     assert.equal(createOptions?.idleTimeoutMs, 300_000)

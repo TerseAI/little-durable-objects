@@ -6,6 +6,3 @@ pub(crate) mod proto {
 }
 
 pub(crate) use self::service::ActorHostGrpcService;
-
-#[cfg(test)]
-mod tests;

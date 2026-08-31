@@ -35,15 +35,6 @@ pub struct ActorHostHandle {
     pub host_id: HostId,
     pub route: String,
     pub canonical_region: String,
-    pub cache_source: CacheSource,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CacheSource {
-    Volume,
-    #[default]
-    DurableStorage,
 }
 
 #[async_trait]

@@ -16,29 +16,28 @@ use tracing::{debug, info, warn};
 
 use crate::{
     clock::Clock,
-    host_leases::{HostLease, HostLeaseRequest, HostLeaseStore},
+    host_leases::{HostLease, HostLeaseRegistry, HostLeaseRequest},
 };
 
-use super::{ConfirmedLeaseState, HostEndpoint};
+use super::HostEndpoint;
 
 const LEASE_RENEWAL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(crate) struct HostLeaseMaintainer {
     endpoint: HostEndpoint,
     session_id: String,
-    store: Arc<dyn HostLeaseStore>,
+    store: Arc<dyn HostLeaseRegistry>,
     clock: Arc<dyn Clock>,
     lease_duration_ms: u64,
     renew_every: Duration,
     consecutive_failures: AtomicU64,
-    confirmed_lease: Option<Arc<ConfirmedLeaseState>>,
 }
 
 impl HostLeaseMaintainer {
     pub(crate) fn new(
         endpoint: HostEndpoint,
         session_id: String,
-        store: Arc<dyn HostLeaseStore>,
+        store: Arc<dyn HostLeaseRegistry>,
         clock: Arc<dyn Clock>,
         lease_duration: Duration,
         renew_every: Duration,
@@ -66,16 +65,7 @@ impl HostLeaseMaintainer {
             lease_duration_ms,
             renew_every,
             consecutive_failures: AtomicU64::new(0),
-            confirmed_lease: None,
         })
-    }
-
-    pub(crate) fn with_confirmed_lease(
-        mut self,
-        confirmed_lease: Arc<ConfirmedLeaseState>,
-    ) -> Self {
-        self.confirmed_lease = Some(confirmed_lease);
-        self
     }
 
     async fn renew_once_with_deadline(&self) -> Result<ConfirmedHostLease> {
@@ -95,9 +85,6 @@ impl HostLeaseMaintainer {
         };
 
         let lease = self.store.register(&request).await?;
-        if let Some(confirmed_lease) = &self.confirmed_lease {
-            confirmed_lease.record_renewal(local_valid_until_ms);
-        }
         self.consecutive_failures.store(0, Ordering::Relaxed);
 
         debug!(
@@ -124,10 +111,6 @@ impl HostLeaseMaintainer {
             lease,
             local_deadline,
         })
-    }
-
-    pub(crate) fn consecutive_failures(&self) -> u64 {
-        self.consecutive_failures.load(Ordering::Relaxed)
     }
 
     pub(crate) async fn unregister(&self) -> Result<()> {
@@ -253,7 +236,7 @@ mod tests {
     use crate::{
         clock::{Clock, SystemClock},
         host::HostId,
-        host_leases::{HostLease, HostLeaseStatus},
+        host_leases::HostLease,
     };
     use async_trait::async_trait;
     use std::sync::{
@@ -293,7 +276,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl HostLeaseStore for HangingLeaseRenewalStore {
+    impl HostLeaseRegistry for HangingLeaseRenewalStore {
         async fn register(&self, request: &HostLeaseRequest) -> Result<HostLease> {
             if self.calls.fetch_add(1, Ordering::SeqCst) > 0 {
                 return std::future::pending().await;
@@ -308,25 +291,13 @@ mod tests {
             Ok(lease)
         }
 
-        async fn lease_status(&self, id: &HostId) -> Result<HostLeaseStatus> {
-            Ok(HostLeaseStatus {
-                lease: self
-                    .lease
-                    .lock()
-                    .expect("test store lock")
-                    .clone()
-                    .filter(|lease| &lease.id == id),
-                store_now_ms: SystemClock.now_ms()?,
-            })
-        }
-
         async fn unregister(&self, _id: &HostId, _session_id: &str) -> Result<()> {
             Ok(())
         }
     }
 
     #[async_trait]
-    impl HostLeaseStore for FlakyLeaseStore {
+    impl HostLeaseRegistry for FlakyLeaseStore {
         async fn register(&self, request: &HostLeaseRequest) -> Result<HostLease> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
             self.changed.notify_one();
@@ -342,18 +313,6 @@ mod tests {
             *self.lease.lock().expect("test store lock") = Some(lease.clone());
 
             Ok(lease)
-        }
-
-        async fn lease_status(&self, id: &HostId) -> Result<HostLeaseStatus> {
-            Ok(HostLeaseStatus {
-                lease: self
-                    .lease
-                    .lock()
-                    .expect("test store lock")
-                    .clone()
-                    .filter(|lease| &lease.id == id),
-                store_now_ms: self.clock.now_ms()?,
-            })
         }
 
         async fn unregister(&self, id: &HostId, session_id: &str) -> Result<()> {
@@ -452,7 +411,7 @@ mod tests {
                 .expires_at_ms,
             2_500
         );
-        assert_eq!(manager.consecutive_failures(), 0);
+        assert_eq!(manager.consecutive_failures.load(Ordering::Relaxed), 0);
 
         renewal.shutdown().await?;
         let calls_after_shutdown = store.calls.load(Ordering::SeqCst);

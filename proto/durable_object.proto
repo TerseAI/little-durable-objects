@@ -3,11 +3,11 @@ syntax = "proto3";
 package durable_object.v1;
 
 service ActorHostService {
-  rpc Invoke(InvokeActorRequest) returns (InvokeActorReply);
+  rpc Invoke(HostInvokeActorRequest) returns (InvokeActorReply);
 }
 
 service ActorControlPlaneService {
-  rpc ResolveActorHost(ResolveActorHostRequest) returns (ResolvedActorHost);
+  rpc Invoke(InvokeActorRequest) returns (InvokeActorReply);
   rpc Execute(ControlPlaneRequest) returns (ControlPlaneReply);
 }
 
@@ -41,8 +41,6 @@ message RegisterLaunchSpecReply {
 message IssueWorkflowTokenRequest {
   string namespace_id = 1;
   string execution_id = 2;
-  string code_revision = 3;
-  string region = 4;
   int64 deadline_unix_ms = 5;
 }
 
@@ -57,22 +55,12 @@ message GetJwksReply {
   bytes jwks_json = 1;
 }
 
-message ResolveActorHostRequest {
-  ActorKey actor = 1;
-}
-
-message ResolvedActorHost {
-  string route = 1;
-}
-
 message ControlPlaneRequest {
   bytes command_json = 1;
-  repeated bytes binary_payloads = 2;
 }
 
 message ControlPlaneReply {
   bytes reply_json = 1;
-  repeated bytes binary_payloads = 2;
 }
 
 message ActorKey {
@@ -87,6 +75,12 @@ message InvokeActorRequest {
   string method = 3;
   bytes args_json = 4;
   uint64 timeout_ms = 5;
+}
+
+message HostInvokeActorRequest {
+  InvokeActorRequest invocation = 1;
+  uint64 owner_epoch = 2;
+  string state_read_url = 3;
 }
 
 message InvokeActorReply {

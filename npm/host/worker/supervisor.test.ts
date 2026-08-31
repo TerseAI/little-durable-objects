@@ -15,31 +15,28 @@ const actorIdentity = {
     actor_id: "counter-1"
 }
 
-test("terminates an uncooperative actor Worker and recreates it from durable state", async () => {
+test("continues an invocation after its caller deadline and preserves ordering", async () => {
     const consumerRoot = await createTypeScriptConsumer()
     const entrypoint = pathToFileURL(path.join(consumerRoot, "src/durable-objects.ts")).href
     try {
-        await exerciseHardCancellation(entrypoint)
+        await exerciseContinuedExecution(entrypoint)
     } finally {
         await rm(consumerRoot, { recursive: true, force: true })
     }
 })
 
-async function exerciseHardCancellation(entrypoint: string): Promise<void> {
+async function exerciseContinuedExecution(entrypoint: string): Promise<void> {
     assert.deepEqual(await loadActorEntrypoint(entrypoint), ["SessionCounter"])
-    const runtime = new ActorWorkerSupervisor({
-        cancellationGraceMs: 20,
-        actorEntrypointUrl: entrypoint
-    })
+    const runtime = new ActorWorkerSupervisor({ actorEntrypointUrl: entrypoint })
 
     const invocation = runtime.handle({
         type: "invoke",
-        request_id: "spin-request",
+        request_id: "slow-request",
         actor: actorIdentity,
-        method: "spinForever",
-        args: [],
+        method: "incrementAfter",
+        args: [20, 2],
         state: null,
-        timeout_ms: 30_000
+        timeout_ms: 1
     })
     await Promise.resolve()
 
@@ -48,35 +45,13 @@ async function exerciseHardCancellation(entrypoint: string): Promise<void> {
         request_id: "parallel-request",
         actor: actorIdentity,
         method: "increment",
-        args: [2],
-        state: { count: 4 },
-        timeout_ms: 30_000
-    })
-
-    assert.deepEqual(
-        await runtime.handle({
-            type: "cancel",
-            request_id: "spin-request",
-            actor: actorIdentity
-        }),
-        { type: "cancelled" }
-    )
-    assert.deepEqual(await invocation, {
-        type: "failed",
-        code: "actor_worker_terminated",
-        message: "actor invocation did not terminate within 20ms of cancellation"
-    })
-    assert.deepEqual(await queued, { type: "invoked", result: 6, state: { count: 6 } })
-    const recovered = await runtime.handle({
-        type: "invoke",
-        request_id: "recovered-request",
-        actor: actorIdentity,
-        method: "increment",
-        args: [2],
+        args: [3],
         state: { count: 0 },
         timeout_ms: 30_000
     })
-    assert.deepEqual(recovered, { type: "invoked", result: 8, state: { count: 8 } })
+
+    assert.deepEqual(await invocation, { type: "invoked", result: 2, state: { count: 2 } })
+    assert.deepEqual(await queued, { type: "invoked", result: 5, state: { count: 5 } })
 }
 
 async function createTypeScriptConsumer(): Promise<string> {
@@ -97,13 +72,9 @@ export class SessionCounter extends Actor {
         return this.count
     }
 
-    async spinForever(): Promise<never> {
-        while (true) {}
-    }
-
-    async announceThenSpin(): Promise<never> {
-        await SessionCounter.get("worker-start-observer").increment()
-        return this.spinForever()
+    async incrementAfter(delayMs: number, amount = 1): Promise<number> {
+        await new Promise(resolve => setTimeout(resolve, delayMs))
+        return this.increment(amount)
     }
 }
 `

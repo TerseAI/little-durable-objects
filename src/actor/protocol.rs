@@ -1,9 +1,6 @@
-use std::time::Duration;
-
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::time::Instant;
 
 use crate::actor_state::ActorStorageKey;
 
@@ -30,7 +27,7 @@ impl ActorScope {
 }
 
 /// The namespace-scoped identity of one actor instance.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActorKey {
     pub namespace_id: String,
     pub actor_type: String,
@@ -45,8 +42,7 @@ impl ActorKey {
         self.storage_key().validate()
     }
 
-    /// Stable storage identity. Components are deliberately restricted instead of
-    /// escaped so the mapping is readable in SQLite, PostgreSQL, and Rapid keys.
+    /// Stable, readable identity used for coordination records.
     pub fn storage_key(&self) -> ActorStorageKey {
         ActorStorageKey::new(format!(
             "object.v1.{}.{}.{}",
@@ -72,7 +68,7 @@ fn validate_component(name: &str, value: &str, max_bytes: usize) -> Result<()> {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ActorInvocation {
-    /// Actor-scoped idempotency key. Retries must preserve this value.
+    /// Correlation ID for this caller attempt. It is not an idempotency key.
     pub request_id: String,
     pub actor: ActorKey,
     pub method: String,
@@ -100,35 +96,6 @@ impl ActorInvocation {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct ActorInvocationDeadline {
-    at: Instant,
-}
-
-impl ActorInvocationDeadline {
-    pub(crate) fn from_timeout_ms(timeout_ms: u64) -> Self {
-        debug_assert!((1..=MAX_ACTOR_INVOCATION_TIMEOUT_MS).contains(&timeout_ms));
-        let at = Instant::now()
-            .checked_add(Duration::from_millis(timeout_ms))
-            .expect("validated actor timeout must fit the monotonic clock range");
-        Self { at }
-    }
-
-    pub(crate) fn at(self) -> Instant {
-        self.at
-    }
-
-    pub(crate) fn remaining_ms(self) -> u64 {
-        let remaining = self.at.saturating_duration_since(Instant::now());
-        u64::try_from(remaining.as_nanos().div_ceil(1_000_000))
-            .expect("validated actor deadline must fit in milliseconds")
-    }
-
-    pub(crate) fn is_elapsed(self) -> bool {
-        Instant::now() >= self.at
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActorInvocationFailure {
     pub code: String,
@@ -136,50 +103,6 @@ pub struct ActorInvocationFailure {
 }
 
 impl ActorInvocationFailure {
-    pub(crate) fn cancelled_before_execution(reason: &str) -> Self {
-        Self {
-            code: "cancelled".into(),
-            message: format!("actor invocation was cancelled before execution because {reason}"),
-        }
-    }
-
-    pub(crate) fn cancelled_during_execution(reason: &str) -> Self {
-        Self {
-            code: "cancelled".into(),
-            message: format!(
-                "actor invocation was cancelled during execution because {reason}; the state transition was rolled back"
-            ),
-        }
-    }
-
-    pub(crate) fn deadline_exceeded_before_execution() -> Self {
-        Self {
-            code: "deadline_exceeded".into(),
-            message: "actor invocation deadline exceeded before execution started".into(),
-        }
-    }
-
-    pub(crate) fn resource_exhausted_before_execution() -> Self {
-        Self {
-            code: "resource_exhausted".into(),
-            message: "actor already has 32 queued invocations".into(),
-        }
-    }
-
-    pub(crate) fn deadline_exceeded_while_waiting() -> Self {
-        Self {
-            code: "deadline_exceeded".into(),
-            message: "actor invocation deadline exceeded; execution may still complete".into(),
-        }
-    }
-
-    pub(crate) fn deadline_exceeded_during_execution() -> Self {
-        Self {
-            code: "deadline_exceeded".into(),
-            message: "actor invocation deadline exceeded during execution; the state transition was rolled back".into(),
-        }
-    }
-
     pub(crate) fn outcome_unknown_after_execution() -> Self {
         Self {
             code: "outcome_unknown".into(),

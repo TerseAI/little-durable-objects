@@ -1,12 +1,5 @@
 use std::{
-    env,
-    future::Future,
-    net::SocketAddr,
-    path::PathBuf,
-    pin::Pin,
-    process::Stdio,
-    sync::Arc,
-    time::{Duration, Instant},
+    env, future::Future, net::SocketAddr, path::PathBuf, process::Stdio, sync::Arc, time::Duration,
 };
 
 use anyhow::{Context, Result, ensure};
@@ -17,39 +10,27 @@ use tracing::{error, info};
 
 use crate::{
     actor::{ActorExecutorListener, ActorScope},
-    actor_state::ActorDatabaseStore,
+    clock::SystemClock,
     control_plane::{ActorJwtVerifier, ActorTokenPurpose, ControlPlaneClient},
-    durability::{ActorDurabilityStore, LocalActorChangeCapture, LtxActorStateRestorer},
     grpc::ActorHostGrpcService,
-    host_leases::{HostLeaseStore, MAX_HOST_LEASE_DURATION_MS},
-    telemetry::{
-        ACTOR_TELEMETRY_SHUTDOWN_TIMEOUT, ActorHostStartupTelemetry, ActorProcessHealthTelemetry,
-        ActorSystemRole, ActorTelemetry, ActorTelemetryEvent, ActorTelemetryScope,
-        ControlPlaneActorTelemetry, elapsed_ms,
-    },
+    host_leases::{HostLeaseRegistry, MAX_HOST_LEASE_DURATION_MS},
+    state_transport::HttpStateTransport,
 };
 
-use super::{
-    ActorDrainReason, ActorHostDependencies, HOST_ACTOR_DRAIN_TIMEOUT, HostEndpoint,
-    LeasedActorHost,
-};
+use super::{ActorHost, HostEndpoint, HostLeaseMaintainer};
 
 const HOST_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
-const HOST_HEALTH_INTERVAL: Duration = Duration::from_secs(60);
-const DEFAULT_ACTOR_IDLE_TIMEOUT_MS: u64 = 60_000;
+const HOST_ACTOR_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_HOST_IDLE_TIMEOUT_MS: u64 = 300_000;
 const MAX_IDLE_TIMEOUT_MS: u64 = 86_400_000;
 
 pub struct ActorHostConfig {
     pub control_plane_url: String,
-    pub control_plane_token: String,
+    pub host_token: String,
     pub jwt_public_keys: String,
     pub namespace_id: String,
     pub host_id: super::HostId,
     pub session_id: String,
-    pub region: String,
-    pub code_revision: Option<String>,
-    pub local_root: PathBuf,
     pub executor_socket: PathBuf,
     pub host_bind: SocketAddr,
     pub host_route: Option<String>,
@@ -58,7 +39,6 @@ pub struct ActorHostConfig {
     pub jwt_max_lifetime: Duration,
     pub lease_duration: Duration,
     pub renew_every: Duration,
-    pub actor_idle_timeout: Duration,
     pub host_idle_timeout: Duration,
 }
 
@@ -69,7 +49,7 @@ impl ActorHostConfig {
 
     fn from_lookup(mut get: impl FnMut(&str) -> Option<String>) -> Result<Self> {
         let control_plane_url = required(&mut get, "DURABLE_OBJECT_CONTROL_PLANE_URL")?;
-        let control_plane_token = required(&mut get, "DURABLE_OBJECT_HOST_TOKEN")?;
+        let host_token = required(&mut get, "DURABLE_OBJECT_HOST_TOKEN")?;
         let jwt_public_keys = required(&mut get, "DURABLE_OBJECT_JWT_PUBLIC_KEYS")?;
         let namespace_id = required(&mut get, "DURABLE_OBJECT_NAMESPACE_ID")?;
         ActorScope {
@@ -85,25 +65,23 @@ impl ActorHostConfig {
         );
         let session_id = required(&mut get, "DURABLE_OBJECT_SESSION_ID")?;
         uuid::Uuid::parse_str(&session_id).context("DURABLE_OBJECT_SESSION_ID must be a UUID")?;
-        let region = get("DURABLE_OBJECT_REGION").unwrap_or_else(|| "default".into());
-        ensure!(valid_region(&region), "DURABLE_OBJECT_REGION is invalid");
-        let code_revision = get("DURABLE_OBJECT_CODE_REVISION");
-        let local_root: PathBuf = required(&mut get, "DURABLE_OBJECT_LOCAL_ROOT")?.into();
         let executor_socket = get("DURABLE_OBJECT_EXECUTOR_SOCKET")
             .map(PathBuf::from)
-            .unwrap_or_else(|| local_root.join("actor-session.sock"));
+            .unwrap_or_else(|| PathBuf::from("/tmp/durable-object-executor.sock"));
         let host_route = get("DURABLE_OBJECT_HOST_ROUTE");
         if let Some(route) = &host_route {
             tonic::transport::Endpoint::from_shared(route.clone())
                 .context("DURABLE_OBJECT_HOST_ROUTE must be a valid HTTP or HTTPS URI")?;
         }
-        let default_host_bind = if host_route.is_some() {
-            "0.0.0.0:7101"
-        } else {
-            "127.0.0.1:0"
-        };
         let host_bind = get("DURABLE_OBJECT_HOST_BIND")
-            .unwrap_or_else(|| default_host_bind.into())
+            .unwrap_or_else(|| {
+                if host_route.is_some() {
+                    "0.0.0.0:7101"
+                } else {
+                    "127.0.0.1:0"
+                }
+                .into()
+            })
             .parse()
             .context("DURABLE_OBJECT_HOST_BIND must be a socket address")?;
         let jwt_issuer = get("DURABLE_OBJECT_JWT_ISSUER")
@@ -114,21 +92,18 @@ impl ActorHostConfig {
             duration_seconds(&mut get, "DURABLE_OBJECT_JWT_MAX_TTL_SECONDS", 1_800)?;
         let lease_duration = duration_ms(&mut get, "DURABLE_OBJECT_LEASE_MS", 30_000)?;
         let renew_every = duration_ms(&mut get, "DURABLE_OBJECT_RENEW_MS", 10_000)?;
-        let actor_idle_timeout = bounded_duration_ms(
-            &mut get,
-            "DURABLE_OBJECT_ACTOR_IDLE_TIMEOUT_MS",
-            DEFAULT_ACTOR_IDLE_TIMEOUT_MS,
-            MAX_IDLE_TIMEOUT_MS,
-        )?;
-        let host_idle_timeout = bounded_duration_ms(
+        let host_idle_timeout = duration_ms(
             &mut get,
             "DURABLE_OBJECT_HOST_IDLE_TIMEOUT_MS",
             DEFAULT_HOST_IDLE_TIMEOUT_MS,
-            MAX_IDLE_TIMEOUT_MS,
         )?;
         ensure!(
+            host_idle_timeout.as_millis() <= u128::from(MAX_IDLE_TIMEOUT_MS),
+            "DURABLE_OBJECT_HOST_IDLE_TIMEOUT_MS is too large"
+        );
+        ensure!(
             lease_duration.as_millis() <= u128::from(MAX_HOST_LEASE_DURATION_MS),
-            "DURABLE_OBJECT_LEASE_MS must not exceed {MAX_HOST_LEASE_DURATION_MS}"
+            "DURABLE_OBJECT_LEASE_MS is too large"
         );
         ensure!(
             renew_every < lease_duration,
@@ -136,14 +111,11 @@ impl ActorHostConfig {
         );
         Ok(Self {
             control_plane_url,
-            control_plane_token,
+            host_token,
             jwt_public_keys,
             namespace_id,
             host_id,
             session_id,
-            region,
-            code_revision,
-            local_root,
             executor_socket,
             host_bind,
             host_route,
@@ -152,7 +124,6 @@ impl ActorHostConfig {
             jwt_max_lifetime,
             lease_duration,
             renew_every,
-            actor_idle_timeout,
             host_idle_timeout,
         })
     }
@@ -162,65 +133,8 @@ pub async fn serve_actor_host<F>(config: ActorHostConfig, shutdown: F) -> Result
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    let process_started = Instant::now();
-    let mut host_process = start_host_process(config, process_started).await?;
-    let stop = supervise_host(&mut host_process, shutdown).await;
-    stop_host(host_process, stop).await
-}
-
-type HostTask = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
-
-struct AuthenticatedHost {
-    control_plane: Arc<ControlPlaneClient>,
-    actor_scope: ActorScope,
-    invocation_auth: ActorJwtVerifier,
-    telemetry: Arc<dyn ActorTelemetry>,
-    control_plane_connect_ms: f64,
-}
-
-struct StartedActorHost {
-    leased_host: LeasedActorHost,
-    shutdown: watch::Sender<bool>,
-    host_server: HostTask,
-    executor_connection: HostTask,
-    javascript_process: HostTask,
-    host_route: String,
-    host_bind_ms: f64,
-    initial_lease_ms: f64,
-}
-
-struct ActorHostProcess {
-    host_id: super::HostId,
-    process_started: Instant,
-    telemetry_scope: ActorTelemetryScope,
-    telemetry: Arc<dyn ActorTelemetry>,
-    leased_host: LeasedActorHost,
-    shutdown: watch::Sender<bool>,
-    host_server: HostTask,
-    executor_connection: HostTask,
-    javascript_process: HostTask,
-    lease_lost: watch::Receiver<bool>,
-    actor_activity: watch::Receiver<usize>,
-    host_idle_timeout: Duration,
-}
-
-async fn authenticate_host(config: &ActorHostConfig) -> Result<AuthenticatedHost> {
-    let phase_started = Instant::now();
-    let control_plane = Arc::new(
-        ControlPlaneClient::connect(&config.control_plane_url, &config.control_plane_token).await?,
-    );
-    let control_plane_connect_ms = elapsed_ms(phase_started);
-    let actor_scope = ActorScope {
-        namespace_id: config.namespace_id.clone(),
-    };
-    actor_scope.validate()?;
-    let telemetry: Arc<dyn ActorTelemetry> = Arc::new(ControlPlaneActorTelemetry::new(
-        control_plane.telemetry_transport(),
-    ));
-    control_plane.set_telemetry(
-        ActorTelemetryScope::namespace(&actor_scope),
-        telemetry.clone(),
-    )?;
+    let control_plane =
+        Arc::new(ControlPlaneClient::connect(&config.control_plane_url, &config.host_token).await?);
     let invocation_auth = ActorJwtVerifier::for_scope(
         &config.jwt_public_keys,
         config.jwt_issuer.clone(),
@@ -229,348 +143,100 @@ async fn authenticate_host(config: &ActorHostConfig) -> Result<AuthenticatedHost
         config.jwt_max_lifetime,
     )?;
 
-    Ok(AuthenticatedHost {
-        control_plane,
-        actor_scope,
-        invocation_auth,
-        telemetry,
-        control_plane_connect_ms,
-    })
-}
-
-async fn start_host_process(
-    config: ActorHostConfig,
-    process_started: Instant,
-) -> Result<ActorHostProcess> {
-    let authenticated = authenticate_host(&config).await?;
-    let host = start_actor_host(&config, &authenticated).await?;
-    let AuthenticatedHost {
-        control_plane: _,
-        actor_scope,
-        invocation_auth: _,
-        telemetry,
-        control_plane_connect_ms,
-    } = authenticated;
-    let StartedActorHost {
-        leased_host,
-        shutdown,
-        host_server,
-        executor_connection,
-        javascript_process,
-        host_route,
-        host_bind_ms,
-        initial_lease_ms,
-    } = host;
-    let host_id = config.host_id.clone();
-    let session_id = config.session_id.clone();
-
-    info!(
-        host_id = %host_id,
-        namespace_id = %actor_scope.namespace_id,
-        session_id,
-        host_route,
-        region = %config.region,
-        code_revision = ?config.code_revision,
-        actor_socket = %config.executor_socket.display(),
-        "durable-object host is ready"
-    );
-    let telemetry_scope = ActorTelemetryScope::namespace(&actor_scope);
-    telemetry.publish(ActorTelemetryEvent::ActorHostStartupFinished(
-        ActorHostStartupTelemetry {
-            scope: telemetry_scope.clone(),
-            role: ActorSystemRole::Host,
-            total_ms: elapsed_ms(process_started),
-            token_exchange_ms: 0.0,
-            control_plane_connect_ms,
-            host_bind_ms,
-            initial_lease_ms,
-            success: true,
-        },
-    ));
-    publish_host_health(
-        telemetry.as_ref(),
-        &telemetry_scope,
-        process_started,
-        true,
-        0,
-    );
-    let lease_lost = leased_host.lease_lost();
-    let actor_activity = leased_host.activity();
-
-    Ok(ActorHostProcess {
-        host_id,
-        process_started,
-        telemetry_scope,
-        telemetry,
-        leased_host,
-        shutdown,
-        host_server,
-        executor_connection,
-        javascript_process,
-        lease_lost,
-        actor_activity,
-        host_idle_timeout: config.host_idle_timeout,
-    })
-}
-
-async fn start_actor_host(
-    config: &ActorHostConfig,
-    authenticated: &AuthenticatedHost,
-) -> Result<StartedActorHost> {
-    let phase_started = Instant::now();
-    let host_listener = TcpListener::bind(config.host_bind)
+    let listener = TcpListener::bind(config.host_bind)
         .await
-        .with_context(|| format!("bind actor host server at {}", config.host_bind))?;
-    let host_bind_ms = elapsed_ms(phase_started);
-    let local_host_address = host_listener.local_addr()?;
-    let host_route = config
-        .host_route
-        .clone()
-        .unwrap_or_else(|| format!("http://{local_host_address}"));
+        .with_context(|| format!("bind actor host at {}", config.host_bind))?;
+    let route = config.host_route.clone().unwrap_or_else(|| {
+        format!(
+            "http://{}",
+            listener.local_addr().expect("bound host address")
+        )
+    });
     let endpoint = HostEndpoint {
         id: config.host_id.clone(),
-        route: host_route.clone(),
+        route: route.clone(),
     };
-    let executor_listener = ActorExecutorListener::bind(&config.executor_socket).await?;
-    let javascript_process = spawn_javascript_process()?;
-    let executor_connection = executor_listener
-        .accept()
-        .await
-        .context("accept customer JavaScript actor executor connection")?;
-    let executor = executor_connection.executor();
 
-    let durability: Arc<dyn ActorDurabilityStore> = authenticated.control_plane.clone();
-    let nodes: Arc<dyn HostLeaseStore> = authenticated.control_plane.clone();
-    let databases = Arc::new(ActorDatabaseStore::new(&config.local_root));
-    let restore = Arc::new(LtxActorStateRestorer::new(
-        durability.clone(),
-        databases.clone(),
+    let executor_listener = ActorExecutorListener::bind(&config.executor_socket).await?;
+    let mut javascript = spawn_javascript_process()?;
+    let executor_connection = executor_listener.accept().await?;
+    let executor = executor_connection.executor();
+    let host = Arc::new(ActorHost::new(
+        endpoint.clone(),
+        config.namespace_id.clone(),
+        executor,
+        control_plane.clone(),
+        Arc::new(HttpStateTransport::new()),
     ));
-    let dependencies = ActorHostDependencies::new(
-        durability,
-        nodes,
-        databases,
-        Arc::new(LocalActorChangeCapture::new(&config.local_root)),
-        restore,
-    )
-    .with_actor_executor(authenticated.actor_scope.clone(), executor)
-    .with_telemetry(authenticated.telemetry.clone());
-    let phase_started = Instant::now();
-    let leased_host = LeasedActorHost::start(
+
+    let lease = Arc::new(HostLeaseMaintainer::new(
         endpoint,
         config.session_id.clone(),
-        dependencies,
+        control_plane.clone() as Arc<dyn HostLeaseRegistry>,
+        Arc::new(SystemClock),
         config.lease_duration,
         config.renew_every,
-    )
-    .await?;
-    let initial_lease_ms = elapsed_ms(phase_started);
-    let host_service =
-        ActorHostGrpcService::new(leased_host.host(), authenticated.invocation_auth.clone())
-            .into_service();
-    executor_connection
-        .mark_ready()
-        .await
-        .context("mark customer JavaScript actor executor connection ready")?;
+    )?);
+    let renewal = lease.clone().start().await?;
+    let mut lease_lost = renewal.lease_lost();
+    let mut activity = host.activity();
 
-    let (shutdown, shutdown_rx) = watch::channel(false);
-    let host_shutdown = shutdown_rx.clone();
-    let host_server: HostTask = Box::pin(async move {
+    let service = ActorHostGrpcService::new(host.clone(), invocation_auth).into_service();
+    executor_connection.mark_ready().await?;
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let mut server = Box::pin(
         Server::builder()
-            .add_service(host_service)
+            .add_service(service)
             .serve_with_incoming_shutdown(
-                TcpListenerStream::new(host_listener),
-                wait_for_shutdown(host_shutdown),
-            )
-            .await
-            .context("serve actor host gRPC")
-    });
-    let executor_connection: HostTask = Box::pin(executor_connection.run(shutdown_rx));
-    let javascript_process: HostTask = Box::pin(wait_for_javascript_process(javascript_process));
-
-    Ok(StartedActorHost {
-        leased_host,
-        shutdown,
-        host_server,
-        executor_connection,
-        javascript_process,
-        host_route,
-        host_bind_ms,
-        initial_lease_ms,
-    })
-}
-
-async fn supervise_host<F>(host_process: &mut ActorHostProcess, shutdown: F) -> HostStop
-where
-    F: Future<Output = ()>,
-{
-    let mut health_ticks = tokio::time::interval_at(
-        tokio::time::Instant::now() + HOST_HEALTH_INTERVAL,
-        HOST_HEALTH_INTERVAL,
+                TcpListenerStream::new(listener),
+                wait_for_shutdown(stop_rx.clone()),
+            ),
     );
+    let mut executor_task = Box::pin(executor_connection.run(stop_rx));
+    let mut idle_deadline = tokio::time::Instant::now() + config.host_idle_timeout;
     tokio::pin!(shutdown);
-    let mut idle_deadline = Some(tokio::time::Instant::now() + host_process.host_idle_timeout);
-    loop {
-        let stop = tokio::select! {
-            result = &mut host_process.host_server => Some(HostStop::Grpc(result)),
-            result = &mut host_process.executor_connection => Some(HostStop::ExecutorConnection(result)),
-            result = &mut host_process.javascript_process => Some(HostStop::JavaScriptProcess(result)),
-            result = wait_for_lease_loss(&mut host_process.lease_lost) => Some(HostStop::LeaseLost(result)),
-            () = &mut shutdown => Some(HostStop::Requested),
-            activity = host_process.actor_activity.changed() => {
-                if activity.is_err() {
-                    Some(HostStop::ActivityTrackerStopped)
-                } else {
-                    idle_deadline = if *host_process.actor_activity.borrow() == 0 {
-                        Some(tokio::time::Instant::now() + host_process.host_idle_timeout)
-                    } else {
-                        None
-                    };
-                    None
+
+    info!(host_id = %config.host_id, namespace_id = %config.namespace_id, route, "durable-object host is ready");
+    let stop_result: Result<()> = loop {
+        tokio::select! {
+            result = &mut server => break result.context("serve actor host gRPC"),
+            result = &mut executor_task => break result.context("run JavaScript actor executor"),
+            result = javascript.wait() => break Err(anyhow::anyhow!("JavaScript actor executor exited with {}", result?)),
+            () = &mut shutdown => break Ok(()),
+            changed = lease_lost.changed() => {
+                if changed.is_err() || *lease_lost.borrow() {
+                    break Err(anyhow::anyhow!("host lease expired; host self-fenced"));
                 }
-            },
-            () = wait_for_idle_deadline(idle_deadline) => Some(HostStop::Idle),
-            _ = health_ticks.tick() => {
-                publish_host_health(
-                    host_process.telemetry.as_ref(),
-                    &host_process.telemetry_scope,
-                    host_process.process_started,
-                    true,
-                    host_process.leased_host.consecutive_lease_failures(),
-                );
-                None
-            },
-        };
-        if let Some(stop) = stop {
-            break stop;
-        }
-    }
-}
-
-async fn stop_host(host_process: ActorHostProcess, stop: HostStop) -> Result<()> {
-    let ActorHostProcess {
-        host_id,
-        process_started,
-        telemetry_scope,
-        telemetry,
-        leased_host,
-        shutdown,
-        host_server,
-        executor_connection,
-        javascript_process,
-        lease_lost: _,
-        actor_activity: _,
-        host_idle_timeout: _,
-    } = host_process;
-    let drain_reason = match &stop {
-        HostStop::LeaseLost(_) => ActorDrainReason::LeaseLost,
-        HostStop::Idle => ActorDrainReason::Idle,
-        _ => ActorDrainReason::Shutdown,
-    };
-    let stopped_after_lease_loss = matches!(&stop, HostStop::LeaseLost(_));
-    let drain_result = leased_host.drain(drain_reason).await;
-    if let Err(error) = &drain_result {
-        error!(
-            host_id = %host_id,
-            timeout_ms = HOST_ACTOR_DRAIN_TIMEOUT.as_millis(),
-            error = %format!("{error:#}"),
-            "actor invocations did not drain cleanly; closing host transports"
-        );
-    }
-    let _ = shutdown.send(true);
-
-    let serve_result = match stop {
-        HostStop::Grpc(host_result) => host_result
-            .and(finish_host_task("actor executor connection", executor_connection).await),
-        HostStop::ExecutorConnection(actor_result) => {
-            actor_result.and(finish_host_task("actor host gRPC server", host_server).await)
-        }
-        HostStop::JavaScriptProcess(executor_result) => {
-            let component_result = finish_host_tasks(host_server, executor_connection).await;
-            executor_result.and(component_result)
-        }
-        HostStop::LeaseLost(lease_result) => {
-            let component_result = finish_host_tasks(host_server, executor_connection).await;
-            let lease_result: Result<()> = lease_result.and_then(|()| {
-                Err(anyhow::anyhow!(
-                    "host lease expired; the process was permanently self-fenced"
-                ))
-            });
-            lease_result.and(component_result)
-        }
-        HostStop::Requested => finish_host_tasks(host_server, executor_connection).await,
-        HostStop::Idle => finish_host_tasks(host_server, executor_connection).await,
-        HostStop::ActivityTrackerStopped => {
-            finish_host_tasks(host_server, executor_connection).await?;
-            Err(anyhow::anyhow!(
-                "actor activity tracker stopped unexpectedly"
-            ))
+            }
+            changed = activity.changed() => {
+                if changed.is_err() { break Err(anyhow::anyhow!("actor activity tracker stopped")); }
+                if *activity.borrow() == 0 {
+                    idle_deadline = tokio::time::Instant::now() + config.host_idle_timeout;
+                }
+            }
+            () = tokio::time::sleep_until(idle_deadline), if *activity.borrow() == 0 => break Ok(()),
         }
     };
-    drop(javascript_process);
-    if let Err(error) = &serve_result {
-        error!(
-            host_id = %host_id,
-            error = %format!("{error:#}"),
-            "sandbox actor host stopped with an error"
-        );
+
+    if let Err(error) = host.drain(HOST_ACTOR_DRAIN_TIMEOUT).await {
+        error!(error = %format!("{error:#}"), "actor invocations did not drain cleanly");
     }
-    let shutdown_result = leased_host.shutdown().await;
-    publish_host_health(
-        telemetry.as_ref(),
-        &telemetry_scope,
-        process_started,
-        false,
-        u64::from(stopped_after_lease_loss),
-    );
-    let telemetry_shutdown = telemetry.shutdown(ACTOR_TELEMETRY_SHUTDOWN_TIMEOUT).await;
-    info!(host_id = %host_id, "sandbox actor host stopped");
-    serve_result?;
-    drain_result?;
-    shutdown_result?;
-    telemetry_shutdown
-}
-
-fn publish_host_health(
-    telemetry: &dyn ActorTelemetry,
-    scope: &ActorTelemetryScope,
-    process_started: Instant,
-    ready: bool,
-    consecutive_failures: u64,
-) {
-    telemetry.publish(ActorTelemetryEvent::ActorProcessHealth(
-        ActorProcessHealthTelemetry {
-            scope: scope.clone(),
-            role: ActorSystemRole::Host,
-            uptime_ms: u64::try_from(process_started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            ready,
-            consecutive_failures,
-            telemetry_dropped_events: telemetry.dropped_events(),
-            last_success_age_ms: None,
-        },
-    ));
-}
-
-enum HostStop {
-    Grpc(Result<()>),
-    ExecutorConnection(Result<()>),
-    JavaScriptProcess(Result<()>),
-    LeaseLost(Result<()>),
-    Requested,
-    Idle,
-    ActivityTrackerStopped,
-}
-
-async fn wait_for_idle_deadline(deadline: Option<tokio::time::Instant>) {
-    match deadline {
-        Some(deadline) => tokio::time::sleep_until(deadline).await,
-        None => std::future::pending().await,
-    }
+    let _ = stop_tx.send(true);
+    let _ = tokio::time::timeout(HOST_TASK_SHUTDOWN_TIMEOUT, async {
+        let _ = tokio::join!(server, executor_task);
+    })
+    .await;
+    drop(javascript);
+    let renewal_result = renewal.shutdown().await;
+    let unregister_result = lease.unregister().await;
+    info!(host_id = %config.host_id, "durable-object host stopped");
+    stop_result?;
+    renewal_result?;
+    unregister_result
 }
 
 fn spawn_javascript_process() -> Result<tokio::process::Child> {
-    let mut command = Command::new("node");
-    command
+    Command::new("node")
         .args([
             "--input-type=module",
             "--eval",
@@ -579,71 +245,19 @@ fn spawn_javascript_process() -> Result<tokio::process::Child> {
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
-        .kill_on_drop(true);
-    command.spawn().context("start JavaScript actor executor")
+        .kill_on_drop(true)
+        .spawn()
+        .context("start JavaScript actor executor")
 }
 
-async fn wait_for_javascript_process(mut child: tokio::process::Child) -> Result<()> {
-    let status = child
-        .wait()
-        .await
-        .context("wait for JavaScript actor executor")?;
-    anyhow::bail!("JavaScript actor executor exited unexpectedly with {status}")
-}
-
-async fn finish_host_task(name: &str, component: impl Future<Output = Result<()>>) -> Result<()> {
-    finish_host_task_within(name, component, HOST_TASK_SHUTDOWN_TIMEOUT).await
-}
-
-async fn finish_host_task_within(
-    name: &str,
-    component: impl Future<Output = Result<()>>,
-    timeout: Duration,
-) -> Result<()> {
-    match tokio::time::timeout(timeout, component).await {
-        Ok(result) => result,
-        Err(_) => anyhow::bail!("{name} did not stop within {}ms", timeout.as_millis()),
-    }
-}
-
-async fn finish_host_tasks(
-    host_server: impl Future<Output = Result<()>>,
-    executor_connection: impl Future<Output = Result<()>>,
-) -> Result<()> {
-    finish_host_task(
-        "actor host gRPC server and actor executor connection",
-        async {
-            let (host_result, actor_result) = tokio::join!(host_server, executor_connection);
-            host_result.and(actor_result)
-        },
-    )
-    .await
-}
-
-async fn wait_for_lease_loss(lease_lost: &mut watch::Receiver<bool>) -> Result<()> {
-    loop {
-        if *lease_lost.borrow() {
-            return Ok(());
-        }
-        lease_lost
-            .changed()
-            .await
-            .context("host lease renewal monitor stopped unexpectedly")?;
-    }
+async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
+    while !*shutdown.borrow() && shutdown.changed().await.is_ok() {}
 }
 
 fn required(get: &mut impl FnMut(&str) -> Option<String>, name: &str) -> Result<String> {
     let value = get(name).with_context(|| format!("{name} is required"))?;
     ensure!(!value.is_empty(), "{name} must not be empty");
     Ok(value)
-}
-
-fn valid_region(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 64
-        && value.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
-        })
 }
 
 fn duration_ms(
@@ -660,20 +274,6 @@ fn duration_ms(
     Ok(Duration::from_millis(value))
 }
 
-fn bounded_duration_ms(
-    get: &mut impl FnMut(&str) -> Option<String>,
-    name: &str,
-    default: u64,
-    maximum: u64,
-) -> Result<Duration> {
-    let duration = duration_ms(get, name, default)?;
-    ensure!(
-        duration.as_millis() <= u128::from(maximum),
-        "{name} must not exceed {maximum}"
-    );
-    Ok(duration)
-}
-
 fn duration_seconds(
     get: &mut impl FnMut(&str) -> Option<String>,
     name: &str,
@@ -688,21 +288,12 @@ fn duration_seconds(
     Ok(Duration::from_secs(value))
 }
 
-async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
-    loop {
-        if *shutdown.borrow() || shutdown.changed().await.is_err() {
-            return;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::*;
     use std::collections::HashMap;
 
-    use super::*;
-
-    fn valid() -> HashMap<String, String> {
+    fn values() -> HashMap<String, String> {
         HashMap::from([
             (
                 "DURABLE_OBJECT_CONTROL_PLANE_URL".into(),
@@ -710,107 +301,27 @@ mod tests {
             ),
             ("DURABLE_OBJECT_HOST_TOKEN".into(), "host-jwt".into()),
             ("DURABLE_OBJECT_JWT_PUBLIC_KEYS".into(), "{}".into()),
-            ("DURABLE_OBJECT_NAMESPACE_ID".into(), "namespace-1".into()),
+            ("DURABLE_OBJECT_NAMESPACE_ID".into(), "project-1".into()),
             (
                 "DURABLE_OBJECT_HOST_ID".into(),
-                "host.v1.namespace-1.00000000-0000-4000-8000-000000000001".into(),
+                "host.v1.project-1.revision-1.host-1".into(),
             ),
             (
                 "DURABLE_OBJECT_SESSION_ID".into(),
-                "00000000-0000-4000-8000-000000000002".into(),
-            ),
-            (
-                "DURABLE_OBJECT_LOCAL_ROOT".into(),
-                "/data/durable-objects".into(),
+                "00000000-0000-4000-8000-000000000001".into(),
             ),
         ])
     }
 
-    fn parse(values: &HashMap<String, String>) -> Result<ActorHostConfig> {
-        ActorHostConfig::from_lookup(|name| values.get(name).cloned())
-    }
-
     #[test]
-    fn configures_a_credentialless_actor_host() -> Result<()> {
-        let config = parse(&valid())?;
-        assert_eq!(config.control_plane_url, "http://127.0.0.1:7100");
-        assert_eq!(config.local_root, PathBuf::from("/data/durable-objects"));
-        assert_eq!(config.host_bind, "127.0.0.1:0".parse()?);
-        assert!(config.host_route.is_none());
-        assert_eq!(config.invocation_jwt_audience, "durable-object-invoke");
-        assert_eq!(config.jwt_max_lifetime, Duration::from_secs(1_800));
+    fn host_needs_no_local_state_directory() -> Result<()> {
+        let values = values();
+        let config = ActorHostConfig::from_lookup(|name| values.get(name).cloned())?;
         assert_eq!(
             config.executor_socket,
-            PathBuf::from("/data/durable-objects/actor-session.sock")
+            PathBuf::from("/tmp/durable-object-executor.sock")
         );
-        assert_eq!(config.lease_duration, Duration::from_secs(30));
-        assert_eq!(config.renew_every, Duration::from_secs(10));
-        assert_eq!(config.actor_idle_timeout, Duration::from_secs(60));
-        assert_eq!(config.host_idle_timeout, Duration::from_secs(5 * 60));
-        assert_eq!(config.region, "default");
+        assert_eq!(config.host_idle_timeout, Duration::from_secs(300));
         Ok(())
-    }
-
-    #[test]
-    fn rejects_missing_credentials_and_invalid_lease_timing() {
-        let mut missing_token = valid();
-        missing_token.remove("DURABLE_OBJECT_HOST_TOKEN");
-        assert!(parse(&missing_token).is_err());
-
-        let mut invalid_lease = valid();
-        invalid_lease.insert("DURABLE_OBJECT_LEASE_MS".into(), "1000".into());
-        invalid_lease.insert("DURABLE_OBJECT_RENEW_MS".into(), "1000".into());
-        assert!(parse(&invalid_lease).is_err());
-
-        let mut oversized_lease = valid();
-        oversized_lease.insert(
-            "DURABLE_OBJECT_LEASE_MS".into(),
-            (MAX_HOST_LEASE_DURATION_MS + 1).to_string(),
-        );
-        assert!(parse(&oversized_lease).is_err());
-
-        for (name, value) in [
-            ("DURABLE_OBJECT_ACTOR_IDLE_TIMEOUT_MS", "0"),
-            ("DURABLE_OBJECT_ACTOR_IDLE_TIMEOUT_MS", "86400001"),
-            ("DURABLE_OBJECT_HOST_IDLE_TIMEOUT_MS", "not-a-number"),
-        ] {
-            let mut invalid_idle = valid();
-            invalid_idle.insert(name.into(), value.into());
-            assert!(parse(&invalid_idle).is_err());
-        }
-    }
-
-    #[test]
-    fn uses_the_fixed_tunnel_port_when_a_host_origin_is_provisioned() -> Result<()> {
-        let mut values = valid();
-        values.insert(
-            "DURABLE_OBJECT_HOST_ROUTE".into(),
-            "https://actor-host_process.example.com".into(),
-        );
-
-        let config = parse(&values)?;
-
-        assert_eq!(
-            config.host_route.as_deref(),
-            Some("https://actor-host_process.example.com")
-        );
-        assert_eq!(config.host_bind, "0.0.0.0:7101".parse()?);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn stuck_host_task_shutdown_returns_a_bounded_error() {
-        let error = finish_host_task_within(
-            "stuck component",
-            std::future::pending(),
-            Duration::from_millis(20),
-        )
-        .await
-        .expect_err("a stuck component must time out");
-
-        assert_eq!(
-            error.to_string(),
-            "stuck component did not stop within 20ms"
-        );
     }
 }

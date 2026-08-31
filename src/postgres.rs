@@ -15,40 +15,12 @@ CREATE TABLE IF NOT EXISTS durable_object_host_leases (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
 
-CREATE TABLE IF NOT EXISTS durable_object_manifests (
+CREATE TABLE IF NOT EXISTS durable_object_placements (
     object_id TEXT PRIMARY KEY,
-    format_version INTEGER NOT NULL,
-    owner_node TEXT NOT NULL,
+    owner_host_id TEXT NOT NULL,
     owner_epoch BIGINT NOT NULL CHECK (owner_epoch > 0),
-    tip_epoch BIGINT,
-    tip_log_generation BIGINT,
-    tip_txid BIGINT,
-    checkpoint_epoch BIGINT,
-    checkpoint_log_generation BIGINT,
-    checkpoint_txid BIGINT,
-    checkpoint_key TEXT,
-    checkpoint_byte_len BIGINT,
-    checkpoint_crc32c BIGINT,
-    checkpoint_page_size BIGINT,
-    checkpoint_checksum TEXT,
-    archived_txid BIGINT NOT NULL DEFAULT 0 CHECK (archived_txid >= 0),
-    rapid_gc_txid BIGINT NOT NULL DEFAULT 0 CHECK (rapid_gc_txid >= 0),
-    storage_region TEXT NOT NULL DEFAULT 'default',
-    revision BIGINT NOT NULL CHECK (revision > 0),
-    CHECK ((tip_epoch IS NULL) = (tip_log_generation IS NULL)),
-    CHECK ((tip_epoch IS NULL) = (tip_txid IS NULL)),
-    CHECK (tip_epoch IS NULL OR tip_epoch > 0),
-    CHECK (tip_txid IS NULL OR tip_txid > 0),
-    CHECK (tip_epoch IS NULL OR tip_epoch <= owner_epoch),
-    CHECK ((checkpoint_epoch IS NULL) = (checkpoint_log_generation IS NULL)),
-    CHECK ((checkpoint_epoch IS NULL) = (checkpoint_txid IS NULL)),
-    CHECK ((checkpoint_epoch IS NULL) = (checkpoint_key IS NULL)),
-    CHECK ((checkpoint_epoch IS NULL) = (checkpoint_byte_len IS NULL)),
-    CHECK ((checkpoint_epoch IS NULL) = (checkpoint_crc32c IS NULL)),
-    CHECK ((checkpoint_epoch IS NULL) = (checkpoint_page_size IS NULL)),
-    CHECK ((checkpoint_epoch IS NULL) = (checkpoint_checksum IS NULL)),
-    CHECK (checkpoint_txid IS NULL OR checkpoint_txid <= tip_txid),
-    CHECK (rapid_gc_txid <= tip_txid)
+    home_region TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
 
 CREATE TABLE IF NOT EXISTS durable_object_namespaces (
@@ -56,33 +28,14 @@ CREATE TABLE IF NOT EXISTS durable_object_namespaces (
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
 
-CREATE TABLE IF NOT EXISTS durable_object_launch_specs (
-    namespace_id TEXT NOT NULL REFERENCES durable_object_namespaces(namespace_id),
+CREATE TABLE IF NOT EXISTS durable_object_project_specs (
+    namespace_id TEXT PRIMARY KEY REFERENCES durable_object_namespaces(namespace_id),
     code_revision TEXT NOT NULL,
     image_ref TEXT NOT NULL,
     working_directory TEXT NOT NULL,
     actor_entrypoint TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-    PRIMARY KEY (namespace_id, code_revision)
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
-
-DO $migration$
-BEGIN
-    IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = current_schema()
-          AND table_name = 'durable_object_launch_specs'
-          AND column_name = 'modal_image_id'
-    ) AND NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = current_schema()
-          AND table_name = 'durable_object_launch_specs'
-          AND column_name = 'image_ref'
-    ) THEN
-        ALTER TABLE durable_object_launch_specs RENAME COLUMN modal_image_id TO image_ref;
-    END IF;
-END
-$migration$;
 
 "#;
 

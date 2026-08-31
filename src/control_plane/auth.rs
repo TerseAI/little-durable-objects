@@ -22,7 +22,7 @@ impl ActorTokenPurpose {
     fn claim(self, role: ActorProcessRole) -> &'static str {
         match (self, role) {
             (Self::ControlPlane, ActorProcessRole::Host) => "actor:authority",
-            (Self::ControlPlane, ActorProcessRole::Workflow) => "actor:resolve",
+            (Self::ControlPlane, ActorProcessRole::Workflow) => "actor:invoke",
             (Self::Invocation, ActorProcessRole::Workflow) => "actor:invoke",
             (Self::Invocation, ActorProcessRole::Host) => "actor:invoke",
         }
@@ -45,22 +45,6 @@ impl ActorPrincipal {
         ensure!(
             host_id == self.host_id.as_str(),
             "host does not match the authenticated host identity"
-        );
-        Ok(())
-    }
-
-    pub(crate) fn validate_namespace_host_id(&self, host_id: &str) -> Result<()> {
-        ensure!(
-            host_id.starts_with(&self.host_id_prefix()),
-            "host does not belong to the authenticated namespace"
-        );
-        Ok(())
-    }
-
-    pub(crate) fn validate_actor_storage_key(&self, storage_key: &str) -> Result<()> {
-        ensure!(
-            storage_key.starts_with(&format!("object.v1.{}.", self.scope.namespace_id)),
-            "actor does not belong to the authenticated namespace"
         );
         Ok(())
     }
@@ -308,14 +292,6 @@ impl ActorJwtVerifier {
                         || byte.is_ascii_digit()
                         || matches!(byte, b'.' | b'_' | b'-')),
             "actor token storage region is invalid"
-        );
-        ensure!(
-            principal.process_role != ActorProcessRole::Workflow
-                || principal
-                    .code_revision
-                    .as_ref()
-                    .is_some_and(|code_revision| !code_revision.is_empty()),
-            "workflow actor token is missing its code revision"
         );
         Ok(principal)
     }
