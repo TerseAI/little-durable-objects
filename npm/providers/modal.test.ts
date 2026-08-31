@@ -101,7 +101,7 @@ function request(): EnsureHostRequest {
         controlPlaneUrl: "https://objects.example.com",
         jwtIssuer: "durable-object-control-plane",
         invocationJwtAudience: "durable-object-invoke",
-        modalImageId: "im-actor",
+        imageRef: "im-actor",
         workingDirectory: "/workspace",
         actorEntrypoint: "src/durable-objects.ts",
         actorIdleTimeoutMs: 60_000,

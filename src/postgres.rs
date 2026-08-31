@@ -59,12 +59,30 @@ CREATE TABLE IF NOT EXISTS durable_object_namespaces (
 CREATE TABLE IF NOT EXISTS durable_object_launch_specs (
     namespace_id TEXT NOT NULL REFERENCES durable_object_namespaces(namespace_id),
     code_revision TEXT NOT NULL,
-    modal_image_id TEXT NOT NULL,
+    image_ref TEXT NOT NULL,
     working_directory TEXT NOT NULL,
     actor_entrypoint TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     PRIMARY KEY (namespace_id, code_revision)
 );
+
+DO $migration$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'durable_object_launch_specs'
+          AND column_name = 'modal_image_id'
+    ) AND NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'durable_object_launch_specs'
+          AND column_name = 'image_ref'
+    ) THEN
+        ALTER TABLE durable_object_launch_specs RENAME COLUMN modal_image_id TO image_ref;
+    END IF;
+END
+$migration$;
 
 "#;
 

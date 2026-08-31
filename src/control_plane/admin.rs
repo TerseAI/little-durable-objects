@@ -12,7 +12,7 @@ use crate::{actor::ActorScope, postgres::PostgresDatabase};
 pub(crate) struct HostLaunchSpec {
     pub namespace_id: String,
     pub code_revision: String,
-    pub modal_image_id: String,
+    pub image_ref: String,
     pub working_directory: String,
     pub actor_entrypoint: Option<String>,
 }
@@ -25,8 +25,8 @@ impl HostLaunchSpec {
         .validate()?;
         validate_component("code revision", &self.code_revision, 128)?;
         ensure!(
-            !self.modal_image_id.is_empty() && self.modal_image_id.len() <= 255,
-            "Modal image ID must contain between 1 and 255 bytes"
+            !self.image_ref.is_empty() && self.image_ref.len() <= 255,
+            "sandbox image reference must contain between 1 and 255 bytes"
         );
         ensure!(
             self.working_directory.starts_with('/') && self.working_directory.len() <= 1024,
@@ -152,12 +152,12 @@ impl AdminRegistry for PostgresAdminRegistry {
             .client()
             .execute(
                 "INSERT INTO durable_object_launch_specs \
-                 (namespace_id, code_revision, modal_image_id, working_directory, actor_entrypoint) \
+                 (namespace_id, code_revision, image_ref, working_directory, actor_entrypoint) \
                  VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
                 &[
                     &spec.namespace_id,
                     &spec.code_revision,
-                    &spec.modal_image_id,
+                    &spec.image_ref,
                     &spec.working_directory,
                     &spec.actor_entrypoint,
                 ],
@@ -188,7 +188,7 @@ impl AdminRegistry for PostgresAdminRegistry {
             .database
             .client()
             .query_opt(
-                "SELECT modal_image_id, working_directory, actor_entrypoint \
+                "SELECT image_ref, working_directory, actor_entrypoint \
                  FROM durable_object_launch_specs WHERE namespace_id = $1 AND code_revision = $2",
                 &[&namespace_id, &code_revision],
             )
@@ -197,7 +197,7 @@ impl AdminRegistry for PostgresAdminRegistry {
             .map(|row| HostLaunchSpec {
                 namespace_id: namespace_id.to_owned(),
                 code_revision: code_revision.to_owned(),
-                modal_image_id: row.get(0),
+                image_ref: row.get(0),
                 working_directory: row.get(1),
                 actor_entrypoint: row.get(2),
             }))
@@ -234,7 +234,7 @@ mod tests {
         HostLaunchSpec {
             namespace_id: "project-1".into(),
             code_revision: "revision-1".into(),
-            modal_image_id: image.into(),
+            image_ref: image.into(),
             working_directory: "/workspace".into(),
             actor_entrypoint: Some("src/durable-objects.ts".into()),
         }

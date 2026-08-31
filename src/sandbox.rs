@@ -22,7 +22,7 @@ pub struct EnsureHostRequest {
     pub control_plane_url: String,
     pub jwt_issuer: String,
     pub invocation_jwt_audience: String,
-    pub modal_image_id: String,
+    pub image_ref: String,
     pub working_directory: String,
     pub actor_entrypoint: Option<String>,
     pub actor_idle_timeout_ms: u64,
@@ -61,36 +61,30 @@ pub struct HostSandboxRuntimeConfig {
 }
 
 pub struct CommandSandboxProvider {
+    provider_name: String,
     command: String,
     environment: HashMap<String, String>,
 }
 
 impl CommandSandboxProvider {
     pub fn new(
+        provider_name: String,
         command: String,
-        modal_token_id: String,
-        modal_token_secret: String,
+        mut environment: HashMap<String, String>,
     ) -> Result<Self> {
         ensure!(
+            !provider_name.is_empty() && provider_name.trim() == provider_name,
+            "sandbox provider name must be non-empty without surrounding whitespace"
+        );
+        ensure!(
             !command.is_empty() && command.trim() == command,
-            "DURABLE_OBJECT_MODAL_COMMAND must be non-empty without surrounding whitespace"
+            "DURABLE_OBJECT_SANDBOX_COMMAND must be non-empty without surrounding whitespace"
         );
-        ensure!(
-            !modal_token_id.is_empty() && modal_token_id.trim() == modal_token_id,
-            "MODAL_TOKEN_ID must be non-empty without surrounding whitespace"
-        );
-        ensure!(
-            !modal_token_secret.is_empty() && modal_token_secret.trim() == modal_token_secret,
-            "MODAL_TOKEN_SECRET must be non-empty without surrounding whitespace"
-        );
-        let mut environment = HashMap::from([
-            ("MODAL_TOKEN_ID".into(), modal_token_id),
-            ("MODAL_TOKEN_SECRET".into(), modal_token_secret),
-        ]);
         if let Ok(path) = std::env::var("PATH") {
-            environment.insert("PATH".into(), path);
+            environment.entry("PATH".into()).or_insert(path);
         }
         Ok(Self {
+            provider_name,
             command,
             environment,
         })
@@ -109,28 +103,38 @@ impl CommandSandboxProvider {
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .with_context(|| format!("start bundled Modal command {:?}", self.command))?;
+            .with_context(|| {
+                format!(
+                    "start {} sandbox command {:?}",
+                    self.provider_name, self.command
+                )
+            })?;
         let document = serde_json::to_vec(&ProviderCommand { operation, request })?;
-        let mut stdin = child.stdin.take().context("open Modal command stdin")?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .with_context(|| format!("open {} sandbox command stdin", self.provider_name))?;
         stdin
             .write_all(&document)
             .await
-            .context("write Modal command request")?;
+            .with_context(|| format!("write {} sandbox command request", self.provider_name))?;
         stdin
             .shutdown()
             .await
-            .context("close Modal command stdin")?;
+            .with_context(|| format!("close {} sandbox command stdin", self.provider_name))?;
         drop(stdin);
         let output = tokio::time::timeout(PROVIDER_REQUEST_TIMEOUT, child.wait_with_output())
             .await
-            .context("bundled Modal command timed out")??;
+            .with_context(|| format!("{} sandbox command timed out", self.provider_name))??;
         ensure!(
             output.status.success(),
-            "bundled Modal command failed with {}: {}",
+            "{} sandbox command failed with {}: {}",
+            self.provider_name,
             output.status,
             String::from_utf8_lossy(&output.stderr).trim()
         );
-        serde_json::from_slice(&output.stdout).context("decode bundled Modal command response")
+        serde_json::from_slice(&output.stdout)
+            .with_context(|| format!("decode {} sandbox command response", self.provider_name))
     }
 }
 
@@ -146,11 +150,13 @@ impl SandboxProvider for CommandSandboxProvider {
         let response: ActorHostHandle = self.execute("ensure_host", request).await?;
         ensure!(
             response.canonical_region == request.canonical_region,
-            "Modal command returned a host in the wrong canonical region"
+            "{} sandbox command returned a host in the wrong canonical region",
+            self.provider_name
         );
         ensure!(
             !response.host_id.as_str().is_empty() && !response.route.is_empty(),
-            "Modal command returned an invalid host"
+            "{} sandbox command returned an invalid host",
+            self.provider_name
         );
         Ok(response)
     }
@@ -162,10 +168,7 @@ mod tests {
 
     #[test]
     fn rejects_ambiguous_command_configuration() {
-        assert!(CommandSandboxProvider::new("".into(), "id".into(), "secret".into()).is_err());
-        assert!(CommandSandboxProvider::new("modal".into(), "".into(), "secret".into()).is_err());
-        assert!(
-            CommandSandboxProvider::new("modal".into(), "id".into(), " secret".into()).is_err()
-        );
+        assert!(CommandSandboxProvider::new("".into(), "modal".into(), HashMap::new()).is_err());
+        assert!(CommandSandboxProvider::new("modal".into(), "".into(), HashMap::new()).is_err());
     }
 }

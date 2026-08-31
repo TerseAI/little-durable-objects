@@ -50,9 +50,9 @@ pub struct ControlPlaneProcessConfig {
 }
 
 pub struct SandboxProviderConfig {
+    pub provider_name: String,
     pub command: String,
-    pub modal_token_id: String,
-    pub modal_token_secret: String,
+    pub environment: HashMap<String, String>,
     pub runtime: crate::sandbox::HostSandboxRuntimeConfig,
 }
 
@@ -122,37 +122,8 @@ impl ControlPlaneProcessConfig {
             }
             backend => anyhow::bail!("unsupported DURABLE_OBJECT_STORAGE {backend:?}"),
         };
-        let sandbox_provider = match (get("MODAL_TOKEN_ID"), get("MODAL_TOKEN_SECRET")) {
-            (Some(modal_token_id), Some(modal_token_secret)) => {
-                let control_plane_url = validated_http_url(
-                    &required(&mut get, "DURABLE_OBJECT_CONTROL_PLANE_URL")?,
-                    "DURABLE_OBJECT_CONTROL_PLANE_URL",
-                )?;
-                Some(SandboxProviderConfig {
-                    command: get("DURABLE_OBJECT_MODAL_COMMAND")
-                        .unwrap_or_else(|| "terse-durable-objects-modal".into()),
-                    modal_token_id,
-                    modal_token_secret,
-                    runtime: crate::sandbox::HostSandboxRuntimeConfig {
-                        control_plane_url,
-                        jwt_issuer: jwt_issuer.clone(),
-                        invocation_jwt_audience: invocation_jwt_audience.clone(),
-                        actor_idle_timeout_ms: idle_timeout_ms(
-                            &mut get,
-                            "DURABLE_OBJECT_ACTOR_IDLE_TIMEOUT_MS",
-                            DEFAULT_ACTOR_IDLE_TIMEOUT_MS,
-                        )?,
-                        host_idle_timeout_ms: idle_timeout_ms(
-                            &mut get,
-                            "DURABLE_OBJECT_HOST_IDLE_TIMEOUT_MS",
-                            DEFAULT_HOST_IDLE_TIMEOUT_MS,
-                        )?,
-                    },
-                })
-            }
-            (None, None) => None,
-            _ => anyhow::bail!("MODAL_TOKEN_ID and MODAL_TOKEN_SECRET must both be set"),
-        };
+        let sandbox_provider =
+            sandbox_provider_config(&mut get, &jwt_issuer, &invocation_jwt_audience)?;
         Ok(Self {
             bind,
             jwt_signing_key,
@@ -196,9 +167,9 @@ pub async fn serve_control_plane(
     if let Some(provider) = config.sandbox_provider {
         service = service
             .with_sandbox_provider(Arc::new(crate::sandbox::CommandSandboxProvider::new(
+                provider.provider_name,
                 provider.command,
-                provider.modal_token_id,
-                provider.modal_token_secret,
+                provider.environment,
             )?))
             .with_sandbox_runtime(provider.runtime);
     }
@@ -332,6 +303,77 @@ fn validated_http_url(value: &str, name: &str) -> Result<String> {
     Ok(url.to_string())
 }
 
+fn sandbox_provider_config(
+    get: &mut impl FnMut(&str) -> Option<String>,
+    jwt_issuer: &str,
+    invocation_jwt_audience: &str,
+) -> Result<Option<SandboxProviderConfig>> {
+    let Some(provider_name) = get("DURABLE_OBJECT_SANDBOX_PROVIDER") else {
+        ensure!(
+            get("DURABLE_OBJECT_SANDBOX_COMMAND").is_none(),
+            "DURABLE_OBJECT_SANDBOX_COMMAND requires DURABLE_OBJECT_SANDBOX_PROVIDER"
+        );
+        ensure!(
+            get("MODAL_TOKEN_ID").is_none() && get("MODAL_TOKEN_SECRET").is_none(),
+            "Modal credentials require DURABLE_OBJECT_SANDBOX_PROVIDER=modal"
+        );
+        return Ok(None);
+    };
+    ensure!(
+        !provider_name.is_empty() && provider_name.trim() == provider_name,
+        "DURABLE_OBJECT_SANDBOX_PROVIDER must be non-empty without surrounding whitespace"
+    );
+
+    let (default_command, environment) = match provider_name.as_str() {
+        "modal" => {
+            let modal_token_id = provider_credential(get, "MODAL_TOKEN_ID")?;
+            let modal_token_secret = provider_credential(get, "MODAL_TOKEN_SECRET")?;
+            (
+                "terse-durable-objects-modal",
+                HashMap::from([
+                    ("MODAL_TOKEN_ID".into(), modal_token_id),
+                    ("MODAL_TOKEN_SECRET".into(), modal_token_secret),
+                ]),
+            )
+        }
+        provider => anyhow::bail!("unsupported DURABLE_OBJECT_SANDBOX_PROVIDER {provider:?}"),
+    };
+    let control_plane_url = validated_http_url(
+        &required(get, "DURABLE_OBJECT_CONTROL_PLANE_URL")?,
+        "DURABLE_OBJECT_CONTROL_PLANE_URL",
+    )?;
+
+    Ok(Some(SandboxProviderConfig {
+        provider_name,
+        command: get("DURABLE_OBJECT_SANDBOX_COMMAND").unwrap_or_else(|| default_command.into()),
+        environment,
+        runtime: crate::sandbox::HostSandboxRuntimeConfig {
+            control_plane_url,
+            jwt_issuer: jwt_issuer.into(),
+            invocation_jwt_audience: invocation_jwt_audience.into(),
+            actor_idle_timeout_ms: idle_timeout_ms(
+                get,
+                "DURABLE_OBJECT_ACTOR_IDLE_TIMEOUT_MS",
+                DEFAULT_ACTOR_IDLE_TIMEOUT_MS,
+            )?,
+            host_idle_timeout_ms: idle_timeout_ms(
+                get,
+                "DURABLE_OBJECT_HOST_IDLE_TIMEOUT_MS",
+                DEFAULT_HOST_IDLE_TIMEOUT_MS,
+            )?,
+        },
+    }))
+}
+
+fn provider_credential(get: &mut impl FnMut(&str) -> Option<String>, name: &str) -> Result<String> {
+    let value = required(get, name)?;
+    ensure!(
+        value.trim() == value,
+        "{name} must not contain surrounding whitespace"
+    );
+    Ok(value)
+}
+
 fn idle_timeout_ms(
     get: &mut impl FnMut(&str) -> Option<String>,
     name: &str,
@@ -443,21 +485,26 @@ mod tests {
     fn configures_control_plane_owned_actor_host_provisioning() -> Result<()> {
         let config = parse(HashMap::from([
             ("DURABLE_OBJECT_STORAGE", "local"),
+            ("DURABLE_OBJECT_SANDBOX_PROVIDER", "modal"),
             (
                 "DURABLE_OBJECT_CONTROL_PLANE_URL",
                 "https://actors.example.com",
             ),
             ("MODAL_TOKEN_ID", "modal-token-id"),
             ("MODAL_TOKEN_SECRET", "modal-token-secret"),
-            ("DURABLE_OBJECT_MODAL_COMMAND", "./modal-cli"),
+            ("DURABLE_OBJECT_SANDBOX_COMMAND", "./modal-cli"),
             ("DURABLE_OBJECT_ACTOR_IDLE_TIMEOUT_MS", "60000"),
             ("DURABLE_OBJECT_HOST_IDLE_TIMEOUT_MS", "300000"),
         ]))?;
 
         let activation = config.sandbox_provider.expect("sandbox provider config");
+        assert_eq!(activation.provider_name, "modal");
         assert_eq!(activation.command, "./modal-cli");
-        assert_eq!(activation.modal_token_id, "modal-token-id");
-        assert_eq!(activation.modal_token_secret, "modal-token-secret");
+        assert_eq!(activation.environment["MODAL_TOKEN_ID"], "modal-token-id");
+        assert_eq!(
+            activation.environment["MODAL_TOKEN_SECRET"],
+            "modal-token-secret"
+        );
         assert_eq!(
             activation.runtime.control_plane_url,
             "https://actors.example.com/"
@@ -471,10 +518,44 @@ mod tests {
     fn rejects_partial_actor_host_provisioning_configuration() {
         let result = parse(HashMap::from([
             ("DURABLE_OBJECT_STORAGE", "local"),
+            ("DURABLE_OBJECT_SANDBOX_PROVIDER", "modal"),
             ("MODAL_TOKEN_ID", "modal-token-id"),
         ]));
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_provider_credentials_without_a_global_provider_selection() {
+        let result = parse(HashMap::from([
+            ("DURABLE_OBJECT_STORAGE", "local"),
+            ("MODAL_TOKEN_ID", "modal-token-id"),
+            ("MODAL_TOKEN_SECRET", "modal-token-secret"),
+        ]));
+
+        assert_eq!(
+            result
+                .err()
+                .expect("provider selection must be explicit")
+                .to_string(),
+            "Modal credentials require DURABLE_OBJECT_SANDBOX_PROVIDER=modal"
+        );
+    }
+
+    #[test]
+    fn rejects_an_unsupported_global_sandbox_provider() {
+        let result = parse(HashMap::from([
+            ("DURABLE_OBJECT_STORAGE", "local"),
+            ("DURABLE_OBJECT_SANDBOX_PROVIDER", "future-provider"),
+        ]));
+
+        assert_eq!(
+            result
+                .err()
+                .expect("unknown provider must fail")
+                .to_string(),
+            "unsupported DURABLE_OBJECT_SANDBOX_PROVIDER \"future-provider\""
+        );
     }
 
     #[test]

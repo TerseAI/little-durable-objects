@@ -33,6 +33,8 @@ DURABLE_OBJECT_CONTROL_PLANE_URL
 DURABLE_OBJECT_INVOCATION_TIMEOUT_MS  # optional, default 30000
 ```
 
+The control plane selects one sandbox provider globally. For Modal, set `DURABLE_OBJECT_SANDBOX_PROVIDER=modal`; optionally override its executable with `DURABLE_OBJECT_SANDBOX_COMMAND`.
+
 The `terse-durable-objects-modal` executable reads one JSON command from stdin, uses `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET` through the Modal TypeScript SDK, and writes one JSON result to stdout. The Rust control plane invokes it locally; no provider HTTP server is required.
 
 Actor hosts conventionally load `src/durable-objects.ts`. See the [runtime repository](https://github.com/TerseAI/durable-objects) for backend configuration, admin RPCs, authentication, and lifecycle behavior.

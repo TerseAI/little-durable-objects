@@ -44,7 +44,7 @@ class ModalSandboxProvider implements SandboxProvider {
     private async ensureHostOnce(request: EnsureHostRequest, name: string): Promise<ActorHostHandle> {
         validateEnsureRequest(request)
         const placement = modalPlacement(request.canonicalRegion, this.options.catalog)
-        const [app, image, cache] = await Promise.all([this.modal.apps.fromName(this.appName, { createIfMissing: true }), this.modal.images.fromId(request.modalImageId), this.cacheVolume(request)])
+        const [app, image, cache] = await Promise.all([this.modal.apps.fromName(this.appName, { createIfMissing: true }), this.modal.images.fromId(request.imageRef), this.cacheVolume(request)])
         const existing = await this.existing(app, name)
         if (existing) {
             try {

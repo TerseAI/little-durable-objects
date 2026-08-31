@@ -78,7 +78,7 @@ const actorGrpcSchema: INamespace = {
                                     type: "string",
                                     id: 2
                                 },
-                                modalImageId: {
+                                imageRef: {
                                     type: "string",
                                     id: 3
                                 },

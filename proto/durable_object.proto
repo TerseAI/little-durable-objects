@@ -29,7 +29,7 @@ message EnsureNamespaceReply {
 message RegisterLaunchSpecRequest {
   string namespace_id = 1;
   string code_revision = 2;
-  string modal_image_id = 3;
+  string image_ref = 3;
   string working_directory = 4;
   optional string actor_entrypoint = 5;
 }

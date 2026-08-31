@@ -9,7 +9,7 @@ interface EnsureHostRequest {
     readonly controlPlaneUrl: string
     readonly jwtIssuer: string
     readonly invocationJwtAudience: string
-    readonly modalImageId: string
+    readonly imageRef: string
     readonly workingDirectory: string
     readonly actorEntrypoint?: string
     readonly actorIdleTimeoutMs: number
@@ -30,10 +30,10 @@ interface SandboxProvider {
     removeLocalCache(request: EnsureHostRequest): Promise<void>
 }
 
-type ModalSandboxCommand =
+type SandboxProviderCommand =
     | { readonly operation: "ensure_host"; readonly request: EnsureHostRequest }
     | { readonly operation: "status"; readonly request: EnsureHostRequest }
     | { readonly operation: "deactivate"; readonly request: EnsureHostRequest }
     | { readonly operation: "remove_local_cache"; readonly request: EnsureHostRequest }
 
-export type { ActorHostHandle, EnsureHostRequest, ModalSandboxCommand, SandboxProvider }
+export type { ActorHostHandle, EnsureHostRequest, SandboxProvider, SandboxProviderCommand }

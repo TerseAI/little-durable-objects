@@ -358,7 +358,7 @@ impl ControlPlaneService {
                 control_plane_url: runtime.control_plane_url.clone(),
                 jwt_issuer: runtime.jwt_issuer.clone(),
                 invocation_jwt_audience: runtime.invocation_jwt_audience.clone(),
-                modal_image_id: spec.modal_image_id,
+                image_ref: spec.image_ref,
                 working_directory: spec.working_directory,
                 actor_entrypoint: spec.actor_entrypoint,
                 actor_idle_timeout_ms: runtime.actor_idle_timeout_ms,
@@ -413,7 +413,7 @@ impl ActorAdminService for ControlPlaneService {
             .register_launch_spec(&HostLaunchSpec {
                 namespace_id: request.namespace_id,
                 code_revision: request.code_revision,
-                modal_image_id: request.modal_image_id,
+                image_ref: request.image_ref,
                 working_directory: request.working_directory,
                 actor_entrypoint: request.actor_entrypoint,
             })
@@ -688,7 +688,7 @@ mod tests {
             .register_launch_spec(&HostLaunchSpec {
                 namespace_id: "namespace-1".into(),
                 code_revision: "revision-1".into(),
-                modal_image_id: "im-test".into(),
+                image_ref: "im-test".into(),
                 working_directory: "/workspace".into(),
                 actor_entrypoint: Some("src/durable-objects.ts".into()),
             })
@@ -803,7 +803,7 @@ mod tests {
             .register_launch_spec(admin_request(RegisterLaunchSpecRequest {
                 namespace_id: "project-1".into(),
                 code_revision: "revision-1".into(),
-                modal_image_id: "im-actor".into(),
+                image_ref: "im-actor".into(),
                 working_directory: "/workspace".into(),
                 actor_entrypoint: Some("src/durable-objects.ts".into()),
             })?)
