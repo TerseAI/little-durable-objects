@@ -15,43 +15,82 @@ const actorIdentity = {
     actor_id: "counter-1"
 }
 
-test("continues an invocation after its caller deadline and preserves ordering", async () => {
+test("keeps an actor resident until Rust explicitly evicts it", async () => {
     const consumerRoot = await createTypeScriptConsumer()
     const entrypoint = pathToFileURL(path.join(consumerRoot, "src/durable-objects.ts")).href
     try {
-        await exerciseContinuedExecution(entrypoint)
+        await exerciseResidency(entrypoint)
+        await exerciseIdleRecycling(entrypoint)
     } finally {
         await rm(consumerRoot, { recursive: true, force: true })
     }
 })
 
-async function exerciseContinuedExecution(entrypoint: string): Promise<void> {
+async function exerciseResidency(entrypoint: string): Promise<void> {
     assert.deepEqual(await loadActorEntrypoint(entrypoint), ["SessionCounter"])
     const runtime = new ActorWorkerSupervisor({ actorEntrypointUrl: entrypoint })
 
-    const invocation = runtime.handle({
-        type: "invoke",
-        request_id: "slow-request",
-        actor: actorIdentity,
-        method: "incrementAfter",
-        args: [20, 2],
-        state: null,
-        timeout_ms: 1
-    })
-    await Promise.resolve()
+    assert.deepEqual(
+        await runtime.handle({
+            type: "invoke",
+            request_id: "request-1",
+            actor: actorIdentity,
+            method: "increment",
+            args: [2],
+            state: null
+        }),
+        { type: "invoked", result: 2, state: { count: 2 } }
+    )
+    assert.deepEqual(
+        await runtime.handle({
+            type: "invoke",
+            request_id: "request-2",
+            actor: actorIdentity,
+            method: "increment",
+            args: [3],
+            state: { count: 0 }
+        }),
+        { type: "invoked", result: 5, state: { count: 5 } }
+    )
+    assert.deepEqual(await runtime.handle({ type: "evict", actor: actorIdentity }), { type: "evicted" })
+    assert.deepEqual(
+        await runtime.handle({
+            type: "invoke",
+            request_id: "request-3",
+            actor: actorIdentity,
+            method: "getCount",
+            args: [],
+            state: { count: 2 }
+        }),
+        { type: "invoked", result: 2, state: { count: 2 } }
+    )
+}
 
-    const queued = runtime.handle({
-        type: "invoke",
-        request_id: "parallel-request",
-        actor: actorIdentity,
-        method: "increment",
-        args: [3],
-        state: { count: 0 },
-        timeout_ms: 30_000
-    })
-
-    assert.deepEqual(await invocation, { type: "invoked", result: 2, state: { count: 2 } })
-    assert.deepEqual(await queued, { type: "invoked", result: 5, state: { count: 5 } })
+async function exerciseIdleRecycling(entrypoint: string): Promise<void> {
+    const runtime = new ActorWorkerSupervisor({ actorEntrypointUrl: entrypoint, actorIdleTimeoutMs: 10 })
+    assert.deepEqual(
+        await runtime.handle({
+            type: "invoke",
+            request_id: "idle-request-1",
+            actor: actorIdentity,
+            method: "increment",
+            args: [2],
+            state: null
+        }),
+        { type: "invoked", result: 2, state: { count: 2 } }
+    )
+    await new Promise(resolve => setTimeout(resolve, 30))
+    assert.deepEqual(
+        await runtime.handle({
+            type: "invoke",
+            request_id: "idle-request-2",
+            actor: actorIdentity,
+            method: "getCount",
+            args: [],
+            state: { count: 9 }
+        }),
+        { type: "invoked", result: 9, state: { count: 9 } }
+    )
 }
 
 async function createTypeScriptConsumer(): Promise<string> {
@@ -72,9 +111,8 @@ export class SessionCounter extends Actor {
         return this.count
     }
 
-    async incrementAfter(delayMs: number, amount = 1): Promise<number> {
-        await new Promise(resolve => setTimeout(resolve, delayMs))
-        return this.increment(amount)
+    async getCount(): Promise<number> {
+        return this.count
     }
 }
 `

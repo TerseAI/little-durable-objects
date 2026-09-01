@@ -26,17 +26,11 @@ export class Counter extends Actor {
         this.count = 999
         throw new CounterExplosionError()
     }
-
-    async incrementAfter(delayMs: number, amount = 1): Promise<number> {
-        await new Promise(resolve => setTimeout(resolve, delayMs))
-        this.count += amount
-        return this.count
-    }
 }
 
 export class Forwarder extends Actor {
     async incrementCounter(): Promise<number> {
-        return Counter.get("counter-1", { timeoutMs: 10_000 }).increment()
+        return Counter.get("counter-1").increment()
     }
 }
 
@@ -64,8 +58,7 @@ test("keeps a successful actor instance resident and restores it after failure",
             actor: actorIdentity,
             method: "increment",
             args: [2],
-            state: null,
-            timeout_ms: 30_000
+            state: null
         }),
         { type: "invoked", result: 2, state: { count: 2 } }
     )
@@ -76,8 +69,7 @@ test("keeps a successful actor instance resident and restores it after failure",
             actor: actorIdentity,
             method: "increment",
             args: [3],
-            state: { count: 2 },
-            timeout_ms: 30_000
+            state: { count: 2 }
         }),
         { type: "invoked", result: 5, state: { count: 5 } }
     )
@@ -88,8 +80,7 @@ test("keeps a successful actor instance resident and restores it after failure",
             actor: actorIdentity,
             method: "getCount",
             args: [],
-            state: { count: 2 },
-            timeout_ms: 30_000
+            state: { count: 2 }
         }),
         { type: "invoked", result: 5, state: { count: 5 } }
     )
@@ -101,8 +92,7 @@ test("keeps a successful actor instance resident and restores it after failure",
             actor: actorIdentity,
             method: "getIdentity",
             args: [],
-            state: { count: 2 },
-            timeout_ms: 30_000
+            state: { count: 2 }
         }),
         { type: "invoked", result: "counter-1", state: { count: 5 } }
     )
@@ -114,8 +104,7 @@ test("keeps a successful actor instance resident and restores it after failure",
             actor: actorIdentity,
             method: "explode",
             args: [],
-            state: { count: 2 },
-            timeout_ms: 30_000
+            state: { count: 2 }
         }),
         { type: "failed", code: "actor_method_failed", message: "boom" }
     )
@@ -126,8 +115,7 @@ test("keeps a successful actor instance resident and restores it after failure",
             actor: actorIdentity,
             method: "getCount",
             args: [],
-            state: { count: 2 },
-            timeout_ms: 30_000
+            state: { count: 2 }
         }),
         { type: "invoked", result: 2, state: { count: 2 } }
     )
@@ -143,7 +131,7 @@ test("Actor.get returns a typed forwarding reference", async () => {
         }
     })
     try {
-        const counter = Counter.get("counter-1", { timeoutMs: 1_234 })
+        const counter = Counter.get("counter-1")
 
         assert.equal(Reflect.get(counter, "missingMethod"), undefined)
         assert.equal(await counter.increment(3), 7)
@@ -153,27 +141,9 @@ test("Actor.get returns a typed forwarding reference", async () => {
                 actorType: "Counter",
                 actorId: "counter-1",
                 method: "increment",
-                args: [3],
-                timeoutMs: 1_234
+                args: [3]
             }
         ])
-    } finally {
-        configureActorClientForTests(undefined)
-    }
-})
-
-test("Actor.get enforces its caller deadline", async () => {
-    configureActorClientForTests({
-        requestId: () => "deadline-request",
-        invoke: async () => new Promise<never>(() => undefined)
-    })
-    try {
-        await assert.rejects(Counter.get("counter-1", { timeoutMs: 10 }).increment(), error => {
-            assert.equal(Reflect.get(error as object, "name"), "ActorInvocationError")
-            assert.equal(Reflect.get(error as object, "code"), "deadline_exceeded")
-            assert.equal(Reflect.get(error as object, "requestId"), "deadline-request")
-            return true
-        })
     } finally {
         configureActorClientForTests(undefined)
     }
@@ -195,8 +165,7 @@ test("the injected invoker remains available inside actor unit tests", async () 
                 actor: forwarderIdentity,
                 method: "incrementCounter",
                 args: [],
-                state: null,
-                timeout_ms: 500
+                state: null
             }),
             {
                 type: "failed",
@@ -207,22 +176,6 @@ test("the injected invoker remains available inside actor unit tests", async () 
     } finally {
         configureActorClientForTests(undefined)
     }
-})
-
-test("an actor method continues after its caller deadline", async () => {
-    const runtime = new ActorRuntime(counterDefinition)
-    assert.deepEqual(
-        await runtime.handle({
-            type: "invoke",
-            request_id: "slow-request",
-            actor: actorIdentity,
-            method: "incrementAfter",
-            args: [10, 3],
-            state: { count: 2 },
-            timeout_ms: 1
-        }),
-        { type: "invoked", result: 5, state: { count: 5 } }
-    )
 })
 
 class CounterExplosionError extends Error {

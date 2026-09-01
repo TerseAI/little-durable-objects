@@ -14,15 +14,36 @@ impl TryFrom<proto::InvokeActorRequest> for ActorInvocation {
             method: invocation.method,
             args: serde_json::from_slice(&invocation.args_json)
                 .context("actor arguments must be a JSON array")?,
-            timeout_ms: invocation.timeout_ms,
         };
         invocation.validate()?;
         Ok(invocation)
     }
 }
 
+impl From<ActorInvocation> for proto::InvokeActorRequest {
+    fn from(invocation: ActorInvocation) -> Self {
+        Self {
+            request_id: invocation.request_id,
+            actor: Some(proto::ActorKey::from(invocation.actor)),
+            method: invocation.method,
+            args_json: serde_json::to_vec(&invocation.args)
+                .expect("validated JSON actor arguments must serialize"),
+        }
+    }
+}
+
 impl From<proto::ActorKey> for ActorKey {
     fn from(actor: proto::ActorKey) -> Self {
+        Self {
+            namespace_id: actor.namespace_id,
+            actor_type: actor.actor_type,
+            actor_id: actor.actor_id,
+        }
+    }
+}
+
+impl From<ActorKey> for proto::ActorKey {
+    fn from(actor: ActorKey) -> Self {
         Self {
             namespace_id: actor.namespace_id,
             actor_type: actor.actor_type,

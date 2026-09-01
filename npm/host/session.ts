@@ -74,7 +74,7 @@ class ActorSessionConnection {
         if (actorTypes.length === 0) throw new ActorSessionError("the actor entrypoint does not export any actor classes")
         const socket = await connectSocket(socketPath)
         const connection = new ActorSessionConnection(socket, commandHandler)
-        connection.send({ type: "attach", protocol: 10, actor_types: actorTypes })
+        connection.send({ type: "attach", protocol: 11, actor_types: actorTypes })
         await connection.waitUntilAttached(timeoutMs)
         return connection
     }

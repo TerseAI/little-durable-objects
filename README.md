@@ -14,7 +14,7 @@ A small, provider-neutral durable-object runtime. Modal is the first sandbox pro
    chmod +x npm/dist/providers/modalCli.js
    ```
 
-3. Start the control plane. The public URL must be an HTTP/2 gRPC origin reachable from Modal.
+3. Start the control plane. Its HTTP origin serves the public REST API and the internal host gRPC API, so it must be reachable from Modal with HTTP/2 enabled.
 
    ```sh
    export DURABLE_OBJECT_PROCESS_ROLE=control_plane
@@ -46,15 +46,18 @@ A small, provider-neutral durable-object runtime. Modal is the first sandbox pro
    }
    ```
 
-5. From your trusted backend, call the admin RPCs in [durable_object.proto](proto/durable_object.proto) using `Authorization: Bearer $DURABLE_OBJECT_ADMIN_TOKEN`:
+5. From your trusted backend, call the JSON API using `Authorization: Bearer $DURABLE_OBJECT_ADMIN_TOKEN`:
 
-   - Once per project: `EnsureNamespace(namespace_id)`
-   - Once per deploy: `RegisterLaunchSpec(namespace_id, code_revision, image_ref, working_directory, actor_entrypoint)`
-   - Once per workflow: `IssueWorkflowToken(namespace_id, execution_id, deadline_unix_ms)`
+   ```text
+   PUT  /v1/namespaces/{namespaceId}/deployment
+   POST /v1/namespaces/{namespaceId}/workflow-tokens
+   ```
+
+   The deployment call atomically ensures the namespace and registers its active deployment. Its body is `{ "codeRevision", "imageRef", "workingDirectory", "actorEntrypoint" }`. The workflow-token body is `{ "executionId", "deadlineUnixMs" }`.
 
    `image_ref` is a Modal image containing Node.js, your built project, its dependencies, and `durable-object-runtime` at `/usr/local/bin/durable-object-runtime`.
 
-6. Give the issued project token to the workflow and call the actor:
+6. Give the issued project token to the workflow and call the actor. The package sends an authenticated JSON `POST` to the control plane:
 
    ```ts
    import { configureDurableObjects } from "@terse/durable-objects"
@@ -71,4 +74,4 @@ A small, provider-neutral durable-object runtime. Modal is the first sandbox pro
 
 Actors leave memory after 60 seconds idle; empty host sandboxes stop after 5 minutes. Override those defaults with `DURABLE_OBJECT_ACTOR_IDLE_TIMEOUT_MS` and `DURABLE_OBJECT_HOST_IDLE_TIMEOUT_MS` on the control plane.
 
-See the short [architecture diagram](docs/system-architecture-ascii.md) for the request and credential flow.
+See the [developer guide](docs/developer-guide.md), [Terse integration quickstart](docs/terse-integration.md), and short [architecture diagram](docs/system-architecture-ascii.md).

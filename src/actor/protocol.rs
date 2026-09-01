@@ -8,7 +8,6 @@ const MAX_NAMESPACE_ID_BYTES: usize = 96;
 const MAX_ACTOR_TYPE_BYTES: usize = 48;
 const MAX_ACTOR_ID_BYTES: usize = 128;
 const MAX_METHOD_BYTES: usize = 128;
-const MAX_ACTOR_INVOCATION_TIMEOUT_MS: u64 = i32::MAX as u64;
 
 /// The authenticated tenant boundary shared by a collection of actors.
 #[derive(Clone, Debug)]
@@ -73,9 +72,6 @@ pub struct ActorInvocation {
     pub actor: ActorKey,
     pub method: String,
     pub args: Vec<Value>,
-    /// Remaining caller wait budget. Execution may continue after this caller's
-    /// deadline expires so the actor gate stays held until the task terminates.
-    pub timeout_ms: u64,
 }
 
 impl ActorInvocation {
@@ -87,11 +83,6 @@ impl ActorInvocation {
         );
         self.actor.validate()?;
         validate_component("actor method", &self.method, MAX_METHOD_BYTES)?;
-        ensure!(self.timeout_ms > 0, "actor timeout must be positive");
-        ensure!(
-            self.timeout_ms <= MAX_ACTOR_INVOCATION_TIMEOUT_MS,
-            "actor timeout must be at most {MAX_ACTOR_INVOCATION_TIMEOUT_MS}ms"
-        );
         Ok(())
     }
 }

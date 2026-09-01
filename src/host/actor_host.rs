@@ -143,7 +143,6 @@ impl ActorHost {
                 method: invocation.method,
                 args: invocation.args,
                 state: loaded.log.latest_state().cloned(),
-                timeout_ms: invocation.timeout_ms,
             })
             .await;
         let (result, next_state) = match outcome {

@@ -4,6 +4,7 @@ mod client;
 mod issuer;
 mod process;
 mod protocol;
+mod public_api;
 mod service;
 
 use std::time::Duration;

@@ -2,8 +2,6 @@ import { z } from "zod"
 
 import { ActorProtocolError, ActorSerializationError, ActorValidationError } from "./errors.js"
 
-const MAX_ACTOR_INVOCATION_TIMEOUT_MS = 2_147_483_647
-
 type JsonPrimitive = string | number | boolean | null
 type JsonObject = { readonly [key: string]: JsonValue }
 type JsonValue = JsonPrimitive | JsonObject | readonly JsonValue[]
@@ -23,8 +21,7 @@ const invokeCommandSchema = z.object({
     actor: actorIdentitySchema,
     method: actorComponentSchema,
     args: z.array(jsonValueSchema),
-    state: jsonValueSchema.nullable(),
-    timeout_ms: z.number().int().positive().max(MAX_ACTOR_INVOCATION_TIMEOUT_MS)
+    state: jsonValueSchema.nullable()
 })
 
 const evictCommandSchema = z.object({
@@ -35,7 +32,7 @@ const evictCommandSchema = z.object({
 const executorCommandSchema = z.discriminatedUnion("type", [invokeCommandSchema, evictCommandSchema])
 
 const actorSessionServerMessageSchema = z.discriminatedUnion("type", [
-    z.object({ type: z.literal("attached"), protocol: z.literal(10) }),
+    z.object({ type: z.literal("attached"), protocol: z.literal(11) }),
     z.object({
         type: z.literal("command"),
         message_id: z.number().int().nonnegative(),
@@ -129,7 +126,7 @@ type ActorSessionClientMessage = AttachMessage | ReplyMessage
 
 interface AttachMessage {
     readonly type: "attach"
-    readonly protocol: 10
+    readonly protocol: 11
     readonly actor_types: readonly string[]
 }
 
@@ -162,7 +159,7 @@ interface ActorWorkerData {
 
 type ActorWorkerRequest = { readonly type: "invoke"; readonly command: InvokeCommand }
 
-export { JsonActorStateSerializer, MAX_ACTOR_INVOCATION_TIMEOUT_MS, errorMessage, failedReply, parseActorSessionServerMessage, validateActorComponent }
+export { JsonActorStateSerializer, errorMessage, failedReply, parseActorSessionServerMessage, validateActorComponent }
 export type {
     ActorExecutorCommand,
     ActorExecutorReply,

@@ -6,7 +6,6 @@ import type { ActorExecutorCommand, ActorExecutorReply, ActorWorkerData, ActorWo
 
 const DEFAULT_ACTOR_IDLE_TIMEOUT_MS = 60_000
 const MAX_RESIDENT_ACTORS = 32
-const MAX_QUEUED_INVOCATIONS_PER_ACTOR = 32
 
 class ActorWorkerSupervisor {
     private readonly actorEntrypointUrl: string
@@ -87,8 +86,6 @@ class ResidentActorWorker {
     readonly onIdle: (actor: ResidentActorWorker) => void
     lastCompletedAt = Date.now()
     private worker: ActorWorker | undefined
-    private tail = Promise.resolve()
-    private outstanding = 0
     private idleTimer: NodeJS.Timeout | undefined
 
     constructor(options: ResidentActorWorkerOptions) {
@@ -98,31 +95,9 @@ class ResidentActorWorker {
         this.onIdle = options.onIdle
     }
 
-    invoke(command: InvokeCommand): Promise<ActorExecutorReply> {
-        if (this.outstanding > MAX_QUEUED_INVOCATIONS_PER_ACTOR) {
-            return Promise.resolve(failedReply("resource_exhausted", `actor already has ${MAX_QUEUED_INVOCATIONS_PER_ACTOR} queued invocations`))
-        }
-        this.outstanding += 1
+    async invoke(command: InvokeCommand): Promise<ActorExecutorReply> {
         if (this.idleTimer !== undefined) clearTimeout(this.idleTimer)
-        const invocation = this.tail.then(() => this.invokeNext(command))
-        this.tail = invocation.then(
-            () => undefined,
-            () => undefined
-        )
-        return invocation
-    }
-
-    isIdle(): boolean {
-        return this.outstanding === 0
-    }
-
-    terminate(reason: string): void {
-        if (this.idleTimer !== undefined) clearTimeout(this.idleTimer)
-        this.worker?.terminate(reason)
-        this.worker = undefined
-    }
-
-    private async invokeNext(command: InvokeCommand): Promise<ActorExecutorReply> {
+        this.idleTimer = undefined
         this.worker ??= new ActorWorker({ actorType: this.actorType, moduleUrl: this.moduleUrl })
         let reply: ActorExecutorReply
         try {
@@ -130,18 +105,26 @@ class ResidentActorWorker {
         } catch (error) {
             reply = failedReply(error instanceof ActorWorkerTerminatedError ? "actor_worker_terminated" : "actor_worker_failed", errorMessage(error))
         } finally {
-            this.outstanding -= 1
             this.lastCompletedAt = Date.now()
         }
         if (reply.type === "failed") {
             this.worker.terminate("actor invocation failed")
             this.worker = undefined
         }
-        if (this.outstanding === 0) {
-            this.idleTimer = setTimeout(() => this.onIdle(this), this.idleTimeoutMs)
-            this.idleTimer.unref()
-        }
+        this.idleTimer = setTimeout(() => this.onIdle(this), this.idleTimeoutMs)
+        this.idleTimer.unref()
         return reply
+    }
+
+    isIdle(): boolean {
+        return this.idleTimer !== undefined
+    }
+
+    terminate(reason: string): void {
+        if (this.idleTimer !== undefined) clearTimeout(this.idleTimer)
+        this.idleTimer = undefined
+        this.worker?.terminate(reason)
+        this.worker = undefined
     }
 }
 
@@ -161,7 +144,6 @@ class ActorWorker {
 
     async invoke(command: InvokeCommand): Promise<ActorExecutorReply> {
         if (this.terminalError !== undefined) throw this.terminalError
-        if (this.replyResolve !== undefined) throw new Error("actor Worker received concurrent invocations")
         this.worker.ref()
         try {
             return await new Promise<ActorExecutorReply>((resolve, reject) => {
@@ -228,5 +210,5 @@ interface ResidentActorWorkerOptions {
     readonly onIdle: (actor: ResidentActorWorker) => void
 }
 
-export { ActorWorkerSupervisor, DEFAULT_ACTOR_IDLE_TIMEOUT_MS, MAX_QUEUED_INVOCATIONS_PER_ACTOR, MAX_RESIDENT_ACTORS }
+export { ActorWorkerSupervisor, DEFAULT_ACTOR_IDLE_TIMEOUT_MS, MAX_RESIDENT_ACTORS }
 export type { ActorWorkerSupervisorOptions }

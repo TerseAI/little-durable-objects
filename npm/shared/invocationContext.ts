@@ -1,18 +1,13 @@
 import { AsyncLocalStorage } from "node:async_hooks"
 
-const invocationStorage = new AsyncLocalStorage<ActorInvocationContext>()
+const invocationStorage = new AsyncLocalStorage<true>()
 
-function runInActorInvocation<T>(context: ActorInvocationContext, operation: () => T): T {
-    return invocationStorage.run(context, operation)
+function runInActorInvocation<T>(operation: () => T): T {
+    return invocationStorage.run(true, operation)
 }
 
-function currentActorInvocation(): ActorInvocationContext | undefined {
+function currentActorInvocation(): true | undefined {
     return invocationStorage.getStore()
 }
 
-interface ActorInvocationContext {
-    readonly deadline: number
-}
-
 export { currentActorInvocation, runInActorInvocation }
-export type { ActorInvocationContext }

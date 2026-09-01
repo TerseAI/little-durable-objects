@@ -22,7 +22,7 @@ use tracing::{debug, info};
 
 use super::{ActorInvocationFailure, ActorKey};
 
-const ACTOR_EXECUTOR_PROTOCOL_VERSION: u32 = 10;
+const ACTOR_EXECUTOR_PROTOCOL_VERSION: u32 = 11;
 pub(crate) const MAX_ACTOR_EXECUTOR_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Serialize)]
@@ -32,7 +32,6 @@ pub struct ActorMethodInvocation {
     pub method: String,
     pub args: Vec<Value>,
     pub state: Option<Value>,
-    pub timeout_ms: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -449,7 +448,6 @@ mod tests {
                 method: "increment".into(),
                 args: vec![json!(2)],
                 state: None,
-                timeout_ms: 30_000,
             })
             .await?;
         assert_eq!(
@@ -470,10 +468,10 @@ mod tests {
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
         writer
-            .write_all(b"{\"type\":\"attach\",\"protocol\":10,\"actor_types\":[\"counter\"]}\n")
+            .write_all(b"{\"type\":\"attach\",\"protocol\":11,\"actor_types\":[\"counter\"]}\n")
             .await?;
         ensure!(
-            read_json_line(&mut reader).await? == json!({ "type": "attached", "protocol": 10 })
+            read_json_line(&mut reader).await? == json!({ "type": "attached", "protocol": 11 })
         );
 
         let invocation = read_json_line(&mut reader).await?;
@@ -481,11 +479,7 @@ mod tests {
             .as_u64()
             .context("invocation message ID")?;
         ensure!(invocation["command"]["type"] == "invoke");
-        ensure!(
-            invocation["command"]["timeout_ms"]
-                .as_u64()
-                .is_some_and(|timeout| timeout > 0 && timeout <= 30_000)
-        );
+        ensure!(invocation["command"].get("timeout_ms").is_none());
         write_json_line(
             &mut writer,
             &json!({

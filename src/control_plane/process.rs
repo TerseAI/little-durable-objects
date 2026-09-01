@@ -148,12 +148,13 @@ pub async fn serve_control_plane(
             )?))
             .with_sandbox_runtime(provider.runtime);
     }
-    let admin = service.clone().into_admin_service();
-    let actors = service.into_service();
+    let public_api = super::public_api::router(service.clone());
+    let internal_api = service.into_internal_service();
+    let routes = tonic::service::Routes::from(public_api).add_service(internal_api);
     info!(bind = %config.bind, "durable-object control plane is ready");
     Server::builder()
-        .add_service(actors)
-        .add_service(admin)
+        .accept_http1(true)
+        .add_routes(routes)
         .serve_with_shutdown(config.bind, shutdown)
         .await
         .context("serve durable-object control plane")

@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, ensure};
 use subtle::ConstantTimeEq;
@@ -7,11 +7,7 @@ use tonic::{Request, Response, Status, metadata::MetadataValue, transport::Endpo
 use crate::{
     actor::{ActorExecutionResult, ActorInvocation, ActorInvocationFailure, ActorKey},
     grpc::proto::{
-        ControlPlaneReply, ControlPlaneRequest, EnsureNamespaceReply, EnsureNamespaceRequest,
-        GetJwksReply, GetJwksRequest, HostInvokeActorRequest, InvokeActorReply, InvokeActorRequest,
-        IssueWorkflowTokenReply, IssueWorkflowTokenRequest, RegisterLaunchSpecReply,
-        RegisterLaunchSpecRequest,
-        actor_admin_service_server::{ActorAdminService, ActorAdminServiceServer},
+        ControlPlaneReply, ControlPlaneRequest, HostInvokeActorRequest, InvokeActorReply,
         actor_control_plane_service_server::{
             ActorControlPlaneService, ActorControlPlaneServiceServer,
         },
@@ -47,10 +43,10 @@ pub struct ControlPlaneService {
 }
 
 #[derive(Clone)]
-struct AdminDependencies {
-    token: String,
-    registry: Arc<dyn AdminRegistry>,
-    issuer: ActorJwtIssuer,
+pub(super) struct AdminDependencies {
+    pub(super) token: String,
+    pub(super) registry: Arc<dyn AdminRegistry>,
+    pub(super) issuer: ActorJwtIssuer,
 }
 
 impl ControlPlaneService {
@@ -99,14 +95,18 @@ impl ControlPlaneService {
         Ok(self)
     }
 
-    pub fn into_service(self) -> ActorControlPlaneServiceServer<Self> {
+    pub fn into_internal_service(self) -> ActorControlPlaneServiceServer<Self> {
         ActorControlPlaneServiceServer::new(self)
             .max_decoding_message_size(MAX_CONTROL_PLANE_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_CONTROL_PLANE_MESSAGE_BYTES)
     }
 
-    pub fn into_admin_service(self) -> ActorAdminServiceServer<Self> {
-        ActorAdminServiceServer::new(self)
+    pub(super) fn admin(&self) -> Option<&AdminDependencies> {
+        self.admin.as_ref()
+    }
+
+    pub(super) fn authenticate_workflow(&self, authorization: &str) -> Result<ActorPrincipal> {
+        self.auth.authenticate_authorization(authorization)
     }
 
     async fn execute_command(
@@ -212,20 +212,17 @@ impl ControlPlaneService {
         Ok(lease)
     }
 
-    async fn invoke_workflow(
+    pub(super) async fn invoke_workflow(
         &self,
         principal: ActorPrincipal,
-        request: InvokeActorRequest,
+        invocation: ActorInvocation,
     ) -> ActorExecutionResult {
-        let invocation: ActorInvocation = match request.clone().try_into() {
-            Ok(invocation) => invocation,
-            Err(error) => {
-                return failed(
-                    "state_error",
-                    format!("invalid actor invocation: {error:#}"),
-                );
-            }
-        };
+        if let Err(error) = invocation.validate() {
+            return failed(
+                "state_error",
+                format!("invalid actor invocation: {error:#}"),
+            );
+        }
         if principal.process_role != ActorProcessRole::Workflow
             || !principal.scope.contains(&invocation.actor)
         {
@@ -243,7 +240,7 @@ impl ControlPlaneService {
                 }
             };
             let reply = match self
-                .invoke_host(request.clone(), &invocation.actor, &target)
+                .invoke_host(invocation.clone(), &invocation.actor, &target)
                 .await
             {
                 Ok(reply) => reply,
@@ -386,7 +383,7 @@ impl ControlPlaneService {
 
     async fn invoke_host(
         &self,
-        request: InvokeActorRequest,
+        invocation: ActorInvocation,
         actor: &ActorKey,
         target: &RoutedActor,
     ) -> std::result::Result<InvokeActorReply, HostCallError> {
@@ -422,7 +419,7 @@ impl ControlPlaneService {
                 HostCallError::Unavailable(format!("could not connect to actor host: {error}"))
             })?;
         let mut rpc = Request::new(HostInvokeActorRequest {
-            invocation: Some(request),
+            invocation: Some(invocation.into()),
             owner_epoch: target.placement.owner_epoch,
             state_read_url: read_url,
         });
@@ -447,66 +444,23 @@ impl ControlPlaneService {
             })
     }
 
-    fn authenticate_admin<T>(
-        &self,
-        request: &Request<T>,
-    ) -> std::result::Result<&AdminDependencies, Status> {
-        let admin = self
-            .admin
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("admin service is not configured"))?;
-        let authorization = request
-            .metadata()
-            .get("authorization")
-            .ok_or_else(|| Status::unauthenticated("admin credential is required"))?
-            .to_str()
-            .map_err(|_| Status::unauthenticated("admin credential is invalid"))?;
-        let token = authorization.strip_prefix("Bearer ").ok_or_else(|| {
-            Status::unauthenticated("admin credential must use Bearer authentication")
-        })?;
-        if !bool::from(token.as_bytes().ct_eq(admin.token.as_bytes())) {
-            return Err(Status::unauthenticated("admin credential is invalid"));
-        }
-        Ok(admin)
+    pub(super) fn authenticate_admin(&self, authorization: &str) -> Result<()> {
+        let admin = self.admin.as_ref().context("admin API is not configured")?;
+        let token = authorization
+            .strip_prefix("Bearer ")
+            .context("admin credential must use Bearer authentication")?;
+        ensure!(
+            !token.is_empty()
+                && token.trim() == token
+                && bool::from(token.as_bytes().ct_eq(admin.token.as_bytes())),
+            "admin credential is invalid"
+        );
+        Ok(())
     }
 }
 
 #[tonic::async_trait]
 impl ActorControlPlaneService for ControlPlaneService {
-    async fn invoke(
-        &self,
-        request: Request<InvokeActorRequest>,
-    ) -> std::result::Result<Response<InvokeActorReply>, Status> {
-        let principal = self.auth.authenticate(&request).await?;
-        let timeout_ms = request.get_ref().timeout_ms;
-        if timeout_ms == 0 {
-            return Err(Status::invalid_argument("actor timeout must be positive"));
-        }
-        let service = self.clone();
-        let invocation = request.into_inner();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let _ = tx.send(service.invoke_workflow(principal, invocation).await);
-        });
-        match tokio::time::timeout(Duration::from_millis(timeout_ms), rx).await {
-            Ok(Ok(result)) => Ok(Response::new(result.into())),
-            Ok(Err(_)) => Ok(Response::new(
-                failed(
-                    "outcome_unknown",
-                    "actor invocation task stopped without a reply",
-                )
-                .into(),
-            )),
-            Err(_) => Ok(Response::new(
-                failed(
-                    "deadline_exceeded",
-                    "caller deadline elapsed; actor execution may still complete",
-                )
-                .into(),
-            )),
-        }
-    }
-
     async fn execute(
         &self,
         request: Request<ControlPlaneRequest>,
@@ -519,87 +473,6 @@ impl ActorControlPlaneService for ControlPlaneService {
             .await
             .map_err(failed_precondition)?;
         Ok(Response::new(encode_reply(reply).map_err(internal)?))
-    }
-}
-
-#[tonic::async_trait]
-impl ActorAdminService for ControlPlaneService {
-    async fn ensure_namespace(
-        &self,
-        request: Request<EnsureNamespaceRequest>,
-    ) -> std::result::Result<Response<EnsureNamespaceReply>, Status> {
-        let admin = self.authenticate_admin(&request)?;
-        let created = admin
-            .registry
-            .ensure_namespace(&request.get_ref().namespace_id)
-            .await
-            .map_err(failed_precondition)?;
-        Ok(Response::new(EnsureNamespaceReply { created }))
-    }
-
-    async fn register_launch_spec(
-        &self,
-        request: Request<RegisterLaunchSpecRequest>,
-    ) -> std::result::Result<Response<RegisterLaunchSpecReply>, Status> {
-        let admin = self.authenticate_admin(&request)?;
-        let request = request.into_inner();
-        let created = admin
-            .registry
-            .register_launch_spec(&HostLaunchSpec {
-                namespace_id: request.namespace_id,
-                code_revision: request.code_revision,
-                image_ref: request.image_ref,
-                working_directory: request.working_directory,
-                actor_entrypoint: request.actor_entrypoint,
-            })
-            .await
-            .map_err(failed_precondition)?;
-        Ok(Response::new(RegisterLaunchSpecReply { created }))
-    }
-
-    async fn issue_workflow_token(
-        &self,
-        request: Request<IssueWorkflowTokenRequest>,
-    ) -> std::result::Result<Response<IssueWorkflowTokenReply>, Status> {
-        let admin = self.authenticate_admin(&request)?;
-        let request = request.into_inner();
-        ensure_workflow_request(&request).map_err(failed_precondition)?;
-        if admin
-            .registry
-            .launch_spec(&request.namespace_id)
-            .await
-            .map_err(failed_precondition)?
-            .is_none()
-        {
-            return Err(Status::failed_precondition(
-                "project has no registered actor code",
-            ));
-        }
-        let issued = admin
-            .issuer
-            .issue_workflow(
-                &request.namespace_id,
-                &request.execution_id,
-                request.deadline_unix_ms,
-            )
-            .map_err(failed_precondition)?;
-        Ok(Response::new(IssueWorkflowTokenReply {
-            token: issued.token,
-            expires_at_ms: issued.expires_at_ms,
-        }))
-    }
-
-    async fn get_jwks(
-        &self,
-        _request: Request<GetJwksRequest>,
-    ) -> std::result::Result<Response<GetJwksReply>, Status> {
-        let admin = self
-            .admin
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("admin service is not configured"))?;
-        Ok(Response::new(GetJwksReply {
-            jwks_json: admin.issuer.jwks_json().map_err(internal)?,
-        }))
     }
 }
 
@@ -626,18 +499,6 @@ fn failed(code: impl Into<String>, message: impl Into<String>) -> ActorExecution
             message: message.into(),
         },
     }
-}
-
-fn ensure_workflow_request(request: &IssueWorkflowTokenRequest) -> Result<()> {
-    ensure!(
-        !request.execution_id.is_empty() && request.execution_id.len() <= 255,
-        "workflow execution ID is invalid"
-    );
-    ensure!(
-        request.deadline_unix_ms > 0,
-        "workflow deadline is required"
-    );
-    Ok(())
 }
 
 fn validate_host_route(route: &str) -> Result<()> {
@@ -668,6 +529,7 @@ fn unix_seconds() -> Result<i64> {
 fn failed_precondition(error: impl std::fmt::Display) -> Status {
     Status::failed_precondition(error.to_string())
 }
+
 fn internal(error: impl std::fmt::Display) -> Status {
     Status::internal(error.to_string())
 }

@@ -1,84 +1,109 @@
-import * as grpc from "@grpc/grpc-js"
 import assert from "node:assert/strict"
+import { createServer } from "node:http"
+import type { IncomingMessage, Server, ServerResponse } from "node:http"
 import { test } from "node:test"
 
 import { ActorInvocationError } from "../shared/errors.js"
 
-import { RemoteActorClient, actorGrpcProtocolForTests as protocol } from "./remoteClient.js"
+import { RemoteActorClient } from "./remoteClient.js"
 
-test("remote actor client sends one authenticated control-plane invocation", async () => {
+test("remote actor client sends one authenticated HTTP invocation", async () => {
     let calls = 0
-    const server = new grpc.Server()
-    server.addService(
-        { invoke: unaryDefinition("/durable_object.v1.ActorControlPlaneService/Invoke", protocol.invokeActorRequestType, protocol.invokeActorReplyType) },
-        {
-            invoke(call: grpc.ServerUnaryCall<Record<string, unknown>, Record<string, unknown>>, callback: grpc.sendUnaryData<Record<string, unknown>>) {
-                calls += 1
-                assert.equal(call.metadata.get("authorization")[0], "Bearer workflow-token")
-                assert.deepEqual(call.request.actor, { namespaceId: "project-1", actorType: "Counter", actorId: "counter-1" })
-                assert.deepEqual(JSON.parse((call.request.argsJson as Buffer).toString("utf8")), [2])
-                callback(null, { completed: { resultJson: Buffer.from("7") } })
-            }
-        }
-    )
-    const port = await bind(server)
+    const server = createServer(async (request, response) => {
+        calls += 1
+        assert.equal(request.method, "POST")
+        assert.equal(request.url, "/v1/namespaces/project-1/actors/Counter/counter-1/invocations")
+        assert.equal(request.headers.authorization, "Bearer workflow-token")
+        const body = JSON.parse(await readBody(request)) as Record<string, unknown>
+        assert.equal(body.method, "increment")
+        assert.deepEqual(body.args, [2])
+        assert.equal(body.timeoutMs, undefined)
+        json(response, 200, { result: 7 })
+    })
+    const port = await listen(server)
     RemoteActorClient.configure({
         token: "workflow-token",
         namespaceId: "project-1",
-        controlPlaneUrl: `http://127.0.0.1:${port}`,
-        invocationTimeoutMs: 5_000
+        controlPlaneUrl: `http://127.0.0.1:${port}`
     })
     try {
         assert.equal(await RemoteActorClient.getInstance().invoke("Counter", "counter-1", "increment", [2]), 7)
         assert.equal(calls, 1)
     } finally {
         RemoteActorClient.resetForTests()
-        server.forceShutdown()
+        await close(server)
     }
 })
 
 test("does not retry a control-plane transport failure", async () => {
     let calls = 0
-    const server = new grpc.Server()
-    server.addService(
-        { invoke: unaryDefinition("/durable_object.v1.ActorControlPlaneService/Invoke", protocol.invokeActorRequestType, protocol.invokeActorReplyType) },
-        {
-            invoke(_call: grpc.ServerUnaryCall<Record<string, unknown>, Record<string, unknown>>, callback: grpc.sendUnaryData<Record<string, unknown>>) {
-                calls += 1
-                callback(serviceError(grpc.status.UNAVAILABLE, "connection was lost"))
-            }
-        }
-    )
-    const port = await bind(server)
-    RemoteActorClient.configure({ token: "workflow-token", namespaceId: "project-1", controlPlaneUrl: `http://127.0.0.1:${port}`, invocationTimeoutMs: 5_000 })
+    const server = createServer(request => {
+        calls += 1
+        request.socket.destroy()
+    })
+    const port = await listen(server)
+    RemoteActorClient.configure({ token: "workflow-token", namespaceId: "project-1", controlPlaneUrl: `http://127.0.0.1:${port}` })
     try {
         await assert.rejects(RemoteActorClient.getInstance().invoke("Counter", "counter-1", "increment", [2]), error => error instanceof ActorInvocationError && error.code === "outcome_unknown")
         assert.equal(calls, 1)
     } finally {
         RemoteActorClient.resetForTests()
-        server.forceShutdown()
+        await close(server)
     }
 })
 
-function unaryDefinition(path: string, requestType: Parameters<typeof protocol.encode>[0], responseType: Parameters<typeof protocol.encode>[0]): grpc.MethodDefinition<unknown, unknown> {
-    return {
-        path,
-        requestStream: false,
-        responseStream: false,
-        requestSerialize: value => protocol.encode(requestType, value),
-        requestDeserialize: value => protocol.decode(requestType, value),
-        responseSerialize: value => protocol.encode(responseType, value),
-        responseDeserialize: value => protocol.decode(responseType, value),
-        originalName: "invoke"
+test("preserves a structured actor failure from HTTP", async () => {
+    const server = createServer((_request, response) => {
+        json(response, 422, {
+            error: {
+                code: "actor_error",
+                message: "actor method failed",
+                requestId: "server-request"
+            }
+        })
+    })
+    const port = await listen(server)
+    RemoteActorClient.configure({ token: "workflow-token", namespaceId: "project-1", controlPlaneUrl: `http://127.0.0.1:${port}` })
+    try {
+        await assert.rejects(
+            RemoteActorClient.getInstance().invoke("Counter", "counter-1", "increment", [2]),
+            error => error instanceof ActorInvocationError && error.code === "actor_error" && error.requestId === "server-request"
+        )
+    } finally {
+        RemoteActorClient.resetForTests()
+        await close(server)
     }
-}
+})
 
-function bind(server: grpc.Server): Promise<number> {
+function readBody(request: IncomingMessage): Promise<string> {
     return new Promise((resolve, reject) => {
-        server.bindAsync("127.0.0.1:0", grpc.ServerCredentials.createInsecure(), (error, port) => (error ? reject(error) : resolve(port)))
+        let body = ""
+        request.setEncoding("utf8")
+        request.on("data", chunk => {
+            body += chunk
+        })
+        request.once("end", () => resolve(body))
+        request.once("error", reject)
     })
 }
 
-function serviceError(code: grpc.status, message: string): grpc.ServiceError {
-    return Object.assign(new Error(message), { code, details: message, metadata: new grpc.Metadata() })
+function json(response: ServerResponse, status: number, body: unknown): void {
+    response.writeHead(status, { "content-type": "application/json" })
+    response.end(JSON.stringify(body))
+}
+
+function listen(server: Server): Promise<number> {
+    return new Promise((resolve, reject) => {
+        server.once("error", reject)
+        server.listen(0, "127.0.0.1", () => {
+            server.off("error", reject)
+            const address = server.address()
+            if (address === null || typeof address === "string") reject(new Error("test HTTP server has no TCP address"))
+            else resolve(address.port)
+        })
+    })
+}
+
+function close(server: Server): Promise<void> {
+    return new Promise((resolve, reject) => server.close(error => (error ? reject(error) : resolve())))
 }

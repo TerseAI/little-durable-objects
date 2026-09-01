@@ -4,7 +4,7 @@ use anyhow::{Context, Result, ensure};
 use aws_lc_rs::signature::{ED25519, VerificationAlgorithm};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::Deserialize;
-use tonic::{Request, Status, metadata::MetadataMap};
+use tonic::{Request, Status};
 
 use crate::actor::ActorScope;
 use crate::host::{ActorProcessRole, HostId};
@@ -167,11 +167,20 @@ impl ActorJwtVerifier {
         &self,
         request: &Request<T>,
     ) -> Result<ActorPrincipal, Status> {
-        let token = bearer_token(request.metadata())?;
-        let header =
-            token_header(token).map_err(|error| Status::unauthenticated(format!("{error:#}")))?;
-        self.verify_with_header(token, header)
+        let authorization = request
+            .metadata()
+            .get(AUTHORIZATION)
+            .ok_or_else(|| Status::unauthenticated("actor token is required"))?
+            .to_str()
+            .map_err(|_| Status::unauthenticated("actor token is not valid metadata"))?;
+        self.authenticate_authorization(authorization)
             .map_err(|error| Status::unauthenticated(format!("{error:#}")))
+    }
+
+    pub(crate) fn authenticate_authorization(&self, authorization: &str) -> Result<ActorPrincipal> {
+        let token = bearer_token(authorization)?;
+        let header = token_header(token).context("actor token header is invalid")?;
+        self.verify_with_header(token, header)
     }
 
     #[cfg(test)]
@@ -337,18 +346,14 @@ fn decode_json_segment<T: for<'de> Deserialize<'de>>(segment: &str, name: &str) 
     serde_json::from_slice(&bytes).with_context(|| format!("parse actor token {name}"))
 }
 
-fn bearer_token(metadata: &MetadataMap) -> Result<&str, Status> {
-    let value = metadata
-        .get(AUTHORIZATION)
-        .ok_or_else(|| Status::unauthenticated("actor token is required"))?
-        .to_str()
-        .map_err(|_| Status::unauthenticated("actor token is not valid metadata"))?;
-    let token = value
+fn bearer_token(authorization: &str) -> Result<&str> {
+    let token = authorization
         .strip_prefix("Bearer ")
-        .ok_or_else(|| Status::unauthenticated("actor token must use Bearer authentication"))?;
-    if token.is_empty() || token.trim() != token {
-        return Err(Status::unauthenticated("actor token is invalid"));
-    }
+        .context("actor token must use Bearer authentication")?;
+    ensure!(
+        !token.is_empty() && token.trim() == token,
+        "actor token is invalid"
+    );
     Ok(token)
 }
 

@@ -45,8 +45,7 @@ impl HostLaunchSpec {
 
 #[async_trait]
 pub(crate) trait AdminRegistry: Send + Sync {
-    async fn ensure_namespace(&self, namespace_id: &str) -> Result<bool>;
-    async fn register_launch_spec(&self, spec: &HostLaunchSpec) -> Result<bool>;
+    async fn register_deployment(&self, spec: &HostLaunchSpec) -> Result<bool>;
     async fn launch_spec(&self, namespace_id: &str) -> Result<Option<HostLaunchSpec>>;
 }
 
@@ -66,26 +65,13 @@ struct LocalAdminState {
 #[cfg(test)]
 #[async_trait]
 impl AdminRegistry for LocalAdminRegistry {
-    async fn ensure_namespace(&self, namespace_id: &str) -> Result<bool> {
-        validate_namespace(namespace_id)?;
-        Ok(self
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("admin registry lock poisoned"))?
-            .namespaces
-            .insert(namespace_id.to_owned()))
-    }
-
-    async fn register_launch_spec(&self, spec: &HostLaunchSpec) -> Result<bool> {
+    async fn register_deployment(&self, spec: &HostLaunchSpec) -> Result<bool> {
         spec.validate()?;
         let mut state = self
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("admin registry lock poisoned"))?;
-        ensure!(
-            state.namespaces.contains(&spec.namespace_id),
-            "namespace must be ensured before registering a launch spec"
-        );
+        state.namespaces.insert(spec.namespace_id.clone());
         let changed = state.launch_specs.get(&spec.namespace_id) != Some(spec);
         state
             .launch_specs
@@ -117,36 +103,31 @@ impl PostgresAdminRegistry {
 
 #[async_trait]
 impl AdminRegistry for PostgresAdminRegistry {
-    async fn ensure_namespace(&self, namespace_id: &str) -> Result<bool> {
-        validate_namespace(namespace_id)?;
+    async fn register_deployment(&self, spec: &HostLaunchSpec) -> Result<bool> {
+        spec.validate()?;
         Ok(self
             .database
             .client()
             .execute(
-                "INSERT INTO durable_object_namespaces (namespace_id) VALUES ($1) ON CONFLICT DO NOTHING",
-                &[&namespace_id],
-            )
-            .await
-            .context("ensure PostgreSQL durable-object namespace")?
-            == 1)
-    }
-
-    async fn register_launch_spec(&self, spec: &HostLaunchSpec) -> Result<bool> {
-        spec.validate()?;
-        if self.launch_spec(&spec.namespace_id).await?.as_ref() == Some(spec) {
-            return Ok(false);
-        }
-        self
-            .database
-            .client()
-            .execute(
-                "INSERT INTO durable_object_project_specs \
-                 (namespace_id, code_revision, image_ref, working_directory, actor_entrypoint) \
-                 VALUES ($1, $2, $3, $4, $5) \
+                "WITH ensured_namespace AS ( \
+                   INSERT INTO durable_object_namespaces (namespace_id) VALUES ($1) \
+                   ON CONFLICT (namespace_id) DO UPDATE SET namespace_id = EXCLUDED.namespace_id \
+                   RETURNING namespace_id \
+                 ) \
+                 INSERT INTO durable_object_project_specs \
+                   (namespace_id, code_revision, image_ref, working_directory, actor_entrypoint) \
+                 SELECT namespace_id, $2, $3, $4, $5 FROM ensured_namespace \
                  ON CONFLICT (namespace_id) DO UPDATE SET \
                    code_revision = EXCLUDED.code_revision, image_ref = EXCLUDED.image_ref, \
                    working_directory = EXCLUDED.working_directory, actor_entrypoint = EXCLUDED.actor_entrypoint, \
-                   updated_at = clock_timestamp()",
+                   updated_at = clock_timestamp() \
+                 WHERE (durable_object_project_specs.code_revision, \
+                        durable_object_project_specs.image_ref, \
+                        durable_object_project_specs.working_directory, \
+                        durable_object_project_specs.actor_entrypoint) \
+                       IS DISTINCT FROM \
+                       (EXCLUDED.code_revision, EXCLUDED.image_ref, \
+                        EXCLUDED.working_directory, EXCLUDED.actor_entrypoint)",
                 &[
                     &spec.namespace_id,
                     &spec.code_revision,
@@ -156,8 +137,8 @@ impl AdminRegistry for PostgresAdminRegistry {
                 ],
             )
             .await
-            .context("replace PostgreSQL project launch spec")?;
-        Ok(true)
+            .context("ensure PostgreSQL namespace and register project deployment")?
+            == 1)
     }
 
     async fn launch_spec(&self, namespace_id: &str) -> Result<Option<HostLaunchSpec>> {
@@ -221,14 +202,20 @@ mod tests {
     #[tokio::test]
     async fn registration_replaces_the_projects_active_revision() -> Result<()> {
         let registry = LocalAdminRegistry::default();
-        assert!(registry.ensure_namespace("project-1").await?);
-        assert!(!registry.ensure_namespace("project-1").await?);
-        assert!(registry.register_launch_spec(&spec("im-1")).await?);
-        assert!(!registry.register_launch_spec(&spec("im-1")).await?);
+        assert!(registry.register_deployment(&spec("im-1")).await?);
+        assert!(!registry.register_deployment(&spec("im-1")).await?);
         let mut replacement = spec("im-2");
         replacement.code_revision = "revision-2".into();
-        assert!(registry.register_launch_spec(&replacement).await?);
+        assert!(registry.register_deployment(&replacement).await?);
         assert_eq!(registry.launch_spec("project-1").await?, Some(replacement));
+        assert!(
+            registry
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("admin registry lock poisoned"))?
+                .namespaces
+                .contains("project-1")
+        );
         Ok(())
     }
 }

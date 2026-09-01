@@ -1,11 +1,11 @@
-mod execution_locks;
+mod actor;
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
 use anyhow::{Result, ensure};
 
-pub(crate) use self::execution_locks::{ActorExecutionAdmission, ActorExecutionLocks};
+pub(crate) use self::actor::{ActorExecutionAdmission, ActorExecutionLocks};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ActorStorageKey(String);

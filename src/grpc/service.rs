@@ -67,8 +67,8 @@ impl ActorHostService for ActorHostGrpcService {
             ));
         }
 
-        // The task is deliberately detached: a caller deadline stops waiting but
-        // never cancels an accepted actor method or releases its actor gate early.
+        // The task is deliberately detached so a disconnected caller never
+        // cancels an accepted actor method or releases its actor gate early.
         let host = self.host.clone();
         let request_id = invocation.request_id.clone();
         let task_request_id = request_id.clone();

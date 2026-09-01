@@ -34,11 +34,8 @@ class ActorRuntime {
             return failedReply("method_not_callable", `actor method ${this.definition.actorType}.${command.method} is not callable`)
         }
 
-        const context = {
-            deadline: performance.now() + command.timeout_ms
-        }
         try {
-            const rawResult: unknown = await runInActorInvocation(context, async () => Reflect.apply(method, instance, command.args) as Promise<unknown>)
+            const rawResult: unknown = await runInActorInvocation(async () => Reflect.apply(method, instance, command.args) as Promise<unknown>)
             const result: JsonValue = rawResult === undefined ? null : this.serializer.clone(rawResult, "actor result")
             return {
                 type: "invoked",

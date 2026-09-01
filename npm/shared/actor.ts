@@ -1,7 +1,7 @@
 import { actorClient } from "../workflow/client.js"
 
 import { ActorDefinitionError } from "./errors.js"
-import { MAX_ACTOR_INVOCATION_TIMEOUT_MS, validateActorComponent } from "./types.js"
+import { validateActorComponent } from "./types.js"
 
 const actorMetadata = new WeakMap<object, ActorMetadata>()
 const actorDefinitions = new Map<string, ActorDefinition>()
@@ -11,8 +11,8 @@ const referenceClasses = new WeakMap<Function, ActorReferenceClass>()
 abstract class Actor {
     protected constructor() {}
 
-    static get<TActorClass extends ActorClass>(this: ValidActorClass<TActorClass>, actorId: string, options: ActorReferenceOptions = {}): ActorReference<TActorClass["prototype"]> {
-        return getActorReference(this, validateActorComponent("actor ID", actorId), validateReferenceOptions(options))
+    static get<TActorClass extends ActorClass>(this: ValidActorClass<TActorClass>, actorId: string): ActorReference<TActorClass["prototype"]> {
+        return getActorReference(this, validateActorComponent("actor ID", actorId))
     }
 
     protected get id(): string {
@@ -42,10 +42,10 @@ function findActorDefinition(actorType: string): ActorDefinition | undefined {
     return actorDefinitions.get(actorType)
 }
 
-function getActorReference<TActorClass extends ActorClass>(actorClass: TActorClass, actorId: string, options: ActorReferenceOptions): ActorReference<TActorClass["prototype"]> {
+function getActorReference<TActorClass extends ActorClass>(actorClass: TActorClass, actorId: string): ActorReference<TActorClass["prototype"]> {
     const definition = registerActorClass(actorClass)
     const Reference = referenceClass(definition)
-    return new Reference(actorId, options) as unknown as ActorReference<TActorClass["prototype"]>
+    return new Reference(actorId) as unknown as ActorReference<TActorClass["prototype"]>
 }
 
 function referenceClass(definition: ActorDefinition): ActorReferenceClass {
@@ -53,9 +53,9 @@ function referenceClass(definition: ActorDefinition): ActorReferenceClass {
     if (existing !== undefined) return existing
 
     class ActorReference extends Actor {
-        constructor(actorId: string, options: ActorReferenceOptions) {
+        constructor(actorId: string) {
             super()
-            bindActorIdentity(this, actorId, options)
+            bindActorIdentity(this, actorId)
         }
     }
 
@@ -66,7 +66,7 @@ function referenceClass(definition: ActorDefinition): ActorReferenceClass {
             writable: false,
             value: function forwardActorMethod(this: Actor, ...args: unknown[]): Promise<unknown> {
                 const metadata = metadataFor(this)
-                return actorClient().invoke(definition.actorType, metadata.actorId, method, args, metadata.timeoutMs)
+                return actorClient().invoke(definition.actorType, metadata.actorId, method, args)
             }
         })
     })
@@ -74,8 +74,8 @@ function referenceClass(definition: ActorDefinition): ActorReferenceClass {
     return ActorReference
 }
 
-function bindActorIdentity(instance: Actor, actorId: string, options: ActorReferenceOptions = {}): void {
-    actorMetadata.set(instance, { actorId: validateActorComponent("actor ID", actorId), timeoutMs: options.timeoutMs })
+function bindActorIdentity(instance: Actor, actorId: string): void {
+    actorMetadata.set(instance, { actorId: validateActorComponent("actor ID", actorId) })
 }
 
 function metadataFor(instance: Actor): ActorMetadata {
@@ -108,14 +108,6 @@ function actorName(actorClass: ActorClass): string {
     return actorClass.name
 }
 
-function validateReferenceOptions(options: ActorReferenceOptions): ActorReferenceOptions {
-    if (options.timeoutMs === undefined) return options
-    if (!Number.isInteger(options.timeoutMs) || options.timeoutMs <= 0 || options.timeoutMs > MAX_ACTOR_INVOCATION_TIMEOUT_MS) {
-        throw new ActorDefinitionError(`actor invocation timeout must be an integer between 1 and ${MAX_ACTOR_INVOCATION_TIMEOUT_MS}ms`)
-    }
-    return options
-}
-
 interface ActorDefinition {
     readonly actorType: string
     readonly actorClass: ActorClass
@@ -124,17 +116,12 @@ interface ActorDefinition {
 
 interface ActorMetadata {
     readonly actorId: string
-    readonly timeoutMs?: number
-}
-
-interface ActorReferenceOptions {
-    readonly timeoutMs?: number
 }
 
 type ActorClass<Instance extends Actor = Actor> = Function & {
     readonly prototype: Instance
 }
-type ActorReferenceClass = new (actorId: string, options: ActorReferenceOptions) => Actor
+type ActorReferenceClass = new (actorId: string) => Actor
 type AsyncMethod = (...args: never[]) => Promise<unknown>
 type PubliclyConstructibleActorClass = abstract new (...args: never[]) => Actor
 type InvalidActorMethod<Instance extends Actor> = {
@@ -146,4 +133,4 @@ type ActorReference<Instance extends Actor> = {
 }
 
 export { Actor, bindActorIdentity, findActorDefinition, registerActorClass }
-export type { ActorClass, ActorDefinition, ActorReference, ActorReferenceOptions }
+export type { ActorClass, ActorDefinition, ActorReference }
