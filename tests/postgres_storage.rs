@@ -8,10 +8,6 @@ use durable_object_runtime::{
     placement::{ObjectPlacementStore, PlacementClaim, PostgresObjectPlacementStore},
 };
 
-fn postgres_url() -> Option<String> {
-    env::var("DURABLE_OBJECT_TEST_POSTGRES_URL").ok()
-}
-
 #[tokio::test]
 async fn postgres_placement_keeps_home_region_and_increments_owner_epoch() -> Result<()> {
     let Some(url) = postgres_url() else {
@@ -69,4 +65,8 @@ async fn postgres_host_lease_store_round_trips_and_fences_sessions() -> Result<(
     );
     leases.unregister(&host_id, &successor.session_id).await?;
     Ok(())
+}
+
+fn postgres_url() -> Option<String> {
+    env::var("DURABLE_OBJECT_TEST_POSTGRES_URL").ok()
 }

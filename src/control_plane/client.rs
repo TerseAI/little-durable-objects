@@ -68,7 +68,44 @@ impl ControlPlaneClient {
             reply => anyhow::bail!("unexpected state-write authorization reply: {reply:?}"),
         }
     }
+}
 
+#[async_trait]
+impl HostLeaseRegistry for ControlPlaneClient {
+    async fn register(&self, request: &HostLeaseRequest) -> Result<HostLease> {
+        match self
+            .execute(ControlPlaneCommand::RegisterLease {
+                request: request.clone(),
+            })
+            .await?
+        {
+            ControlPlaneCommandReply::Lease {
+                lease,
+                replacement_token,
+            } => {
+                if let Some(token) = replacement_token {
+                    self.replace_token(&token)?;
+                }
+                Ok(lease)
+            }
+            reply => anyhow::bail!("unexpected register-lease reply: {reply:?}"),
+        }
+    }
+
+    async fn unregister(&self, id: &HostId, _session_id: &str) -> Result<()> {
+        match self
+            .execute(ControlPlaneCommand::UnregisterLease {
+                host_id: id.clone(),
+            })
+            .await?
+        {
+            ControlPlaneCommandReply::Unit => Ok(()),
+            reply => anyhow::bail!("unexpected unregister-lease reply: {reply:?}"),
+        }
+    }
+}
+
+impl ControlPlaneClient {
     async fn execute(&self, command: ControlPlaneCommand) -> Result<ControlPlaneCommandReply> {
         let mut request = Request::new(encode_command(command)?);
         request.set_timeout(CONTROL_PLANE_REQUEST_TIMEOUT);
@@ -107,39 +144,4 @@ fn bearer_authorization(token: &str) -> Result<MetadataValue<tonic::metadata::As
     format!("Bearer {token}")
         .parse()
         .context("actor token is not valid gRPC metadata")
-}
-
-#[async_trait]
-impl HostLeaseRegistry for ControlPlaneClient {
-    async fn register(&self, request: &HostLeaseRequest) -> Result<HostLease> {
-        match self
-            .execute(ControlPlaneCommand::RegisterLease {
-                request: request.clone(),
-            })
-            .await?
-        {
-            ControlPlaneCommandReply::Lease {
-                lease,
-                replacement_token,
-            } => {
-                if let Some(token) = replacement_token {
-                    self.replace_token(&token)?;
-                }
-                Ok(lease)
-            }
-            reply => anyhow::bail!("unexpected register-lease reply: {reply:?}"),
-        }
-    }
-
-    async fn unregister(&self, id: &HostId, _session_id: &str) -> Result<()> {
-        match self
-            .execute(ControlPlaneCommand::UnregisterLease {
-                host_id: id.clone(),
-            })
-            .await?
-        {
-            ControlPlaneCommandReply::Unit => Ok(()),
-            reply => anyhow::bail!("unexpected unregister-lease reply: {reply:?}"),
-        }
-    }
 }

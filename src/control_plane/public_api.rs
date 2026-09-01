@@ -271,15 +271,6 @@ struct ApiError {
 }
 
 impl ApiError {
-    fn new(status: StatusCode, code: impl Into<String>, message: impl Into<String>) -> Self {
-        Self {
-            status,
-            code: code.into(),
-            message: message.into(),
-            request_id: None,
-        }
-    }
-
     fn bad_request(error: impl std::fmt::Display) -> Self {
         Self::new(
             StatusCode::BAD_REQUEST,
@@ -315,6 +306,15 @@ impl ApiError {
     fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
         self.request_id = Some(request_id.into());
         self
+    }
+
+    fn new(status: StatusCode, code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            code: code.into(),
+            message: message.into(),
+            request_id: None,
+        }
     }
 }
 

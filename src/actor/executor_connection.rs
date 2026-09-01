@@ -175,6 +175,13 @@ impl Drop for ActorExecutorConnection {
     }
 }
 
+struct JsActorExecutor {
+    actor_types: HashSet<String>,
+    next_message_id: AtomicU64,
+    pending: Mutex<HashMap<u64, oneshot::Sender<ExecutorReply>>>,
+    writer: AsyncMutex<OwnedWriteHalf>,
+}
+
 #[async_trait]
 impl ActorExecutor for JsActorExecutor {
     fn supports(&self, actor_type: &str) -> bool {
@@ -209,13 +216,6 @@ impl ActorExecutor for JsActorExecutor {
             }
         }
     }
-}
-
-struct JsActorExecutor {
-    actor_types: HashSet<String>,
-    next_message_id: AtomicU64,
-    pending: Mutex<HashMap<u64, oneshot::Sender<ExecutorReply>>>,
-    writer: AsyncMutex<OwnedWriteHalf>,
 }
 
 impl JsActorExecutor {
@@ -275,15 +275,15 @@ impl JsActorExecutor {
         Ok(())
     }
 
+    async fn close(&self) {
+        let _ = self.writer.lock().await.shutdown().await;
+        self.disconnect();
+    }
+
     fn disconnect(&self) {
         if let Ok(mut pending) = self.pending.lock() {
             pending.clear();
         }
-    }
-
-    async fn close(&self) {
-        let _ = self.writer.lock().await.shutdown().await;
-        self.disconnect();
     }
 }
 

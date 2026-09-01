@@ -99,15 +99,6 @@ class ModalSandboxProvider implements SandboxProvider {
         return handle
     }
 
-    private async validatePlacement(sandbox: Sandbox, expectedRegion: string): Promise<void> {
-        const observed = await runtimePlacement(sandbox)
-        const observedCanonical = canonicalRegionForModal(observed.cloud, observed.region, this.options.catalog)
-        if (observedCanonical !== expectedRegion) {
-            await sandbox.terminate()
-            throw new Error(`Modal placed host in ${observedCanonical ?? "an unknown region"}; expected ${expectedRegion}`)
-        }
-    }
-
     private async existing(app: App, name: string): Promise<Sandbox | undefined> {
         try {
             const sandbox = await this.modal.sandboxes.fromName(app.name ?? this.appName, name)
@@ -128,6 +119,15 @@ class ModalSandboxProvider implements SandboxProvider {
         const handle = JSON.parse(document) as ActorHostHandle
         if (handle.canonicalRegion !== canonicalRegion) throw new Error("existing Modal host has the wrong canonical region")
         return handle
+    }
+
+    private async validatePlacement(sandbox: Sandbox, expectedRegion: string): Promise<void> {
+        const observed = await runtimePlacement(sandbox)
+        const observedCanonical = canonicalRegionForModal(observed.cloud, observed.region, this.options.catalog)
+        if (observedCanonical !== expectedRegion) {
+            await sandbox.terminate()
+            throw new Error(`Modal placed host in ${observedCanonical ?? "an unknown region"}; expected ${expectedRegion}`)
+        }
     }
 
     private async start(sandbox: Sandbox, request: EnsureHostRequest): Promise<ActorHostHandle> {

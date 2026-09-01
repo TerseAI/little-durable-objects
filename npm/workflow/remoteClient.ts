@@ -40,18 +40,6 @@ class RemoteActorClient {
         this.settingsValue = options === undefined ? undefined : configuredSettings(options)
     }
 
-    private get settings(): RemoteActorSettings {
-        if (this.settingsValue !== undefined) return this.settingsValue
-        const result = remoteSettingsSchema.safeParse(this.environment)
-        if (!result.success) throw new ActorConfigurationError(`remote actor settings are invalid: ${result.error.message}`)
-        this.settingsValue = {
-            token: result.data.DURABLE_OBJECT_TOKEN,
-            namespaceId: result.data.DURABLE_OBJECT_NAMESPACE_ID,
-            controlPlaneUrl: validateOrigin(result.data.DURABLE_OBJECT_CONTROL_PLANE_URL)
-        }
-        return this.settingsValue
-    }
-
     async invoke(actorType: string, actorId: string, method: string, args: readonly unknown[]): Promise<unknown> {
         const requestId = validateActorComponent("request ID", this.requestId())
         if (currentActorInvocation() !== undefined) {
@@ -96,6 +84,18 @@ class RemoteActorClient {
             throw new ActorProtocolError(`control-plane HTTP ${response.status} response did not contain a valid error`)
         }
         throw new ActorInvocationError(failure.data.error.code, failure.data.error.requestId ?? requestId, failure.data.error.message)
+    }
+
+    private get settings(): RemoteActorSettings {
+        if (this.settingsValue !== undefined) return this.settingsValue
+        const result = remoteSettingsSchema.safeParse(this.environment)
+        if (!result.success) throw new ActorConfigurationError(`remote actor settings are invalid: ${result.error.message}`)
+        this.settingsValue = {
+            token: result.data.DURABLE_OBJECT_TOKEN,
+            namespaceId: result.data.DURABLE_OBJECT_NAMESPACE_ID,
+            controlPlaneUrl: validateOrigin(result.data.DURABLE_OBJECT_CONTROL_PLANE_URL)
+        }
+        return this.settingsValue
     }
 
     private jsonArguments(args: readonly unknown[]): readonly JsonValue[] {

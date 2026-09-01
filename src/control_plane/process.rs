@@ -51,7 +51,85 @@ impl ControlPlaneProcessConfig {
     pub fn from_env() -> Result<Self> {
         Self::from_lookup(|name| env::var(name).ok())
     }
+}
 
+pub async fn serve_control_plane(
+    config: ControlPlaneProcessConfig,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<()> {
+    let bind = config.bind;
+    let routes = control_plane_routes(config).await?;
+    info!(bind = %bind, "durable-object control plane is ready");
+    Server::builder()
+        .accept_http1(true)
+        .add_routes(routes)
+        .serve_with_shutdown(bind, shutdown)
+        .await
+        .context("serve durable-object control plane")
+}
+
+async fn control_plane_routes(config: ControlPlaneProcessConfig) -> Result<tonic::service::Routes> {
+    let issuer = super::ActorJwtIssuer::from_base64_pkcs8(
+        &config.jwt_signing_key,
+        config.jwt_key_id,
+        config.jwt_issuer.clone(),
+        config.authority_audience.clone(),
+        config.invocation_audience,
+        config.jwt_max_lifetime,
+    )?;
+    let auth = ActorJwtVerifier::for_scope(
+        issuer.verifier_keys_json()?,
+        config.jwt_issuer,
+        config.authority_audience,
+        super::ActorTokenPurpose::ControlPlane,
+        config.jwt_max_lifetime,
+    )?;
+    let database = PostgresDatabase::connect(&config.storage.postgres_url).await?;
+    let leases = Arc::new(PostgresHostLeaseStore::from_database(database.clone()));
+    let placements = Arc::new(PostgresObjectPlacementStore::from_database(
+        database.clone(),
+    ));
+    let registry = Arc::new(super::PostgresAdminRegistry::from_database(database));
+    let storage_urls = Arc::new(GcsStorageUrlSigner::from_adc(
+        config.storage.standard_buckets,
+    )?);
+    let provisioner = sandbox_provisioner(config.sandbox_provider, &issuer, &leases)?;
+    let service = ControlPlaneService::new(leases, placements, storage_urls, auth).with_routing(
+        registry.clone(),
+        issuer.clone(),
+        provisioner,
+    );
+    let admin = super::admin::AdminService::new(config.admin_token, registry, issuer)?;
+    let public_api = super::public_api::router(service.clone(), admin);
+    let internal_api = service.into_internal_service();
+    Ok(tonic::service::Routes::from(public_api).add_service(internal_api))
+}
+
+fn sandbox_provisioner(
+    config: Option<SandboxProviderConfig>,
+    issuer: &super::ActorJwtIssuer,
+    leases: &Arc<PostgresHostLeaseStore>,
+) -> Result<Option<Arc<dyn super::service::HostProvisioner>>> {
+    config
+        .map(
+            |config| -> Result<Arc<dyn super::service::HostProvisioner>> {
+                let provider = Arc::new(CommandSandboxProvider::new(
+                    config.provider_name,
+                    config.command,
+                    config.environment,
+                )?);
+                Ok(Arc::new(super::service::SandboxHostProvisioner::new(
+                    provider,
+                    config.runtime,
+                    issuer.clone(),
+                    leases.clone(),
+                )))
+            },
+        )
+        .transpose()
+}
+
+impl ControlPlaneProcessConfig {
     fn from_lookup(mut get: impl FnMut(&str) -> Option<String>) -> Result<Self> {
         let bind = get("DURABLE_OBJECT_CONTROL_PLANE_BIND")
             .unwrap_or_else(|| "127.0.0.1:7100".into())
@@ -104,70 +182,6 @@ impl ControlPlaneProcessConfig {
             sandbox_provider,
         })
     }
-}
-
-pub async fn serve_control_plane(
-    config: ControlPlaneProcessConfig,
-    shutdown: impl Future<Output = ()> + Send + 'static,
-) -> Result<()> {
-    let issuer = super::ActorJwtIssuer::from_base64_pkcs8(
-        &config.jwt_signing_key,
-        config.jwt_key_id,
-        config.jwt_issuer.clone(),
-        config.authority_audience.clone(),
-        config.invocation_audience,
-        config.jwt_max_lifetime,
-    )?;
-    let auth = ActorJwtVerifier::for_scope(
-        issuer.verifier_keys_json()?,
-        config.jwt_issuer,
-        config.authority_audience,
-        super::ActorTokenPurpose::ControlPlane,
-        config.jwt_max_lifetime,
-    )?;
-    let database = PostgresDatabase::connect(&config.storage.postgres_url).await?;
-    let leases = Arc::new(PostgresHostLeaseStore::from_database(database.clone()));
-    let placements = Arc::new(PostgresObjectPlacementStore::from_database(
-        database.clone(),
-    ));
-    let registry = Arc::new(super::PostgresAdminRegistry::from_database(database));
-    let storage_urls = Arc::new(GcsStorageUrlSigner::from_adc(
-        config.storage.standard_buckets,
-    )?);
-    let provisioner = config
-        .sandbox_provider
-        .map(
-            |config| -> Result<Arc<dyn super::service::HostProvisioner>> {
-                let provider = Arc::new(CommandSandboxProvider::new(
-                    config.provider_name,
-                    config.command,
-                    config.environment,
-                )?);
-                Ok(Arc::new(super::service::SandboxHostProvisioner::new(
-                    provider,
-                    config.runtime,
-                    issuer.clone(),
-                    leases.clone(),
-                )))
-            },
-        )
-        .transpose()?;
-    let service = ControlPlaneService::new(leases, placements, storage_urls, auth).with_routing(
-        registry.clone(),
-        issuer.clone(),
-        provisioner,
-    );
-    let admin = super::admin::AdminService::new(config.admin_token, registry, issuer)?;
-    let public_api = super::public_api::router(service.clone(), admin);
-    let internal_api = service.into_internal_service();
-    let routes = tonic::service::Routes::from(public_api).add_service(internal_api);
-    info!(bind = %config.bind, "durable-object control plane is ready");
-    Server::builder()
-        .accept_http1(true)
-        .add_routes(routes)
-        .serve_with_shutdown(config.bind, shutdown)
-        .await
-        .context("serve durable-object control plane")
 }
 
 fn sandbox_provider_config(
@@ -223,15 +237,15 @@ fn sandbox_provider_config(
     }))
 }
 
-fn required(get: &mut impl FnMut(&str) -> Option<String>, name: &str) -> Result<String> {
-    let value = get(name).with_context(|| format!("{name} is required"))?;
-    ensure!(!value.is_empty(), "{name} must not be empty");
-    Ok(value)
-}
-
 fn provider_credential(get: &mut impl FnMut(&str) -> Option<String>, name: &str) -> Result<String> {
     let value = required(get, name)?;
     ensure!(value.trim() == value, "{name} has surrounding whitespace");
+    Ok(value)
+}
+
+fn required(get: &mut impl FnMut(&str) -> Option<String>, name: &str) -> Result<String> {
+    let value = get(name).with_context(|| format!("{name} is required"))?;
+    ensure!(!value.is_empty(), "{name} must not be empty");
     Ok(value)
 }
 

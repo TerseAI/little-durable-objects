@@ -65,6 +65,121 @@ impl HostLeaseMaintainer {
         })
     }
 
+    pub(crate) async fn start(self: Arc<Self>) -> Result<LeaseRenewalTask> {
+        let initial = self.renew_once_with_deadline().await?;
+        info!(
+            host_id = %initial.lease.id,
+            route = %initial.lease.route,
+            expires_at_ms = initial.lease.expires_at_ms,
+            "host lease registered"
+        );
+        let shutdown = CancellationToken::new();
+        let task_shutdown = shutdown.clone();
+        let (lease_lost_tx, lease_lost) = watch::channel(false);
+        let manager = self.clone();
+        let task = tokio::spawn(manager.renew_until_stopped(
+            initial.local_deadline,
+            task_shutdown,
+            lease_lost_tx,
+        ));
+
+        Ok(LeaseRenewalTask {
+            shutdown,
+            task,
+            lease_lost,
+        })
+    }
+
+    pub(crate) async fn unregister(&self) -> Result<()> {
+        self.store
+            .unregister(&self.endpoint.id, &self.session_id)
+            .await?;
+        info!(host_id = %self.endpoint.id, "host lease unregistered");
+        Ok(())
+    }
+
+    async fn renew_until_stopped(
+        self: Arc<Self>,
+        mut local_deadline: Instant,
+        shutdown: CancellationToken,
+        lease_lost: watch::Sender<bool>,
+    ) {
+        loop {
+            if !self
+                .wait_until_renewal(local_deadline, &shutdown, &lease_lost)
+                .await
+            {
+                return;
+            }
+            let Some(deadline) = self
+                .renew_before_deadline(local_deadline, &shutdown, &lease_lost)
+                .await
+            else {
+                return;
+            };
+            local_deadline = deadline;
+        }
+    }
+
+    async fn wait_until_renewal(
+        &self,
+        local_deadline: Instant,
+        shutdown: &CancellationToken,
+        lease_lost: &watch::Sender<bool>,
+    ) -> bool {
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => false,
+            _ = tokio::time::sleep_until(local_deadline) => {
+                warn!(
+                    host_id = %self.endpoint.id,
+                    "locally confirmed host lease expired; permanently self-fencing this process"
+                );
+                let _ = lease_lost.send(true);
+                false
+            }
+            _ = tokio::time::sleep(self.renew_every) => true,
+        }
+    }
+
+    async fn renew_before_deadline(
+        &self,
+        local_deadline: Instant,
+        shutdown: &CancellationToken,
+        lease_lost: &watch::Sender<bool>,
+    ) -> Option<Instant> {
+        let renewal = self.renew_once_with_deadline();
+        tokio::pin!(renewal);
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => None,
+            _ = tokio::time::sleep_until(local_deadline) => {
+                warn!(
+                    host_id = %self.endpoint.id,
+                    "host lease expired while its renewal request was still pending; permanently self-fencing this process"
+                );
+                let _ = lease_lost.send(true);
+                None
+            }
+            result = &mut renewal => Some(match result {
+                Ok(confirmed) => confirmed.local_deadline,
+                Err(error) => {
+                    warn!(
+                        host_id = %self.endpoint.id,
+                        error = %format!("{error:#}"),
+                        "host lease renewal failed; ownership checks will self-fence after expiry"
+                    );
+                    let _ = self.consecutive_failures.fetch_update(
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                        |failures| Some(failures.saturating_add(1)),
+                    );
+                    local_deadline
+                }
+            }),
+        }
+    }
+
     async fn renew_once_with_deadline(&self) -> Result<ConfirmedHostLease> {
         // The store stamps the durable expiration with its own clock. The locally
         // confirmed window is anchored to this host's clock, sampled before the
@@ -83,7 +198,6 @@ impl HostLeaseMaintainer {
 
         let lease = self.store.register(&request).await?;
         self.consecutive_failures.store(0, Ordering::Relaxed);
-
         debug!(
             host_id = %lease.id,
             route = %lease.route,
@@ -107,86 +221,6 @@ impl HostLeaseMaintainer {
         Ok(ConfirmedHostLease {
             lease,
             local_deadline,
-        })
-    }
-
-    pub(crate) async fn unregister(&self) -> Result<()> {
-        self.store
-            .unregister(&self.endpoint.id, &self.session_id)
-            .await?;
-        info!(host_id = %self.endpoint.id, "host lease unregistered");
-        Ok(())
-    }
-
-    pub(crate) async fn start(self: Arc<Self>) -> Result<LeaseRenewalTask> {
-        let initial = self.renew_once_with_deadline().await?;
-        info!(
-            host_id = %initial.lease.id,
-            route = %initial.lease.route,
-            expires_at_ms = initial.lease.expires_at_ms,
-            "host lease registered"
-        );
-        let shutdown = CancellationToken::new();
-        let task_shutdown = shutdown.clone();
-        let (lease_lost_tx, lease_lost) = watch::channel(false);
-        let manager = self.clone();
-        let task = tokio::spawn(async move {
-            let mut local_deadline = initial.local_deadline;
-            loop {
-                let renewal_due = tokio::time::sleep(manager.renew_every);
-                tokio::pin!(renewal_due);
-                tokio::select! {
-                    biased;
-                    _ = task_shutdown.cancelled() => break,
-                    _ = tokio::time::sleep_until(local_deadline) => {
-                        warn!(
-                            host_id = %manager.endpoint.id,
-                            "locally confirmed host lease expired; permanently self-fencing this process"
-                        );
-                        let _ = lease_lost_tx.send(true);
-                        break;
-                    }
-                    _ = &mut renewal_due => {}
-                }
-
-                let renewal = manager.renew_once_with_deadline();
-                tokio::pin!(renewal);
-                tokio::select! {
-                    biased;
-                    _ = task_shutdown.cancelled() => break,
-                    _ = tokio::time::sleep_until(local_deadline) => {
-                        warn!(
-                            host_id = %manager.endpoint.id,
-                            "host lease expired while its renewal request was still pending; permanently self-fencing this process"
-                        );
-                        let _ = lease_lost_tx.send(true);
-                        break;
-                    }
-                    result = &mut renewal => {
-                        match result {
-                            Ok(confirmed) => local_deadline = confirmed.local_deadline,
-                            Err(error) => {
-                                warn!(
-                                    host_id = %manager.endpoint.id,
-                                    error = %format!("{error:#}"),
-                                    "host lease renewal failed; ownership checks will self-fence after expiry"
-                                );
-                                let _ = manager.consecutive_failures.fetch_update(
-                                    Ordering::Relaxed,
-                                    Ordering::Relaxed,
-                                    |failures| Some(failures.saturating_add(1)),
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        Ok(LeaseRenewalTask {
-            shutdown,
-            task,
-            lease_lost,
         })
     }
 }
@@ -334,17 +368,6 @@ mod tests {
         }
     }
 
-    async fn wait_for_calls(store: &FlakyLeaseStore, expected: usize) -> Result<()> {
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while store.calls.load(Ordering::SeqCst) < expected {
-                store.changed.notified().await;
-            }
-        })
-        .await?;
-
-        Ok(())
-    }
-
     #[test]
     fn new_hosts_receive_unique_session_ids() {
         let first = HostEndpoint {
@@ -444,6 +467,17 @@ mod tests {
         assert!(*lease_lost.borrow());
         assert_eq!(store.calls.load(Ordering::SeqCst), 2);
         renewal.shutdown().await?;
+        Ok(())
+    }
+
+    async fn wait_for_calls(store: &FlakyLeaseStore, expected: usize) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while store.calls.load(Ordering::SeqCst) < expected {
+                store.changed.notified().await;
+            }
+        })
+        .await?;
+
         Ok(())
     }
 }

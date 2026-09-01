@@ -80,7 +80,27 @@ impl CommandSandboxProvider {
             environment,
         })
     }
+}
 
+#[async_trait]
+impl SandboxProvider for CommandSandboxProvider {
+    async fn ensure_host(&self, request: &EnsureHostRequest) -> Result<ActorHostHandle> {
+        let response: ActorHostHandle = self.execute("ensure_host", request).await?;
+        ensure!(
+            response.canonical_region == request.canonical_region,
+            "{} sandbox command returned a host in the wrong canonical region",
+            self.provider_name
+        );
+        ensure!(
+            !response.host_id.as_str().is_empty() && !response.route.is_empty(),
+            "{} sandbox command returned an invalid host",
+            self.provider_name
+        );
+        Ok(response)
+    }
+}
+
+impl CommandSandboxProvider {
     async fn execute<Request: Serialize, Reply: for<'de> Deserialize<'de>>(
         &self,
         operation: &str,
@@ -133,24 +153,6 @@ impl CommandSandboxProvider {
 struct ProviderCommand<'a, Request> {
     operation: &'a str,
     request: &'a Request,
-}
-
-#[async_trait]
-impl SandboxProvider for CommandSandboxProvider {
-    async fn ensure_host(&self, request: &EnsureHostRequest) -> Result<ActorHostHandle> {
-        let response: ActorHostHandle = self.execute("ensure_host", request).await?;
-        ensure!(
-            response.canonical_region == request.canonical_region,
-            "{} sandbox command returned a host in the wrong canonical region",
-            self.provider_name
-        );
-        ensure!(
-            !response.host_id.as_str().is_empty() && !response.route.is_empty(),
-            "{} sandbox command returned an invalid host",
-            self.provider_name
-        );
-        Ok(response)
-    }
 }
 
 #[cfg(test)]

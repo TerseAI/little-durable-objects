@@ -84,15 +84,6 @@ impl ControlPlaneService {
         self
     }
 
-    #[cfg(test)]
-    fn with_host_invoker(mut self, invoker: Arc<dyn HostInvoker>) -> Self {
-        self.routing
-            .as_mut()
-            .expect("routing must be configured before its host invoker")
-            .invoker = invoker;
-        self
-    }
-
     pub fn into_internal_service(self) -> ActorControlPlaneServiceServer<Self> {
         ActorControlPlaneServiceServer::new(self)
             .max_decoding_message_size(MAX_CONTROL_PLANE_MESSAGE_BYTES)
@@ -103,6 +94,57 @@ impl ControlPlaneService {
         self.auth.authenticate_authorization(authorization)
     }
 
+    pub(super) async fn invoke_workflow(
+        &self,
+        principal: ActorPrincipal,
+        invocation: ActorInvocation,
+    ) -> ActorExecutionResult {
+        if let Err(failure) = validate_workflow_invocation(&principal, &invocation) {
+            return failure;
+        }
+        for _ in 0..MAX_ROUTE_ATTEMPTS {
+            match self.invoke_once(&invocation).await {
+                Ok(ActorExecutionResult::Reroute) => continue,
+                Ok(result) => return result,
+                Err(failure) => return failure,
+            }
+        }
+        failed(
+            "unavailable",
+            "actor ownership changed repeatedly before execution",
+        )
+    }
+}
+
+#[tonic::async_trait]
+impl ActorControlPlaneService for ControlPlaneService {
+    async fn execute(
+        &self,
+        request: Request<ControlPlaneRequest>,
+    ) -> std::result::Result<Response<ControlPlaneReply>, Status> {
+        let principal = self.auth.authenticate(&request).await?;
+        let command = decode_command(request.into_inner())
+            .map_err(|error| Status::invalid_argument(format!("invalid command: {error:#}")))?;
+        let reply = self
+            .execute_command(&principal, command)
+            .await
+            .map_err(failed_precondition)?;
+        Ok(Response::new(encode_reply(reply).map_err(internal)?))
+    }
+}
+
+#[cfg(test)]
+impl ControlPlaneService {
+    fn with_host_invoker(mut self, invoker: Arc<dyn HostInvoker>) -> Self {
+        self.routing
+            .as_mut()
+            .expect("routing must be configured before its host invoker")
+            .invoker = invoker;
+        self
+    }
+}
+
+impl ControlPlaneService {
     async fn execute_command(
         &self,
         principal: &ActorPrincipal,
@@ -137,6 +179,33 @@ impl ControlPlaneService {
         }
     }
 
+    async fn invoke_once(
+        &self,
+        invocation: &ActorInvocation,
+    ) -> std::result::Result<ActorExecutionResult, ActorExecutionResult> {
+        let target = self.route_actor(&invocation.actor).await.map_err(|error| {
+            failed(
+                "unavailable",
+                format!("actor host is unavailable: {error:#}"),
+            )
+        })?;
+        let routing = self
+            .routing
+            .as_ref()
+            .expect("route_actor requires routing dependencies");
+        let reply = routing
+            .invoker
+            .invoke(invocation.clone(), &invocation.actor, &target)
+            .await
+            .map_err(host_call_failure)?;
+        ActorExecutionResult::try_from(reply).map_err(|error| {
+            failed(
+                "outcome_unknown",
+                format!("actor host returned an invalid reply: {error:#}"),
+            )
+        })
+    }
+
     async fn register_lease(
         &self,
         principal: &ActorPrincipal,
@@ -153,31 +222,6 @@ impl ControlPlaneService {
             lease,
             replacement_token: self.replacement_host_token(principal)?,
         })
-    }
-
-    fn replacement_host_token(&self, principal: &ActorPrincipal) -> Result<Option<String>> {
-        if principal.expires_at.saturating_sub(unix_seconds()?) > HOST_TOKEN_RENEWAL_WINDOW_SECONDS
-        {
-            return Ok(None);
-        }
-        let issuer = self
-            .host_token_issuer
-            .as_ref()
-            .context("JWT issuer is not configured")?;
-        Ok(Some(
-            issuer
-                .issue_host(
-                    &principal.scope.namespace_id,
-                    &principal.host_id,
-                    &principal.session_id,
-                    principal
-                        .code_revision
-                        .as_deref()
-                        .context("host token has no code revision")?,
-                    &principal.region,
-                )?
-                .token,
-        ))
     }
 
     async fn unregister_lease(
@@ -214,72 +258,6 @@ impl ControlPlaneService {
                 .storage_urls
                 .write_url(&placement.home_region, &actor, &expected_generation)
                 .await?,
-        })
-    }
-
-    async fn current_placement(&self, actor: &ActorKey) -> Result<ObjectPlacement> {
-        self.placements
-            .get(&actor.storage_key())
-            .await?
-            .context("actor has no current placement")
-    }
-
-    async fn require_active_host(&self, principal: &ActorPrincipal) -> Result<HostLease> {
-        let status = self.leases.lease_status(&principal.host_id).await?;
-        ensure!(status.is_active(), "host lease is not active");
-        let lease = status.lease.context("active host lease is missing")?;
-        ensure!(
-            lease.session_id == principal.session_id,
-            "host lease belongs to another session"
-        );
-        Ok(lease)
-    }
-
-    pub(super) async fn invoke_workflow(
-        &self,
-        principal: ActorPrincipal,
-        invocation: ActorInvocation,
-    ) -> ActorExecutionResult {
-        if let Err(failure) = validate_workflow_invocation(&principal, &invocation) {
-            return failure;
-        }
-        for _ in 0..MAX_ROUTE_ATTEMPTS {
-            match self.invoke_once(&invocation).await {
-                Ok(ActorExecutionResult::Reroute) => continue,
-                Ok(result) => return result,
-                Err(failure) => return failure,
-            }
-        }
-        failed(
-            "unavailable",
-            "actor ownership changed repeatedly before execution",
-        )
-    }
-
-    async fn invoke_once(
-        &self,
-        invocation: &ActorInvocation,
-    ) -> std::result::Result<ActorExecutionResult, ActorExecutionResult> {
-        let target = self.route_actor(&invocation.actor).await.map_err(|error| {
-            failed(
-                "unavailable",
-                format!("actor host is unavailable: {error:#}"),
-            )
-        })?;
-        let routing = self
-            .routing
-            .as_ref()
-            .expect("route_actor requires routing dependencies");
-        let reply = routing
-            .invoker
-            .invoke(invocation.clone(), &invocation.actor, &target)
-            .await
-            .map_err(host_call_failure)?;
-        ActorExecutionResult::try_from(reply).map_err(|error| {
-            failed(
-                "outcome_unknown",
-                format!("actor host returned an invalid reply: {error:#}"),
-            )
         })
     }
 
@@ -323,6 +301,49 @@ impl ControlPlaneService {
         }
     }
 
+    fn replacement_host_token(&self, principal: &ActorPrincipal) -> Result<Option<String>> {
+        if principal.expires_at.saturating_sub(unix_seconds()?) > HOST_TOKEN_RENEWAL_WINDOW_SECONDS
+        {
+            return Ok(None);
+        }
+        let issuer = self
+            .host_token_issuer
+            .as_ref()
+            .context("JWT issuer is not configured")?;
+        Ok(Some(
+            issuer
+                .issue_host(
+                    &principal.scope.namespace_id,
+                    &principal.host_id,
+                    &principal.session_id,
+                    principal
+                        .code_revision
+                        .as_deref()
+                        .context("host token has no code revision")?,
+                    &principal.region,
+                )?
+                .token,
+        ))
+    }
+
+    async fn require_active_host(&self, principal: &ActorPrincipal) -> Result<HostLease> {
+        let status = self.leases.lease_status(&principal.host_id).await?;
+        ensure!(status.is_active(), "host lease is not active");
+        let lease = status.lease.context("active host lease is missing")?;
+        ensure!(
+            lease.session_id == principal.session_id,
+            "host lease belongs to another session"
+        );
+        Ok(lease)
+    }
+
+    async fn current_placement(&self, actor: &ActorKey) -> Result<ObjectPlacement> {
+        self.placements
+            .get(&actor.storage_key())
+            .await?
+            .context("actor has no current placement")
+    }
+
     async fn active_target(
         &self,
         current: &Option<ObjectPlacement>,
@@ -353,23 +374,6 @@ impl ControlPlaneService {
     }
 }
 
-#[tonic::async_trait]
-impl ActorControlPlaneService for ControlPlaneService {
-    async fn execute(
-        &self,
-        request: Request<ControlPlaneRequest>,
-    ) -> std::result::Result<Response<ControlPlaneReply>, Status> {
-        let principal = self.auth.authenticate(&request).await?;
-        let command = decode_command(request.into_inner())
-            .map_err(|error| Status::invalid_argument(format!("invalid command: {error:#}")))?;
-        let reply = self
-            .execute_command(&principal, command)
-            .await
-            .map_err(failed_precondition)?;
-        Ok(Response::new(encode_reply(reply).map_err(internal)?))
-    }
-}
-
 #[async_trait]
 pub(crate) trait HostProvisioner: Send + Sync {
     async fn ensure_host(&self, spec: &HostLaunchSpec, region: &str) -> Result<HostLease>;
@@ -396,7 +400,20 @@ impl SandboxHostProvisioner {
             leases,
         }
     }
+}
 
+#[async_trait]
+impl HostProvisioner for SandboxHostProvisioner {
+    async fn ensure_host(&self, spec: &HostLaunchSpec, region: &str) -> Result<HostLease> {
+        let handle = self
+            .provider
+            .ensure_host(&self.request(spec, region)?)
+            .await?;
+        self.active_lease(handle, region).await
+    }
+}
+
+impl SandboxHostProvisioner {
     fn request(&self, spec: &HostLaunchSpec, region: &str) -> Result<EnsureHostRequest> {
         let host_id = HostId::new(format!(
             "host.v1.{}.{}.{}",
@@ -456,17 +473,6 @@ impl SandboxHostProvisioner {
 }
 
 #[async_trait]
-impl HostProvisioner for SandboxHostProvisioner {
-    async fn ensure_host(&self, spec: &HostLaunchSpec, region: &str) -> Result<HostLease> {
-        let handle = self
-            .provider
-            .ensure_host(&self.request(spec, region)?)
-            .await?;
-        self.active_lease(handle, region).await
-    }
-}
-
-#[async_trait]
 trait HostInvoker: Send + Sync {
     async fn invoke(
         &self,
@@ -488,7 +494,35 @@ impl GrpcHostInvoker {
             issuer,
         }
     }
+}
 
+#[async_trait]
+impl HostInvoker for GrpcHostInvoker {
+    async fn invoke(
+        &self,
+        invocation: ActorInvocation,
+        actor: &ActorKey,
+        target: &RoutedActor,
+    ) -> std::result::Result<InvokeActorReply, HostCallError> {
+        let request = Self::request(
+            invocation,
+            target,
+            self.read_url(actor, target).await?,
+            self.token(actor, target)?,
+        )?;
+        ActorHostServiceClient::new(self.connect(target).await?)
+            .invoke(request)
+            .await
+            .map(|reply| reply.into_inner())
+            .map_err(|error| {
+                HostCallError::OutcomeUnknown(format!(
+                    "actor host RPC failed after dispatch: {error}"
+                ))
+            })
+    }
+}
+
+impl GrpcHostInvoker {
     async fn read_url(
         &self,
         actor: &ActorKey,
@@ -556,32 +590,6 @@ impl GrpcHostInvoker {
                 })?,
         );
         Ok(request)
-    }
-}
-
-#[async_trait]
-impl HostInvoker for GrpcHostInvoker {
-    async fn invoke(
-        &self,
-        invocation: ActorInvocation,
-        actor: &ActorKey,
-        target: &RoutedActor,
-    ) -> std::result::Result<InvokeActorReply, HostCallError> {
-        let request = Self::request(
-            invocation,
-            target,
-            self.read_url(actor, target).await?,
-            self.token(actor, target)?,
-        )?;
-        ActorHostServiceClient::new(self.connect(target).await?)
-            .invoke(request)
-            .await
-            .map(|reply| reply.into_inner())
-            .map_err(|error| {
-                HostCallError::OutcomeUnknown(format!(
-                    "actor host RPC failed after dispatch: {error}"
-                ))
-            })
     }
 }
 

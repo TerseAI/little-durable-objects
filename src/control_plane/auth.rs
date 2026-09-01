@@ -112,6 +112,26 @@ impl ActorJwtVerifier {
         Self::from_decoded_public_keys(public_keys, issuer, audience, purpose, max_lifetime)
     }
 
+    pub(crate) async fn authenticate<T>(
+        &self,
+        request: &Request<T>,
+    ) -> Result<ActorPrincipal, Status> {
+        let authorization = request
+            .metadata()
+            .get(AUTHORIZATION)
+            .ok_or_else(|| Status::unauthenticated("actor token is required"))?
+            .to_str()
+            .map_err(|_| Status::unauthenticated("actor token is not valid metadata"))?;
+        self.authenticate_authorization(authorization)
+            .map_err(|error| Status::unauthenticated(format!("{error:#}")))
+    }
+
+    pub(crate) fn authenticate_authorization(&self, authorization: &str) -> Result<ActorPrincipal> {
+        let token = bearer_token(authorization)?;
+        let header = decode_header(token).context("actor token header is invalid")?;
+        self.verify_with_header(token, header)
+    }
+
     fn from_decoded_public_keys(
         public_keys: HashMap<String, DecodingKey>,
         issuer: impl Into<String>,
@@ -143,26 +163,6 @@ impl ActorJwtVerifier {
             purpose,
             max_lifetime,
         })
-    }
-
-    pub(crate) async fn authenticate<T>(
-        &self,
-        request: &Request<T>,
-    ) -> Result<ActorPrincipal, Status> {
-        let authorization = request
-            .metadata()
-            .get(AUTHORIZATION)
-            .ok_or_else(|| Status::unauthenticated("actor token is required"))?
-            .to_str()
-            .map_err(|_| Status::unauthenticated("actor token is not valid metadata"))?;
-        self.authenticate_authorization(authorization)
-            .map_err(|error| Status::unauthenticated(format!("{error:#}")))
-    }
-
-    pub(crate) fn authenticate_authorization(&self, authorization: &str) -> Result<ActorPrincipal> {
-        let token = bearer_token(authorization)?;
-        let header = decode_header(token).context("actor token header is invalid")?;
-        self.verify_with_header(token, header)
     }
 
     #[cfg(test)]
@@ -320,63 +320,6 @@ mod tests {
 
     use super::*;
 
-    fn verifier_and_key_pair() -> Result<(ActorJwtVerifier, Ed25519KeyPair)> {
-        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())?;
-        let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref())?;
-        let keys = public_key_set(&key_pair)?;
-        Ok((
-            ActorJwtVerifier::new(
-                keys,
-                "durable-object-control-plane",
-                "durable-object-authority",
-                Duration::from_secs(60),
-            )?,
-            key_pair,
-        ))
-    }
-
-    fn token(
-        key_pair: &Ed25519KeyPair,
-        header: serde_json::Value,
-        claims: serde_json::Value,
-    ) -> Result<String> {
-        let header = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header)?);
-        let claims = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims)?);
-        let input = format!("{header}.{claims}");
-        let signature = URL_SAFE_NO_PAD.encode(key_pair.sign(input.as_bytes()).as_ref());
-        Ok(format!("{input}.{signature}"))
-    }
-
-    fn public_key_set(key_pair: &Ed25519KeyPair) -> Result<String> {
-        Ok(serde_json::to_string(&json!({
-            "keys": [{
-                "alg": "EdDSA",
-                "crv": "Ed25519",
-                "kid": "test-key",
-                "kty": "OKP",
-                "use": "sig",
-                "x": URL_SAFE_NO_PAD.encode(key_pair.public_key().as_ref())
-            }]
-        }))?)
-    }
-
-    fn valid_claims(now: i64) -> serde_json::Value {
-        json!({
-            "iss": "durable-object-control-plane",
-            "aud": "durable-object-authority",
-            "sub": "host.v1.namespace-1.00000000-0000-4000-8000-000000000001",
-            "namespaceId": "namespace-1",
-            "processId": "host.v1.namespace-1.00000000-0000-4000-8000-000000000001",
-            "sessionId": "00000000-0000-4000-8000-000000000002",
-            "processRole": "host",
-            "storageRegion": "default",
-            "scope": "actor:authority",
-            "iat": now,
-            "nbf": now,
-            "exp": now + 60
-        })
-    }
-
     #[test]
     fn verifies_a_signed_actor_token() -> Result<()> {
         let (verifier, key_pair) = verifier_and_key_pair()?;
@@ -508,5 +451,62 @@ mod tests {
         )?;
         assert!(verifier.verify(&too_long).is_err());
         Ok(())
+    }
+
+    fn verifier_and_key_pair() -> Result<(ActorJwtVerifier, Ed25519KeyPair)> {
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())?;
+        let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref())?;
+        let keys = public_key_set(&key_pair)?;
+        Ok((
+            ActorJwtVerifier::new(
+                keys,
+                "durable-object-control-plane",
+                "durable-object-authority",
+                Duration::from_secs(60),
+            )?,
+            key_pair,
+        ))
+    }
+
+    fn token(
+        key_pair: &Ed25519KeyPair,
+        header: serde_json::Value,
+        claims: serde_json::Value,
+    ) -> Result<String> {
+        let header = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header)?);
+        let claims = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims)?);
+        let input = format!("{header}.{claims}");
+        let signature = URL_SAFE_NO_PAD.encode(key_pair.sign(input.as_bytes()).as_ref());
+        Ok(format!("{input}.{signature}"))
+    }
+
+    fn public_key_set(key_pair: &Ed25519KeyPair) -> Result<String> {
+        Ok(serde_json::to_string(&json!({
+            "keys": [{
+                "alg": "EdDSA",
+                "crv": "Ed25519",
+                "kid": "test-key",
+                "kty": "OKP",
+                "use": "sig",
+                "x": URL_SAFE_NO_PAD.encode(key_pair.public_key().as_ref())
+            }]
+        }))?)
+    }
+
+    fn valid_claims(now: i64) -> serde_json::Value {
+        json!({
+            "iss": "durable-object-control-plane",
+            "aud": "durable-object-authority",
+            "sub": "host.v1.namespace-1.00000000-0000-4000-8000-000000000001",
+            "namespaceId": "namespace-1",
+            "processId": "host.v1.namespace-1.00000000-0000-4000-8000-000000000001",
+            "sessionId": "00000000-0000-4000-8000-000000000002",
+            "processRole": "host",
+            "storageRegion": "default",
+            "scope": "actor:authority",
+            "iat": now,
+            "nbf": now,
+            "exp": now + 60
+        })
     }
 }

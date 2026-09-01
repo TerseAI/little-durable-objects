@@ -140,6 +140,18 @@ impl ActorHost {
             .await
     }
 
+    pub(crate) async fn drain(&self, timeout: Duration) -> Result<()> {
+        self.accepting.store(false, Ordering::SeqCst);
+        tokio::time::timeout(timeout, async {
+            while self.active.load(Ordering::SeqCst) != 0 {
+                self.idle.notified().await;
+            }
+        })
+        .await
+        .context("actor invocations did not drain before shutdown")?;
+        Ok(())
+    }
+
     fn validate_invocation(
         &self,
         invocation: &ActorInvocation,
@@ -185,22 +197,6 @@ impl ActorHost {
             Ok(OwnershipRead::Owned(loaded))
         } else {
             Ok(OwnershipRead::Reroute)
-        }
-    }
-
-    async fn publish_claim(
-        &self,
-        invocation: &ActorInvocation,
-        owner_epoch: u64,
-        loaded: &LoadedState,
-    ) -> Result<bool> {
-        let write_url = self
-            .authorize_write(invocation, owner_epoch, &loaded.generation)
-            .await
-            .context("authorize actor ownership claim")?;
-        match self.state.write(&write_url, loaded.log.encode()?).await? {
-            StateWrite::Written => Ok(true),
-            StateWrite::GenerationMismatch => Ok(false),
         }
     }
 
@@ -265,6 +261,22 @@ impl ActorHost {
         Ok(ActorExecutionResult::Completed { result })
     }
 
+    async fn publish_claim(
+        &self,
+        invocation: &ActorInvocation,
+        owner_epoch: u64,
+        loaded: &LoadedState,
+    ) -> Result<bool> {
+        let write_url = self
+            .authorize_write(invocation, owner_epoch, &loaded.generation)
+            .await
+            .context("authorize actor ownership claim")?;
+        match self.state.write(&write_url, loaded.log.encode()?).await? {
+            StateWrite::Written => Ok(true),
+            StateWrite::GenerationMismatch => Ok(false),
+        }
+    }
+
     async fn publish_state(
         &self,
         invocation: &ActorInvocation,
@@ -296,18 +308,6 @@ impl ActorHost {
                 generation,
             )
             .await
-    }
-
-    pub(crate) async fn drain(&self, timeout: Duration) -> Result<()> {
-        self.accepting.store(false, Ordering::SeqCst);
-        tokio::time::timeout(timeout, async {
-            while self.active.load(Ordering::SeqCst) != 0 {
-                self.idle.notified().await;
-            }
-        })
-        .await
-        .context("actor invocations did not drain before shutdown")?;
-        Ok(())
     }
 
     async fn evict(&self, actor: &crate::actor::ActorKey) {

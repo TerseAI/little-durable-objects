@@ -33,11 +33,6 @@ const recommendedRegionCatalog = {
     }
 } as const satisfies CanonicalRegionCatalog
 
-function validateCanonicalRegion(value: string): string {
-    if (!canonicalRegionPattern.test(value)) throw new Error(`invalid canonical region ${JSON.stringify(value)}`)
-    return value
-}
-
 function modalPlacement(region: string, catalog: CanonicalRegionCatalog = recommendedRegionCatalog): ModalPlacement {
     const placement = catalog[validateCanonicalRegion(region)]?.modal
     if (!placement) throw new Error(`canonical region ${JSON.stringify(region)} has no Modal placement`)
@@ -49,6 +44,11 @@ function canonicalRegionForModal(cloud: string | undefined, region: string | und
     const normalizedRegion = region.toLowerCase()
     const candidates = [cloud ? `${cloud.toLowerCase()}:${normalizedRegion}` : undefined, normalizedRegion].filter((candidate): candidate is string => candidate !== undefined)
     return Object.entries(catalog).find(([, definition]) => definition.modal.observedPlacements.some(pattern => candidates.some(candidate => matchesPlacement(pattern, candidate))))?.[0]
+}
+
+function validateCanonicalRegion(value: string): string {
+    if (!canonicalRegionPattern.test(value)) throw new Error(`invalid canonical region ${JSON.stringify(value)}`)
+    return value
 }
 
 function matchesPlacement(pattern: string, candidate: string): boolean {

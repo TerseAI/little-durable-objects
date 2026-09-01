@@ -42,11 +42,7 @@ const actorSessionServerMessageSchema = z.discriminatedUnion("type", [
 
 class JsonActorStateSerializer {
     clone(value: unknown, label: string): JsonValue {
-        const encoded = this.encode(value, label)
-        const decoded: unknown = JSON.parse(encoded)
-        const result = jsonValueSchema.safeParse(decoded)
-        if (!result.success) throw new ActorSerializationError(`${label} must be JSON serializable`)
-        return result.data
+        return this.cloneValue(value, label)
     }
 
     snapshot(instance: object): JsonObject {
@@ -70,9 +66,17 @@ class JsonActorStateSerializer {
     }
 
     private cloneObject(value: unknown, label: string): JsonObject {
-        const cloned = this.clone(value, label)
+        const cloned = this.cloneValue(value, label)
         if (!isJsonObject(cloned)) throw new ActorSerializationError(`${label} must be a JSON object`)
         return cloned
+    }
+
+    private cloneValue(value: unknown, label: string): JsonValue {
+        const encoded = this.encode(value, label)
+        const decoded: unknown = JSON.parse(encoded)
+        const result = jsonValueSchema.safeParse(decoded)
+        if (!result.success) throw new ActorSerializationError(`${label} must be JSON serializable`)
+        return result.data
     }
 
     private encode(value: unknown, label: string): string {

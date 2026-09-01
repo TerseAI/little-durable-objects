@@ -36,20 +36,6 @@ impl LocalHostLeaseStore {
         self
     }
 
-    fn path_for(&self, id: &HostId) -> PathBuf {
-        self.root.join(format!("{id}.json"))
-    }
-
-    async fn load(&self, id: &HostId) -> Result<Option<HostLease>> {
-        let body = match tokio::fs::read(self.path_for(id)).await {
-            Ok(body) => body,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-
-        Ok(Some(serde_json::from_slice(&body)?))
-    }
-
     #[cfg(test)]
     pub(crate) async fn get(&self, id: &HostId) -> Result<Option<HostLease>> {
         let _mutation = self.mutations.lock().await;
@@ -116,6 +102,22 @@ impl HostLeaseStore for LocalHostLeaseStore {
     }
 }
 
+impl LocalHostLeaseStore {
+    fn path_for(&self, id: &HostId) -> PathBuf {
+        self.root.join(format!("{id}.json"))
+    }
+
+    async fn load(&self, id: &HostId) -> Result<Option<HostLease>> {
+        let body = match tokio::fs::read(self.path_for(id)).await {
+            Ok(body) => body,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+
+        Ok(Some(serde_json::from_slice(&body)?))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,15 +140,6 @@ mod tests {
     impl Clock for ManualClock {
         fn now_ms(&self) -> Result<u64> {
             Ok(self.0.load(Ordering::SeqCst))
-        }
-    }
-
-    fn request(id: &str) -> HostLeaseRequest {
-        HostLeaseRequest {
-            id: HostId::new(id),
-            session_id: format!("session-{id}"),
-            route: "127.0.0.1:7000".into(),
-            duration_ms: 30_000,
         }
     }
 
@@ -355,5 +348,14 @@ mod tests {
         );
         assert!(store.get(&oversized.id).await?.is_none());
         Ok(())
+    }
+
+    fn request(id: &str) -> HostLeaseRequest {
+        HostLeaseRequest {
+            id: HostId::new(id),
+            session_id: format!("session-{id}"),
+            route: "127.0.0.1:7000".into(),
+            duration_ms: 30_000,
+        }
     }
 }

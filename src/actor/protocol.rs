@@ -50,21 +50,6 @@ impl ActorKey {
     }
 }
 
-fn validate_component(name: &str, value: &str, max_bytes: usize) -> Result<()> {
-    ensure!(!value.is_empty(), "{name} must not be empty");
-    ensure!(
-        value.len() <= max_bytes,
-        "{name} must be at most {max_bytes} bytes"
-    );
-    ensure!(
-        value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')),
-        "{name} may contain only ASCII letters, digits, '.', '-', and '_'"
-    );
-    Ok(())
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct ActorInvocation {
     /// Correlation ID for this caller attempt. It is not an idempotency key.
@@ -108,6 +93,21 @@ pub enum ActorExecutionResult {
     Failed { failure: ActorInvocationFailure },
     Reroute,
     HostUnavailable,
+}
+
+fn validate_component(name: &str, value: &str, max_bytes: usize) -> Result<()> {
+    ensure!(!value.is_empty(), "{name} must not be empty");
+    ensure!(
+        value.len() <= max_bytes,
+        "{name} must be at most {max_bytes} bytes"
+    );
+    ensure!(
+        value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')),
+        "{name} may contain only ASCII letters, digits, '.', '-', and '_'"
+    );
+    Ok(())
 }
 
 #[cfg(test)]

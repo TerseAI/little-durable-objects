@@ -21,6 +21,10 @@ function configureDurableObjects(options: DurableObjectsClientOptions): void {
     defaultClients.configure(options)
 }
 
+function runWithActorClientForTests<T>(options: ActorTestClientOptions, operation: () => T): T {
+    return scopedClients.run(new TestActorClient(options), operation)
+}
+
 class DefaultActorClientProvider {
     private client: ActorClientTransport = new RemoteActorClient()
 
@@ -58,10 +62,6 @@ class TestActorClient implements ActorClientTransport {
         }
         return this.invokeTest(request)
     }
-}
-
-function runWithActorClientForTests<T>(options: ActorTestClientOptions, operation: () => T): T {
-    return scopedClients.run(new TestActorClient(options), operation)
 }
 
 interface ActorInvocationRequest {

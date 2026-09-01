@@ -39,14 +39,6 @@ impl GcsStorageUrlSigner {
         validate_buckets(&buckets)?;
         Ok(Self { buckets, signer })
     }
-
-    fn bucket(&self, region: &str) -> Result<String> {
-        validate_region(region)?;
-        self.buckets
-            .get(region)
-            .map(|bucket| format!("projects/_/buckets/{bucket}"))
-            .with_context(|| format!("sandbox region {region:?} has no Standard bucket"))
-    }
 }
 
 #[async_trait]
@@ -83,6 +75,16 @@ impl StorageUrlSigner for GcsStorageUrlSigner {
         let mut regions = self.buckets.keys().cloned().collect::<Vec<_>>();
         regions.sort();
         regions
+    }
+}
+
+impl GcsStorageUrlSigner {
+    fn bucket(&self, region: &str) -> Result<String> {
+        validate_region(region)?;
+        self.buckets
+            .get(region)
+            .map(|bucket| format!("projects/_/buckets/{bucket}"))
+            .with_context(|| format!("sandbox region {region:?} has no Standard bucket"))
     }
 }
 

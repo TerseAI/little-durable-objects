@@ -88,14 +88,14 @@ impl ActorJwtIssuer {
         })
     }
 
+    pub(crate) fn verifier_keys_json(&self) -> Result<String> {
+        Ok(String::from_utf8(self.jwks_json()?)?)
+    }
+
     pub(crate) fn jwks_json(&self) -> Result<Vec<u8>> {
         Ok(serde_json::to_vec(&JwkSet {
             keys: vec![self.public_key.clone()],
         })?)
-    }
-
-    pub(crate) fn verifier_keys_json(&self) -> Result<String> {
-        Ok(String::from_utf8(self.jwks_json()?)?)
     }
 
     pub(crate) fn issue_workflow(

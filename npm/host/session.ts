@@ -30,6 +30,11 @@ class ActorSession {
         return this.startup
     }
 
+    waitUntilDisconnected(): Promise<void> {
+        if (this.connection === undefined) throw new ActorSessionError("actor session has not started")
+        return this.connection.closed()
+    }
+
     private async initialize(): Promise<void> {
         const actorEntrypointUrl = await resolveActorEntrypoint(this.settings.actorEntrypoint)
         const actorTypes = await loadActorEntrypoint(actorEntrypointUrl)
@@ -40,11 +45,37 @@ class ActorSession {
         const commandHandler = (command: ActorExecutorCommand): Promise<ActorExecutorReply> => supervisor.handle(command)
         this.connection = await ActorSessionConnection.open(this.settings.socketPath, actorTypes, commandHandler, this.settings.startupTimeoutMs)
     }
+}
 
-    waitUntilDisconnected(): Promise<void> {
-        if (this.connection === undefined) throw new ActorSessionError("actor session has not started")
-        return this.connection.closed()
+class ActorSessionSettings {
+    private constructor(
+        readonly socketPath: string,
+        readonly actorEntrypoint: string | undefined,
+        readonly startupTimeoutMs: number,
+        readonly actorIdleTimeoutMs: number
+    ) {}
+
+    static fromEnvironment(environment: NodeJS.ProcessEnv): ActorSessionSettings {
+        const result = actorSessionSettingsSchema.safeParse(environment)
+        if (!result.success) throw new ActorConfigurationError(`actor-host session settings are invalid: ${result.error.message}`)
+        return new ActorSessionSettings(
+            result.data.DURABLE_OBJECT_EXECUTOR_SOCKET,
+            result.data.DURABLE_OBJECT_ENTRYPOINT,
+            parseStartupTimeout(environment.DURABLE_OBJECT_HOST_STARTUP_MS),
+            parseActorIdleTimeout(environment.DURABLE_OBJECT_ACTOR_IDLE_TIMEOUT_MS)
+        )
     }
+}
+
+async function runActorHost(): Promise<never> {
+    const session = new ActorSession()
+    await session.start()
+
+    const readyFile = process.env.DURABLE_OBJECT_HOST_READY_FILE
+    if (readyFile) await writeFile(readyFile, `${Date.now()}\n`, { mode: 0o600 })
+
+    await session.waitUntilDisconnected()
+    throw new ActorSessionError("Rust host disconnected from actor session")
 }
 
 class ActorSessionConnection {
@@ -54,6 +85,19 @@ class ActorSessionConnection {
     private readonly attachedPromise: Promise<void>
     private closedResolve: (() => void) | undefined
     private readonly closedPromise: Promise<void>
+
+    static async open(socketPath: string, actorTypes: readonly string[], commandHandler: ActorCommandHandler, timeoutMs: number): Promise<ActorSessionConnection> {
+        if (actorTypes.length === 0) throw new ActorSessionError("the actor entrypoint does not export any actor classes")
+        const socket = await connectSocket(socketPath)
+        const connection = new ActorSessionConnection(socket, commandHandler)
+        connection.send({ type: "attach", protocol: 11, actor_types: actorTypes })
+        await connection.waitUntilAttached(timeoutMs)
+        return connection
+    }
+
+    closed(): Promise<void> {
+        return this.closedPromise
+    }
 
     private constructor(
         private readonly socket: Socket,
@@ -67,19 +111,6 @@ class ActorSessionConnection {
             this.closedResolve = resolve
         })
         this.bindSocket()
-    }
-
-    static async open(socketPath: string, actorTypes: readonly string[], commandHandler: ActorCommandHandler, timeoutMs: number): Promise<ActorSessionConnection> {
-        if (actorTypes.length === 0) throw new ActorSessionError("the actor entrypoint does not export any actor classes")
-        const socket = await connectSocket(socketPath)
-        const connection = new ActorSessionConnection(socket, commandHandler)
-        connection.send({ type: "attach", protocol: 11, actor_types: actorTypes })
-        await connection.waitUntilAttached(timeoutMs)
-        return connection
-    }
-
-    closed(): Promise<void> {
-        return this.closedPromise
     }
 
     private waitUntilAttached(timeoutMs: number): Promise<void> {
@@ -206,37 +237,6 @@ function parseActorIdleTimeout(value: string | undefined): number {
         throw new ActorConfigurationError(`DURABLE_OBJECT_ACTOR_IDLE_TIMEOUT_MS must be an integer between 1 and ${MAX_IDLE_TIMEOUT_MS}`)
     }
     return parsed
-}
-
-class ActorSessionSettings {
-    private constructor(
-        readonly socketPath: string,
-        readonly actorEntrypoint: string | undefined,
-        readonly startupTimeoutMs: number,
-        readonly actorIdleTimeoutMs: number
-    ) {}
-
-    static fromEnvironment(environment: NodeJS.ProcessEnv): ActorSessionSettings {
-        const result = actorSessionSettingsSchema.safeParse(environment)
-        if (!result.success) throw new ActorConfigurationError(`actor-host session settings are invalid: ${result.error.message}`)
-        return new ActorSessionSettings(
-            result.data.DURABLE_OBJECT_EXECUTOR_SOCKET,
-            result.data.DURABLE_OBJECT_ENTRYPOINT,
-            parseStartupTimeout(environment.DURABLE_OBJECT_HOST_STARTUP_MS),
-            parseActorIdleTimeout(environment.DURABLE_OBJECT_ACTOR_IDLE_TIMEOUT_MS)
-        )
-    }
-}
-
-async function runActorHost(): Promise<never> {
-    const session = new ActorSession()
-    await session.start()
-
-    const readyFile = process.env.DURABLE_OBJECT_HOST_READY_FILE
-    if (readyFile) await writeFile(readyFile, `${Date.now()}\n`, { mode: 0o600 })
-
-    await session.waitUntilDisconnected()
-    throw new ActorSessionError("Rust host disconnected from actor session")
 }
 
 type ActorCommandHandler = (command: ActorExecutorCommand) => Promise<ActorExecutorReply>

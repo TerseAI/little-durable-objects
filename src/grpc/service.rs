@@ -44,6 +44,16 @@ impl ActorHostService for ActorHostGrpcService {
         &self,
         request: Request<HostInvokeActorRequest>,
     ) -> Result<Response<InvokeActorReply>, Status> {
+        let invocation = self.authorize_invocation(request).await?;
+        self.invoke_detached(invocation).await
+    }
+}
+
+impl ActorHostGrpcService {
+    async fn authorize_invocation(
+        &self,
+        request: Request<HostInvokeActorRequest>,
+    ) -> Result<AuthorizedHostInvocation, Status> {
         let principal = self.invocation_auth.authenticate(&request).await?;
         if principal.process_role != ActorProcessRole::Host || principal.host_id != self.host_id {
             return Err(Status::permission_denied(
@@ -66,16 +76,30 @@ impl ActorHostService for ActorHostGrpcService {
                 "actor ownership capability is incomplete",
             ));
         }
+        Ok(AuthorizedHostInvocation {
+            invocation,
+            owner_epoch: request.owner_epoch,
+            state_read_url: request.state_read_url,
+        })
+    }
 
+    async fn invoke_detached(
+        &self,
+        request: AuthorizedHostInvocation,
+    ) -> Result<Response<InvokeActorReply>, Status> {
         // The task is deliberately detached so a disconnected caller never
         // cancels an accepted actor method or releases its actor gate early.
         let host = self.host.clone();
-        let request_id = invocation.request_id.clone();
+        let request_id = request.invocation.request_id.clone();
         let task_request_id = request_id.clone();
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let result = match host
-                .invoke_actor(invocation, request.owner_epoch, request.state_read_url)
+                .invoke_actor(
+                    request.invocation,
+                    request.owner_epoch,
+                    request.state_read_url,
+                )
                 .await
             {
                 Ok(result) => result,
@@ -101,4 +125,10 @@ impl ActorHostService for ActorHostGrpcService {
             }
         }
     }
+}
+
+struct AuthorizedHostInvocation {
+    invocation: ActorInvocation,
+    owner_epoch: u64,
+    state_read_url: String,
 }

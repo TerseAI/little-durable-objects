@@ -48,6 +48,10 @@ function getActorReference<TActorClass extends ActorClass>(actorClass: TActorCla
     return new Reference(actorId) as unknown as ActorReference<TActorClass["prototype"]>
 }
 
+function bindActorIdentity(instance: Actor, actorId: string): void {
+    actorMetadata.set(instance, { actorId: validateActorComponent("actor ID", actorId) })
+}
+
 function referenceClass(definition: ActorDefinition): ActorReferenceClass {
     const existing = referenceClasses.get(definition.actorClass)
     if (existing !== undefined) return existing
@@ -72,10 +76,6 @@ function referenceClass(definition: ActorDefinition): ActorReferenceClass {
     })
     referenceClasses.set(definition.actorClass, ActorReference)
     return ActorReference
-}
-
-function bindActorIdentity(instance: Actor, actorId: string): void {
-    actorMetadata.set(instance, { actorId: validateActorComponent("actor ID", actorId) })
 }
 
 function metadataFor(instance: Actor): ActorMetadata {

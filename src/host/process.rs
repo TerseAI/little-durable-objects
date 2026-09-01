@@ -47,7 +47,61 @@ impl ActorHostConfig {
     pub fn from_env() -> Result<Self> {
         Self::from_lookup(|name| env::var(name).ok())
     }
+}
 
+pub async fn serve_actor_host<F>(config: ActorHostConfig, shutdown: F) -> Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let PreparedActorHost {
+        invocation_auth,
+        listener,
+        route,
+        executor_connection,
+        mut javascript,
+        host,
+        lease,
+        renewal,
+    } = prepare_actor_host(&config).await?;
+    let mut lease_lost = renewal.lease_lost();
+    let mut activity = host.activity();
+
+    let service = ActorHostGrpcService::new(host.clone(), invocation_auth).into_service();
+    executor_connection.mark_ready().await?;
+    let stop = CancellationToken::new();
+    let server_stop = stop.clone();
+    let mut server = Box::pin(
+        Server::builder()
+            .add_service(service)
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                server_stop.cancelled().await
+            }),
+    );
+    let mut executor_task = Box::pin(executor_connection.run(stop.clone()));
+    tokio::pin!(shutdown);
+
+    info!(host_id = %config.host_id, namespace_id = %config.namespace_id, route, "durable-object host is ready");
+    let stop_result = wait_for_host_stop(
+        server.as_mut(),
+        executor_task.as_mut(),
+        &mut javascript,
+        shutdown.as_mut(),
+        &mut lease_lost,
+        &mut activity,
+        config.host_idle_timeout,
+    )
+    .await;
+    stop_host_tasks(&host, &stop, server, executor_task).await;
+    drop(javascript);
+    let renewal_result = renewal.shutdown().await;
+    let unregister_result = lease.unregister().await;
+    info!(host_id = %config.host_id, "durable-object host stopped");
+    stop_result?;
+    renewal_result?;
+    unregister_result
+}
+
+impl ActorHostConfig {
     fn from_lookup(mut get: impl FnMut(&str) -> Option<String>) -> Result<Self> {
         let control_plane_url = required(&mut get, "DURABLE_OBJECT_CONTROL_PLANE_URL")?;
         let host_token = required(&mut get, "DURABLE_OBJECT_HOST_TOKEN")?;
@@ -128,58 +182,6 @@ impl ActorHostConfig {
             host_idle_timeout,
         })
     }
-}
-
-pub async fn serve_actor_host<F>(config: ActorHostConfig, shutdown: F) -> Result<()>
-where
-    F: Future<Output = ()> + Send + 'static,
-{
-    let PreparedActorHost {
-        invocation_auth,
-        listener,
-        route,
-        executor_connection,
-        mut javascript,
-        host,
-        lease,
-        renewal,
-    } = prepare_actor_host(&config).await?;
-    let mut lease_lost = renewal.lease_lost();
-    let mut activity = host.activity();
-
-    let service = ActorHostGrpcService::new(host.clone(), invocation_auth).into_service();
-    executor_connection.mark_ready().await?;
-    let stop = CancellationToken::new();
-    let server_stop = stop.clone();
-    let mut server = Box::pin(
-        Server::builder()
-            .add_service(service)
-            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
-                server_stop.cancelled().await
-            }),
-    );
-    let mut executor_task = Box::pin(executor_connection.run(stop.clone()));
-    tokio::pin!(shutdown);
-
-    info!(host_id = %config.host_id, namespace_id = %config.namespace_id, route, "durable-object host is ready");
-    let stop_result = wait_for_host_stop(
-        server.as_mut(),
-        executor_task.as_mut(),
-        &mut javascript,
-        shutdown.as_mut(),
-        &mut lease_lost,
-        &mut activity,
-        config.host_idle_timeout,
-    )
-    .await;
-    stop_host_tasks(&host, &stop, server, executor_task).await;
-    drop(javascript);
-    let renewal_result = renewal.shutdown().await;
-    let unregister_result = lease.unregister().await;
-    info!(host_id = %config.host_id, "durable-object host stopped");
-    stop_result?;
-    renewal_result?;
-    unregister_result
 }
 
 struct PreparedActorHost {
@@ -369,6 +371,18 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    #[test]
+    fn host_needs_no_local_state_directory() -> Result<()> {
+        let values = values();
+        let config = ActorHostConfig::from_lookup(|name| values.get(name).cloned())?;
+        assert_eq!(
+            config.executor_socket,
+            PathBuf::from("/tmp/durable-object-executor.sock")
+        );
+        assert_eq!(config.host_idle_timeout, Duration::from_secs(300));
+        Ok(())
+    }
+
     fn values() -> HashMap<String, String> {
         HashMap::from([
             (
@@ -387,17 +401,5 @@ mod tests {
                 "00000000-0000-4000-8000-000000000001".into(),
             ),
         ])
-    }
-
-    #[test]
-    fn host_needs_no_local_state_directory() -> Result<()> {
-        let values = values();
-        let config = ActorHostConfig::from_lookup(|name| values.get(name).cloned())?;
-        assert_eq!(
-            config.executor_socket,
-            PathBuf::from("/tmp/durable-object-executor.sock")
-        );
-        assert_eq!(config.host_idle_timeout, Duration::from_secs(300));
-        Ok(())
     }
 }

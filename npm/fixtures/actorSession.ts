@@ -8,17 +8,17 @@ class SessionCounter extends Actor {
         return this.count
     }
 
+    async announceThenSpin(): Promise<never> {
+        await SessionCounter.get("worker-start-observer").increment(0)
+        return this.spinForever()
+    }
+
     async spinForever(): Promise<never> {
         // Deliberately uncooperative code used to verify hard Worker termination.
         while (true) {
             // Keep the loop opaque to optimizers without yielding the Worker event loop.
             void performance.now()
         }
-    }
-
-    async announceThenSpin(): Promise<never> {
-        await SessionCounter.get("worker-start-observer").increment(0)
-        return this.spinForever()
     }
 }
 
