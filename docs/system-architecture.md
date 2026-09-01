@@ -30,3 +30,13 @@ trusted backend
 ```
 
 The trusted backend alone holds the admin token. One PostgreSQL statement ensures a namespace and registers its active deployment. Workflows receive a namespace-scoped JWT and invoke actors only through the public HTTP API. The control plane owns routing, placement, leases, host activation, and signed state capabilities through injected service boundaries. Internal gRPC uses host-scoped JWTs. Rust actor hosts serialize execution and persistence; customer actor code runs in isolated Node workers without admin, provider, database, or cloud-storage credentials. Cancellation tokens stop host tasks as one tree.
+
+Release images use native builders for each supported architecture:
+
+```text
+GitHub release
+    |
+    +----> Blacksmith amd64 build ----+
+    |                                 |
+    +----> Blacksmith arm64 build ----+----> GHCR manifest + provenance attestation
+```

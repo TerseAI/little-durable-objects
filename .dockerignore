@@ -1,0 +1,12 @@
+**
+!Cargo.toml
+!Cargo.lock
+!build.rs
+!.cargo
+!.cargo/**
+!migrations
+!migrations/**
+!proto
+!proto/**
+!src
+!src/**

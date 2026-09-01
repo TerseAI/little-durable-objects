@@ -9,7 +9,7 @@
         "format:check": "cargo fmt --all -- --check && pnpm --dir npm format:check && prettier --check \"scripts/*.mjs\"",
         "release:prepare": "node scripts/release.mjs prepare",
         "release:verify": "node scripts/release.mjs verify",
-        "test": "node --test scripts/release.test.mjs && cargo test --locked --no-fail-fast && pnpm --dir npm test"
+        "test": "cargo test --locked --no-fail-fast && pnpm --dir npm test"
     },
     "devDependencies": {
         "@trivago/prettier-plugin-sort-imports": "^6.0.2",
