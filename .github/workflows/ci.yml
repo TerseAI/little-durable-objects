@@ -50,5 +50,9 @@ jobs:
                   node-version: "22.19.0"
                   cache: pnpm
             - run: pnpm install --frozen-lockfile
+            - run: node --test scripts/release.test.mjs
             - run: pnpm --dir npm format:check
             - run: pnpm --dir npm test
+            - name: Verify npm package
+              working-directory: npm
+              run: npm pack --dry-run

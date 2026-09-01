@@ -1,6 +1,22 @@
-# Durable objects
+# lil-durable-objects
 
 A small, provider-neutral durable-object runtime. Modal is the first sandbox provider; actor state is stored as NDJSON in regional GCS buckets and coordination lives in Postgres.
+
+## Install
+
+Install the TypeScript API in actor and workflow projects:
+
+```sh
+pnpm add lil-durable-objects
+```
+
+Install the Rust runtime from crates.io:
+
+```sh
+cargo install durable-object-runtime --locked
+```
+
+Container builds can copy the binary from `ghcr.io/terseai/lil-durable-objects:latest`. The image is a runtime base, not a complete actor sandbox: actor images also need Node.js, the project code, and `lil-durable-objects` in the project's dependencies.
 
 ## Quickstart
 
@@ -36,7 +52,7 @@ A small, provider-neutral durable-object runtime. Modal is the first sandbox pro
 4. Export actors from `src/durable-objects.ts` in your project:
 
    ```ts
-   import { Actor } from "@terse/durable-objects"
+   import { Actor } from "lil-durable-objects"
 
    export class Counter extends Actor {
      count = 0
@@ -60,7 +76,7 @@ A small, provider-neutral durable-object runtime. Modal is the first sandbox pro
 6. Give the issued project token to the workflow and call the actor. The package sends an authenticated JSON `POST` to the control plane:
 
    ```ts
-   import { configureDurableObjects } from "@terse/durable-objects"
+   import { configureDurableObjects } from "lil-durable-objects"
    import { Counter } from "./durable-objects.js"
 
    configureDurableObjects({
@@ -75,3 +91,9 @@ A small, provider-neutral durable-object runtime. Modal is the first sandbox pro
 Actors leave memory after 60 seconds idle; empty host sandboxes stop after 5 minutes. Override those defaults with `DURABLE_OBJECT_ACTOR_IDLE_TIMEOUT_MS` and `DURABLE_OBJECT_HOST_IDLE_TIMEOUT_MS` on the control plane.
 
 See the [architecture diagram](docs/system-architecture.md) for the request, credential, placement, and state flow.
+
+Release maintainers should follow the [release guide](docs/releasing.md).
+
+## License
+
+MIT © 2026 Terse

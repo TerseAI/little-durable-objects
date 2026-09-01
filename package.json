@@ -1,13 +1,15 @@
 {
-    "name": "durable-objects",
-    "version": "0.1.0",
+    "name": "lil-durable-objects",
     "private": true,
+    "license": "MIT",
     "scripts": {
         "build": "cargo build --release && pnpm --dir npm build",
         "dev": "cargo run --release",
-        "format": "cargo fmt --all && pnpm --dir npm format",
-        "format:check": "cargo fmt --all -- --check && pnpm --dir npm format:check",
-        "test": "cargo test --locked --no-fail-fast && pnpm --dir npm test"
+        "format": "cargo fmt --all && pnpm --dir npm format && prettier --write \"scripts/*.mjs\"",
+        "format:check": "cargo fmt --all -- --check && pnpm --dir npm format:check && prettier --check \"scripts/*.mjs\"",
+        "release:prepare": "node scripts/release.mjs prepare",
+        "release:verify": "node scripts/release.mjs verify",
+        "test": "node --test scripts/release.test.mjs && cargo test --locked --no-fail-fast && pnpm --dir npm test"
     },
     "devDependencies": {
         "@trivago/prettier-plugin-sort-imports": "^6.0.2",

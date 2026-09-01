@@ -42,7 +42,8 @@ function modalPlacement(region: string, catalog: CanonicalRegionCatalog = recomm
 function canonicalRegionForModal(cloud: string | undefined, region: string | undefined, catalog: CanonicalRegionCatalog = recommendedRegionCatalog): string | undefined {
     if (!region) return undefined
     const normalizedRegion = region.toLowerCase()
-    const candidates = [cloud ? `${cloud.toLowerCase()}:${normalizedRegion}` : undefined, normalizedRegion].filter((candidate): candidate is string => candidate !== undefined)
+    const normalizedCloud = cloud?.toLowerCase().replace(/^cloud_provider_/u, "")
+    const candidates = [normalizedCloud ? `${normalizedCloud}:${normalizedRegion}` : undefined, normalizedRegion].filter((candidate): candidate is string => candidate !== undefined)
     return Object.entries(catalog).find(([, definition]) => definition.modal.observedPlacements.some(pattern => candidates.some(candidate => matchesPlacement(pattern, candidate))))?.[0]
 }
 

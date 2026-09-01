@@ -1,13 +1,29 @@
 {
-    "name": "@terse/durable-objects",
-    "version": "0.4.7",
+    "name": "lil-durable-objects",
+    "version": "0.1.0",
     "description": "Provider-neutral durable objects for sandbox compute",
     "type": "module",
-    "license": "SEE LICENSE IN LICENSE.md",
+    "license": "MIT",
+    "sideEffects": false,
+    "engines": {
+        "node": ">=20"
+    },
+    "packageManager": "pnpm@10.17.1",
+    "keywords": [
+        "actors",
+        "distributed-systems",
+        "durable-objects",
+        "modal",
+        "serverless"
+    ],
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/TerseAI/durable-objects.git",
+        "url": "git+https://github.com/TerseAI/lil-durable-objects.git",
         "directory": "npm"
+    },
+    "homepage": "https://github.com/TerseAI/lil-durable-objects#readme",
+    "bugs": {
+        "url": "https://github.com/TerseAI/lil-durable-objects/issues"
     },
     "publishConfig": {
         "access": "public"
@@ -15,14 +31,29 @@
     "main": "dist/index.js",
     "types": "dist/index.d.ts",
     "bin": {
-        "terse-durable-objects-modal": "./dist/providers/modalCli.js"
+        "lil-durable-objects-modal": "./dist/providers/modalCli.js"
     },
     "exports": {
-        ".": "./dist/index.js",
-        "./host": "./dist/host.js",
-        "./modal": "./dist/providers/modal.js",
-        "./providers": "./dist/providers/types.js",
-        "./regions": "./dist/regions.js"
+        ".": {
+            "types": "./dist/index.d.ts",
+            "import": "./dist/index.js"
+        },
+        "./host": {
+            "types": "./dist/host.d.ts",
+            "import": "./dist/host.js"
+        },
+        "./modal": {
+            "types": "./dist/providers/modal.d.ts",
+            "import": "./dist/providers/modal.js"
+        },
+        "./providers": {
+            "types": "./dist/providers/types.d.ts",
+            "import": "./dist/providers/types.js"
+        },
+        "./regions": {
+            "types": "./dist/regions.d.ts",
+            "import": "./dist/regions.js"
+        }
     },
     "files": [
         "dist",
@@ -31,10 +62,13 @@
     ],
     "scripts": {
         "build": "tsc -p tsconfig.build.json",
+        "check": "pnpm run format:check && pnpm run test && pnpm run package:check",
         "clean": "rm -rf dist .test-dist",
+        "package:check": "node scripts/check-package.mjs",
+        "prepack": "pnpm run clean && pnpm run build && pnpm run package:check",
         "test": "pnpm run clean && pnpm run build && tsc -p tsconfig.test.json && node --test --test-concurrency=1 .test-dist/*.test.js .test-dist/shared/*.test.js .test-dist/workflow/*.test.js .test-dist/host/*.test.js .test-dist/host/worker/*.test.js .test-dist/providers/*.test.js",
-        "format": "prettier --config ../.prettierrc --write \"*.ts\" \"{fixtures,host,providers,shared,workflow}/**/*.ts\"",
-        "format:check": "prettier --config ../.prettierrc --check \"*.ts\" \"{fixtures,host,providers,shared,workflow}/**/*.ts\""
+        "format": "prettier --config ../.prettierrc --write \"*.ts\" \"{fixtures,host,providers,shared,workflow}/**/*.ts\" \"scripts/*.mjs\"",
+        "format:check": "prettier --config ../.prettierrc --check \"*.ts\" \"{fixtures,host,providers,shared,workflow}/**/*.ts\" \"scripts/*.mjs\""
     },
     "dependencies": {
         "modal": "^0.7.2",

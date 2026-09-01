@@ -10,6 +10,7 @@ test("canonical regions map Modal placement", () => {
         observedPlacements: ["gcp:us-east*"]
     })
     assert.equal(canonicalRegionForModal("gcp", "us-east-1"), "north-america-east")
+    assert.equal(canonicalRegionForModal("CLOUD_PROVIDER_GCP", "us-east4"), "north-america-east")
     assert.equal(canonicalRegionForModal("GCP", "US-EAST4-A"), "north-america-east")
 })
 

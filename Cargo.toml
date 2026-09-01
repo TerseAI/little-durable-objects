@@ -2,11 +2,14 @@
 name = "durable-object-runtime"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.89"
 default-run = "durable-object-runtime"
 description = "Standalone regional durable-object control plane, host, and durability runtime"
 readme = "README.md"
-repository = "https://github.com/TerseAI/durable-objects"
-license-file = "LICENSE.md"
+repository = "https://github.com/TerseAI/lil-durable-objects"
+license = "MIT"
+keywords = ["actors", "distributed-systems", "durable-objects", "serverless"]
+categories = ["asynchronous", "network-programming"]
 include = ["/src/**", "/tests/**", "/proto/**", "/migrations/**", "/build.rs", "/README.md", "/LICENSE.md"]
 
 [dependencies]

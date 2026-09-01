@@ -18,6 +18,11 @@ test("creates Modal with the host as its main process and injects only runtime c
                         return placement ? "gcp\nus-east-1\n" : ""
                     }
                 },
+                stderr: {
+                    async readText() {
+                        return ""
+                    }
+                },
                 async wait() {
                     return 0
                 }
@@ -79,13 +84,74 @@ test("creates Modal with the host as its main process and injects only runtime c
     })
     assert.equal(createOptions?.timeoutMs, 86_400_000)
     assert.equal(createOptions?.idleTimeoutMs, 300_000)
-    assert.deepEqual(createOptions?.command?.slice(-2), ["/tmp/durable-object-route", "/usr/local/bin/durable-object-runtime"])
+    assert.equal(createOptions?.command?.[5], "/usr/local/bin/durable-object-runtime")
     assert.equal(createOptions?.env?.DURABLE_OBJECT_HOST_TOKEN, "host-jwt")
     assert.equal(createOptions?.env?.DURABLE_OBJECT_ACTOR_IDLE_TIMEOUT_MS, "60000")
     assert.equal(createOptions?.env?.DURABLE_OBJECT_HOST_IDLE_TIMEOUT_MS, "300000")
     assert.equal(createOptions?.env?.MODAL_TOKEN_ID, undefined)
     assert.equal(files.get("/tmp/durable-object-route"), "https://host.example.com")
     assert.match(files.get("/tmp/durable-object-host.json") ?? "", /host\.v1\.project-1/u)
+})
+
+test("surfaces host stderr when the main process exits before readiness", async () => {
+    let terminated = false
+    const sandbox = {
+        async exec(command: string[]) {
+            const placement = command.join(" ").includes("MODAL_CLOUD_PROVIDER")
+            return {
+                stdout: {
+                    async readText() {
+                        return placement ? "gcp\nus-east-1\n" : ""
+                    }
+                },
+                stderr: {
+                    async readText() {
+                        return placement ? "" : "host could not register its lease\n"
+                    }
+                },
+                async wait() {
+                    return placement ? 0 : 1
+                }
+            }
+        },
+        async tunnels() {
+            return { 7101: { url: "https://host.example.com" } }
+        },
+        async open() {
+            return {
+                async write() {},
+                async flush() {},
+                async close() {}
+            }
+        },
+        async terminate() {
+            terminated = true
+        }
+    }
+    const client = {
+        apps: {
+            async fromName() {
+                return { name: "durable-object-hosts" }
+            }
+        },
+        images: {
+            async fromId() {
+                return { imageId: "im-actor" }
+            }
+        },
+        sandboxes: {
+            async fromName() {
+                throw new NotFoundError("not found")
+            },
+            async create() {
+                return sandbox
+            }
+        }
+    }
+    const provider = new ModalSandboxProvider({ client: client as unknown as ModalClient })
+
+    await assert.rejects(provider.ensureHost(request()), /durable-object host did not become ready: host could not register its lease/u)
+    assert.equal(terminated, true)
 })
 
 function request(): EnsureHostRequest {

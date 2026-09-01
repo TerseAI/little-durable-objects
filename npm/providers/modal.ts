@@ -10,6 +10,8 @@ import type { ActorHostHandle, EnsureHostRequest, SandboxProvider } from "./type
 const hostPort = 7101
 const hostRouteFile = "/tmp/durable-object-route"
 const readyFile = "/tmp/durable-object-ready"
+const hostStderrFile = "/tmp/durable-object-host.stderr"
+const hostExitedFile = "/tmp/durable-object-host-exited"
 const maximumSandboxLifetimeMs = 24 * 60 * 60 * 1000
 
 interface ModalSandboxProviderOptions {
@@ -73,10 +75,12 @@ class ModalSandboxProvider implements SandboxProvider {
                 command: [
                     "sh",
                     "-c",
-                    'until test -s "$1"; do sleep 0.05; done; export DURABLE_OBJECT_HOST_ROUTE="$(cat "$1")"; exec "$2"',
+                    'until test -s "$1"; do sleep 0.05; done; export DURABLE_OBJECT_HOST_ROUTE="$(cat "$1")"; "$2" 2>"$3"; status=$?; printf \'%s\n\' "$status" >"$4"; sleep 300; exit "$status"',
                     "durable-object-host-bootstrap",
                     hostRouteFile,
-                    this.binaryPath
+                    this.binaryPath,
+                    hostStderrFile,
+                    hostExitedFile
                 ],
                 workdir: request.workingDirectory,
                 env: hostEnvironment(request),
@@ -134,10 +138,15 @@ class ModalSandboxProvider implements SandboxProvider {
         const route = (await sandbox.tunnels())[hostPort]?.url
         if (!route) throw new Error("Modal did not create the durable-object HTTP/2 tunnel")
         await writeFile(sandbox, hostRouteFile, route)
-        const ready = await sandbox.exec(["sh", "-c", `for i in $(seq 1 1200); do test -f ${readyFile} && exit 0; sleep 0.05; done; exit 1`], { stdout: "pipe", stderr: "pipe" })
-        if ((await ready.wait()) !== 0) {
-            await sandbox.terminate()
-            throw new Error("durable-object host did not become ready")
+        const ready = await sandbox.exec(
+            ["sh", "-c", `for i in $(seq 1 1200); do test -f ${readyFile} && exit 0; if test -f ${hostExitedFile}; then cat ${hostStderrFile} >&2; exit 1; fi; sleep 0.05; done; exit 1`],
+            { stdout: "pipe", stderr: "pipe" }
+        )
+        const [detail, exitCode] = await Promise.all([ready.stderr.readText(), ready.wait()])
+        if (exitCode !== 0) {
+            await sandbox.terminate().catch(() => undefined)
+            const message = detail.trim()
+            throw new Error(`durable-object host did not become ready${message ? `: ${message}` : ""}`)
         }
         return { hostId: request.hostId, route, canonicalRegion: request.canonicalRegion }
     }
