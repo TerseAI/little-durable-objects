@@ -27,16 +27,17 @@ const errorDocumentSchema = z.object({
 })
 
 class RemoteActorClient {
-    private static instance: RemoteActorClient | undefined
-
     private readonly serializer = new JsonActorStateSerializer()
     private settingsValue: RemoteActorSettings | undefined
+    private readonly environment: NodeJS.ProcessEnv
+    private readonly fetchRequest: typeof globalThis.fetch
+    private readonly requestId: () => string
 
-    private constructor(
-        private readonly environment: NodeJS.ProcessEnv = process.env,
-        configuredSettings?: RemoteActorSettings
-    ) {
-        this.settingsValue = configuredSettings
+    constructor(options?: DurableObjectsClientOptions, dependencies: RemoteActorClientDependencies = {}) {
+        this.environment = dependencies.environment ?? process.env
+        this.fetchRequest = dependencies.fetch ?? globalThis.fetch
+        this.requestId = dependencies.requestId ?? (() => globalThis.crypto.randomUUID())
+        this.settingsValue = options === undefined ? undefined : configuredSettings(options)
     }
 
     private get settings(): RemoteActorSettings {
@@ -51,52 +52,37 @@ class RemoteActorClient {
         return this.settingsValue
     }
 
-    static getInstance(): RemoteActorClient {
-        this.instance ??= new RemoteActorClient()
-        return this.instance
-    }
-
-    static configure(options: DurableObjectsClientOptions): void {
-        const result = clientOptionsSchema.safeParse(options)
-        if (!result.success) throw new ActorConfigurationError(`durable-object client settings are invalid: ${result.error.message}`)
-        this.instance = new RemoteActorClient(process.env, {
-            ...result.data,
-            controlPlaneUrl: validateOrigin(result.data.controlPlaneUrl)
-        })
-    }
-
-    static resetForTests(): void {
-        this.instance = undefined
-    }
-
     async invoke(actorType: string, actorId: string, method: string, args: readonly unknown[]): Promise<unknown> {
-        const requestId = validateActorComponent("request ID", globalThis.crypto.randomUUID())
+        const requestId = validateActorComponent("request ID", this.requestId())
         if (currentActorInvocation() !== undefined) {
             throw new ActorInvocationError("actor_error", requestId, "actor-to-actor calls are not available")
         }
+        const response = await this.send(requestId, actorType, actorId, method, args)
+        return this.result(response, requestId)
+    }
 
-        const url = invocationUrl(this.settings, actorType, actorId)
-        const body = JSON.stringify({
-            requestId,
-            method: validateActorComponent("actor method", method),
-            args: this.jsonArguments(args)
-        })
-        let response: Response
+    private async send(requestId: string, actorType: string, actorId: string, method: string, args: readonly unknown[]): Promise<Response> {
         try {
-            response = await fetch(url, {
+            return await this.fetchRequest(invocationUrl(this.settings, actorType, actorId), {
                 method: "POST",
                 headers: {
                     accept: "application/json",
                     authorization: `Bearer ${this.settings.token}`,
                     "content-type": "application/json"
                 },
-                body
+                body: JSON.stringify({
+                    requestId,
+                    method: validateActorComponent("actor method", method),
+                    args: this.jsonArguments(args)
+                })
             })
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error)
             throw new ActorInvocationError("outcome_unknown", requestId, `control-plane HTTP request failed after dispatch: ${message}`)
         }
+    }
 
+    private async result(response: Response, requestId: string): Promise<unknown> {
         const document = await responseDocument(response)
         if (response.ok) {
             if (isObject(document) && Object.hasOwn(document, "result")) return document.result
@@ -117,6 +103,12 @@ class RemoteActorClient {
         if (!Array.isArray(value)) throw new ActorProtocolError("actor arguments must be a JSON array")
         return value
     }
+}
+
+function configuredSettings(options: DurableObjectsClientOptions): RemoteActorSettings {
+    const result = clientOptionsSchema.safeParse(options)
+    if (!result.success) throw new ActorConfigurationError(`durable-object client settings are invalid: ${result.error.message}`)
+    return { ...result.data, controlPlaneUrl: validateOrigin(result.data.controlPlaneUrl) }
 }
 
 function validateOrigin(origin: string): string {
@@ -162,5 +154,11 @@ interface DurableObjectsClientOptions {
     readonly controlPlaneUrl: string
 }
 
+interface RemoteActorClientDependencies {
+    readonly environment?: NodeJS.ProcessEnv
+    readonly fetch?: typeof globalThis.fetch
+    readonly requestId?: () => string
+}
+
 export { RemoteActorClient }
-export type { DurableObjectsClientOptions }
+export type { DurableObjectsClientOptions, RemoteActorClientDependencies }

@@ -1,3 +1,5 @@
+import { AsyncLocalStorage } from "node:async_hooks"
+
 import { ActorProtocolError } from "../shared/errors.js"
 import { JsonActorStateSerializer, validateActorComponent } from "../shared/types.js"
 import type { JsonValue } from "../shared/types.js"
@@ -9,15 +11,29 @@ interface ActorClientTransport {
     invoke(actorType: string, actorId: string, method: string, args: readonly unknown[]): Promise<unknown>
 }
 
+const scopedClients = new AsyncLocalStorage<ActorClientTransport>()
+
 function actorClient(): ActorClientTransport {
-    return testActorClient ?? RemoteActorClient.getInstance()
+    return scopedClients.getStore() ?? defaultClients.get()
 }
 
 function configureDurableObjects(options: DurableObjectsClientOptions): void {
-    RemoteActorClient.configure(options)
+    defaultClients.configure(options)
 }
 
-let testActorClient: TestActorClient | undefined
+class DefaultActorClientProvider {
+    private client: ActorClientTransport = new RemoteActorClient()
+
+    get(): ActorClientTransport {
+        return this.client
+    }
+
+    configure(options: DurableObjectsClientOptions): void {
+        this.client = new RemoteActorClient(options)
+    }
+}
+
+const defaultClients = new DefaultActorClientProvider()
 
 class TestActorClient implements ActorClientTransport {
     private readonly serializer = new JsonActorStateSerializer()
@@ -44,8 +60,8 @@ class TestActorClient implements ActorClientTransport {
     }
 }
 
-function configureActorClientForTests(options?: ActorTestClientOptions): void {
-    testActorClient = options === undefined ? undefined : new TestActorClient(options)
+function runWithActorClientForTests<T>(options: ActorTestClientOptions, operation: () => T): T {
+    return scopedClients.run(new TestActorClient(options), operation)
 }
 
 interface ActorInvocationRequest {
@@ -63,5 +79,5 @@ interface ActorTestClientOptions {
 
 type ActorTestInvoker = (request: ActorInvocationRequest) => Promise<unknown>
 
-export { actorClient, configureActorClientForTests, configureDurableObjects }
+export { actorClient, configureDurableObjects, runWithActorClientForTests }
 export type { ActorInvocationRequest, ActorTestClientOptions, DurableObjectsClientOptions }

@@ -15,11 +15,17 @@ use crate::{
 
 use super::{
     MAX_CONTROL_PLANE_MESSAGE_BYTES,
-    admin::HostLaunchSpec,
-    service::{AdminDependencies, ControlPlaneService},
+    admin::{AdminService, HostLaunchSpec},
+    service::ControlPlaneService,
 };
 
-pub(super) fn router(service: ControlPlaneService) -> Router {
+#[derive(Clone)]
+struct PublicApiState {
+    invocations: ControlPlaneService,
+    admin: AdminService,
+}
+
+pub(super) fn router(invocations: ControlPlaneService, admin: AdminService) -> Router {
     Router::new()
         .route("/.well-known/jwks.json", get(jwks))
         .route(
@@ -35,19 +41,19 @@ pub(super) fn router(service: ControlPlaneService) -> Router {
             post(invoke_actor),
         )
         .layer(DefaultBodyLimit::max(MAX_CONTROL_PLANE_MESSAGE_BYTES))
-        .with_state(service)
+        .with_state(PublicApiState { invocations, admin })
 }
 
 async fn register_deployment(
-    State(service): State<ControlPlaneService>,
+    State(state): State<PublicApiState>,
     Path(namespace_id): Path<String>,
     headers: HeaderMap,
     Json(request): Json<RegisterDeploymentRequest>,
 ) -> Result<Json<DeploymentReply>, ApiError> {
-    let admin = authorized_admin(&service, &headers)?;
-    let changed = admin
-        .registry
-        .register_deployment(&HostLaunchSpec {
+    authorized_admin(&state.admin, &headers)?;
+    let changed = state
+        .admin
+        .ensure_namespace_and_register_deployment(&HostLaunchSpec {
             namespace_id,
             code_revision: request.code_revision,
             image_ref: request.image_ref,
@@ -60,30 +66,29 @@ async fn register_deployment(
 }
 
 async fn issue_workflow_token(
-    State(service): State<ControlPlaneService>,
+    State(state): State<PublicApiState>,
     Path(namespace_id): Path<String>,
     headers: HeaderMap,
     Json(request): Json<IssueWorkflowTokenRequest>,
 ) -> Result<Json<IssueWorkflowTokenReply>, ApiError> {
-    let admin = authorized_admin(&service, &headers)?;
+    authorized_admin(&state.admin, &headers)?;
     if request.execution_id.is_empty() || request.execution_id.len() > 255 {
         return Err(ApiError::bad_request("workflow execution ID is invalid"));
     }
     if request.deadline_unix_ms <= 0 {
         return Err(ApiError::bad_request("workflow deadline is required"));
     }
-    if admin
-        .registry
-        .launch_spec(&namespace_id)
+    if !state
+        .admin
+        .deployment_exists(&namespace_id)
         .await
         .map_err(ApiError::internal)?
-        .is_none()
     {
         return Err(ApiError::conflict("project has no registered actor code"));
     }
-    let issued = admin
-        .issuer
-        .issue_workflow(
+    let issued = state
+        .admin
+        .issue_workflow_token(
             &namespace_id,
             &request.execution_id,
             request.deadline_unix_ms,
@@ -95,24 +100,21 @@ async fn issue_workflow_token(
     }))
 }
 
-async fn jwks(State(service): State<ControlPlaneService>) -> Result<Json<Value>, ApiError> {
-    let admin = service
-        .admin()
-        .ok_or_else(|| ApiError::unavailable("JWT issuer is not configured"))?;
-    let document = serde_json::from_slice(&admin.issuer.jwks_json().map_err(ApiError::internal)?)
+async fn jwks(State(state): State<PublicApiState>) -> Result<Json<Value>, ApiError> {
+    let document = serde_json::from_slice(&state.admin.jwks_json().map_err(ApiError::internal)?)
         .map_err(ApiError::internal)?;
     Ok(Json(document))
 }
 
 async fn invoke_actor(
-    State(service): State<ControlPlaneService>,
+    State(state): State<PublicApiState>,
     Path((namespace_id, actor_type, actor_id)): Path<(String, String, String)>,
     headers: HeaderMap,
     Json(request): Json<InvokeActorRequest>,
 ) -> Response {
     let request_id = request.request_id.clone();
     match invoke_actor_inner(
-        service,
+        state.invocations,
         headers,
         ActorInvocation {
             request_id: request.request_id,
@@ -164,18 +166,12 @@ async fn invoke_actor_inner(
     }
 }
 
-fn authorized_admin<'a>(
-    service: &'a ControlPlaneService,
-    headers: &HeaderMap,
-) -> Result<&'a AdminDependencies, ApiError> {
-    let admin = service
-        .admin()
-        .ok_or_else(|| ApiError::unavailable("admin API is not configured"))?;
+fn authorized_admin(admin: &AdminService, headers: &HeaderMap) -> Result<(), ApiError> {
     let authorization = authorization(headers)?;
-    service
-        .authenticate_admin(authorization)
+    admin
+        .authenticate(authorization)
         .map_err(|_| ApiError::unauthorized("admin credential was rejected"))?;
-    Ok(admin)
+    Ok(())
 }
 
 fn authorization(headers: &HeaderMap) -> Result<&str, ApiError> {

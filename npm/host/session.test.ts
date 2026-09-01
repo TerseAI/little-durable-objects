@@ -9,20 +9,20 @@ import { fileURLToPath } from "node:url"
 
 test("the actor session carries only owned execution commands", async () => {
     const socketPath = `/tmp/ta-session-${process.pid}.sock`
-    const previousSocket = process.env.DURABLE_OBJECT_EXECUTOR_SOCKET
-    const previousEntrypoint = process.env.DURABLE_OBJECT_ENTRYPOINT
     await removeSocket(socketPath)
     const server = createServer()
     const customerSocketPromise = new Promise<Socket>(resolve => {
         server.once("connection", resolve)
     })
-    process.env.DURABLE_OBJECT_EXECUTOR_SOCKET = socketPath
-    process.env.DURABLE_OBJECT_ENTRYPOINT = fileURLToPath(new URL("../fixtures/actorSession.js", import.meta.url))
-
     const { ActorSession, ActorSessionSettings } = await import("./session.js")
     server.listen(socketPath)
     await once(server, "listening")
-    const session = new ActorSession()
+    const session = new ActorSession(
+        ActorSessionSettings.fromEnvironment({
+            DURABLE_OBJECT_EXECUTOR_SOCKET: socketPath,
+            DURABLE_OBJECT_ENTRYPOINT: fileURLToPath(new URL("../fixtures/actorSession.js", import.meta.url))
+        })
+    )
     const startup = session.start()
 
     try {
@@ -84,11 +84,6 @@ test("the actor session carries only owned execution commands", async () => {
         server.close()
         await once(server, "close")
     } finally {
-        ActorSessionSettings.resetForTests()
-        if (previousSocket === undefined) delete process.env.DURABLE_OBJECT_EXECUTOR_SOCKET
-        else process.env.DURABLE_OBJECT_EXECUTOR_SOCKET = previousSocket
-        if (previousEntrypoint === undefined) delete process.env.DURABLE_OBJECT_ENTRYPOINT
-        else process.env.DURABLE_OBJECT_ENTRYPOINT = previousEntrypoint
         if (server.listening) server.close()
         await removeSocket(socketPath)
     }

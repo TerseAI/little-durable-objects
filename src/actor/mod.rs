@@ -9,4 +9,6 @@ pub use self::{
         ActorExecutionResult, ActorInvocation, ActorInvocationFailure, ActorKey, ActorScope,
     },
 };
-pub(crate) use executor_connection::{ActorExecutorListener, MAX_ACTOR_EXECUTOR_MESSAGE_BYTES};
+pub(crate) use executor_connection::{
+    ActorExecutorConnection, ActorExecutorListener, MAX_ACTOR_EXECUTOR_MESSAGE_BYTES,
+};

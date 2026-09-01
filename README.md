@@ -74,4 +74,4 @@ A small, provider-neutral durable-object runtime. Modal is the first sandbox pro
 
 Actors leave memory after 60 seconds idle; empty host sandboxes stop after 5 minutes. Override those defaults with `DURABLE_OBJECT_ACTOR_IDLE_TIMEOUT_MS` and `DURABLE_OBJECT_HOST_IDLE_TIMEOUT_MS` on the control plane.
 
-See the [developer guide](docs/developer-guide.md), [Terse integration quickstart](docs/terse-integration.md), and short [architecture diagram](docs/system-architecture-ascii.md).
+See the [architecture diagram](docs/system-architecture.md) for the request, credential, placement, and state flow.

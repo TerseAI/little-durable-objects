@@ -3,13 +3,14 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use tokio::{net::TcpListener, process::Command, sync::watch};
+use tokio::{net::TcpListener, process::Command};
 use tokio_stream::wrappers::TcpListenerStream;
+use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 use tracing::{error, info};
 
 use crate::{
-    actor::{ActorExecutorListener, ActorScope},
+    actor::{ActorExecutorConnection, ActorExecutorListener, ActorScope},
     clock::SystemClock,
     control_plane::{ActorJwtVerifier, ActorTokenPurpose, ControlPlaneClient},
     grpc::ActorHostGrpcService,
@@ -17,7 +18,7 @@ use crate::{
     state_transport::HttpStateTransport,
 };
 
-use super::{ActorHost, HostEndpoint, HostLeaseMaintainer};
+use super::{ActorHost, HostEndpoint, HostLeaseMaintainer, LeaseRenewalTask};
 
 const HOST_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const HOST_ACTOR_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -133,16 +134,110 @@ pub async fn serve_actor_host<F>(config: ActorHostConfig, shutdown: F) -> Result
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    let PreparedActorHost {
+        invocation_auth,
+        listener,
+        route,
+        executor_connection,
+        mut javascript,
+        host,
+        lease,
+        renewal,
+    } = prepare_actor_host(&config).await?;
+    let mut lease_lost = renewal.lease_lost();
+    let mut activity = host.activity();
+
+    let service = ActorHostGrpcService::new(host.clone(), invocation_auth).into_service();
+    executor_connection.mark_ready().await?;
+    let stop = CancellationToken::new();
+    let server_stop = stop.clone();
+    let mut server = Box::pin(
+        Server::builder()
+            .add_service(service)
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                server_stop.cancelled().await
+            }),
+    );
+    let mut executor_task = Box::pin(executor_connection.run(stop.clone()));
+    tokio::pin!(shutdown);
+
+    info!(host_id = %config.host_id, namespace_id = %config.namespace_id, route, "durable-object host is ready");
+    let stop_result = wait_for_host_stop(
+        server.as_mut(),
+        executor_task.as_mut(),
+        &mut javascript,
+        shutdown.as_mut(),
+        &mut lease_lost,
+        &mut activity,
+        config.host_idle_timeout,
+    )
+    .await;
+    stop_host_tasks(&host, &stop, server, executor_task).await;
+    drop(javascript);
+    let renewal_result = renewal.shutdown().await;
+    let unregister_result = lease.unregister().await;
+    info!(host_id = %config.host_id, "durable-object host stopped");
+    stop_result?;
+    renewal_result?;
+    unregister_result
+}
+
+struct PreparedActorHost {
+    invocation_auth: ActorJwtVerifier,
+    listener: TcpListener,
+    route: String,
+    executor_connection: ActorExecutorConnection,
+    javascript: tokio::process::Child,
+    host: Arc<ActorHost>,
+    lease: Arc<HostLeaseMaintainer>,
+    renewal: LeaseRenewalTask,
+}
+
+async fn prepare_actor_host(config: &ActorHostConfig) -> Result<PreparedActorHost> {
+    let invocation_auth = invocation_auth(config)?;
     let control_plane =
         Arc::new(ControlPlaneClient::connect(&config.control_plane_url, &config.host_token).await?);
-    let invocation_auth = ActorJwtVerifier::for_scope(
+    let (listener, route, endpoint) = bind_host(config).await?;
+    let (executor_connection, javascript) = connect_executor(&config.executor_socket).await?;
+    let host = Arc::new(ActorHost::new(
+        endpoint.clone(),
+        config.namespace_id.clone(),
+        executor_connection.executor(),
+        control_plane.clone(),
+        Arc::new(HttpStateTransport::new()),
+    ));
+    let lease = Arc::new(HostLeaseMaintainer::new(
+        endpoint,
+        config.session_id.clone(),
+        control_plane as Arc<dyn HostLeaseRegistry>,
+        Arc::new(SystemClock),
+        config.lease_duration,
+        config.renew_every,
+    )?);
+    let renewal = lease.clone().start().await?;
+    Ok(PreparedActorHost {
+        invocation_auth,
+        listener,
+        route,
+        executor_connection,
+        javascript,
+        host,
+        lease,
+        renewal,
+    })
+}
+
+fn invocation_auth(config: &ActorHostConfig) -> Result<ActorJwtVerifier> {
+    ActorJwtVerifier::for_scope(
         &config.jwt_public_keys,
         config.jwt_issuer.clone(),
         config.invocation_jwt_audience.clone(),
         ActorTokenPurpose::Invocation,
         config.jwt_max_lifetime,
-    )?;
+    )
+}
 
+async fn bind_host(config: &ActorHostConfig) -> Result<(TcpListener, String, HostEndpoint)> {
     let listener = TcpListener::bind(config.host_bind)
         .await
         .with_context(|| format!("bind actor host at {}", config.host_bind))?;
@@ -156,53 +251,38 @@ where
         id: config.host_id.clone(),
         route: route.clone(),
     };
+    Ok((listener, route, endpoint))
+}
 
-    let executor_listener = ActorExecutorListener::bind(&config.executor_socket).await?;
-    let mut javascript = spawn_javascript_process()?;
-    let executor_connection = executor_listener.accept().await?;
-    let executor = executor_connection.executor();
-    let host = Arc::new(ActorHost::new(
-        endpoint.clone(),
-        config.namespace_id.clone(),
-        executor,
-        control_plane.clone(),
-        Arc::new(HttpStateTransport::new()),
-    ));
+async fn connect_executor(
+    socket: &std::path::Path,
+) -> Result<(ActorExecutorConnection, tokio::process::Child)> {
+    let listener = ActorExecutorListener::bind(socket).await?;
+    let javascript = spawn_javascript_process()?;
+    Ok((listener.accept().await?, javascript))
+}
 
-    let lease = Arc::new(HostLeaseMaintainer::new(
-        endpoint,
-        config.session_id.clone(),
-        control_plane.clone() as Arc<dyn HostLeaseRegistry>,
-        Arc::new(SystemClock),
-        config.lease_duration,
-        config.renew_every,
-    )?);
-    let renewal = lease.clone().start().await?;
-    let mut lease_lost = renewal.lease_lost();
-    let mut activity = host.activity();
-
-    let service = ActorHostGrpcService::new(host.clone(), invocation_auth).into_service();
-    executor_connection.mark_ready().await?;
-    let (stop_tx, stop_rx) = watch::channel(false);
-    let mut server = Box::pin(
-        Server::builder()
-            .add_service(service)
-            .serve_with_incoming_shutdown(
-                TcpListenerStream::new(listener),
-                wait_for_shutdown(stop_rx.clone()),
-            ),
-    );
-    let mut executor_task = Box::pin(executor_connection.run(stop_rx));
-    let mut idle_deadline = tokio::time::Instant::now() + config.host_idle_timeout;
-    tokio::pin!(shutdown);
-
-    info!(host_id = %config.host_id, namespace_id = %config.namespace_id, route, "durable-object host is ready");
-    let stop_result: Result<()> = loop {
+async fn wait_for_host_stop<ServerFuture, ExecutorFuture, ShutdownFuture>(
+    mut server: std::pin::Pin<&mut ServerFuture>,
+    mut executor: std::pin::Pin<&mut ExecutorFuture>,
+    javascript: &mut tokio::process::Child,
+    mut shutdown: std::pin::Pin<&mut ShutdownFuture>,
+    lease_lost: &mut tokio::sync::watch::Receiver<bool>,
+    activity: &mut tokio::sync::watch::Receiver<usize>,
+    idle_timeout: Duration,
+) -> Result<()>
+where
+    ServerFuture: Future<Output = std::result::Result<(), tonic::transport::Error>> + ?Sized,
+    ExecutorFuture: Future<Output = Result<()>> + ?Sized,
+    ShutdownFuture: Future<Output = ()> + ?Sized,
+{
+    let mut idle_deadline = tokio::time::Instant::now() + idle_timeout;
+    loop {
         tokio::select! {
-            result = &mut server => break result.context("serve actor host gRPC"),
-            result = &mut executor_task => break result.context("run JavaScript actor executor"),
+            result = server.as_mut() => break result.context("serve actor host gRPC"),
+            result = executor.as_mut() => break result.context("run JavaScript actor executor"),
             result = javascript.wait() => break Err(anyhow::anyhow!("JavaScript actor executor exited with {}", result?)),
-            () = &mut shutdown => break Ok(()),
+            () = shutdown.as_mut() => break Ok(()),
             changed = lease_lost.changed() => {
                 if changed.is_err() || *lease_lost.borrow() {
                     break Err(anyhow::anyhow!("host lease expired; host self-fenced"));
@@ -211,28 +291,28 @@ where
             changed = activity.changed() => {
                 if changed.is_err() { break Err(anyhow::anyhow!("actor activity tracker stopped")); }
                 if *activity.borrow() == 0 {
-                    idle_deadline = tokio::time::Instant::now() + config.host_idle_timeout;
+                    idle_deadline = tokio::time::Instant::now() + idle_timeout;
                 }
             }
             () = tokio::time::sleep_until(idle_deadline), if *activity.borrow() == 0 => break Ok(()),
         }
-    };
+    }
+}
 
+async fn stop_host_tasks(
+    host: &ActorHost,
+    stop: &CancellationToken,
+    server: impl Future,
+    executor: impl Future,
+) {
     if let Err(error) = host.drain(HOST_ACTOR_DRAIN_TIMEOUT).await {
         error!(error = %format!("{error:#}"), "actor invocations did not drain cleanly");
     }
-    let _ = stop_tx.send(true);
+    stop.cancel();
     let _ = tokio::time::timeout(HOST_TASK_SHUTDOWN_TIMEOUT, async {
-        let _ = tokio::join!(server, executor_task);
+        let _ = tokio::join!(server, executor);
     })
     .await;
-    drop(javascript);
-    let renewal_result = renewal.shutdown().await;
-    let unregister_result = lease.unregister().await;
-    info!(host_id = %config.host_id, "durable-object host stopped");
-    stop_result?;
-    renewal_result?;
-    unregister_result
 }
 
 fn spawn_javascript_process() -> Result<tokio::process::Child> {
@@ -248,10 +328,6 @@ fn spawn_javascript_process() -> Result<tokio::process::Child> {
         .kill_on_drop(true)
         .spawn()
         .context("start JavaScript actor executor")
-}
-
-async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
-    while !*shutdown.borrow() && shutdown.changed().await.is_ok() {}
 }
 
 fn required(get: &mut impl FnMut(&str) -> Option<String>, name: &str) -> Result<String> {

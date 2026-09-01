@@ -7,11 +7,8 @@ use std::{
 };
 
 use anyhow::{Result, ensure};
-use tokio::{
-    sync::{oneshot, watch},
-    task::JoinHandle,
-    time::Instant,
-};
+use tokio::{sync::watch, task::JoinHandle, time::Instant};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -129,7 +126,8 @@ impl HostLeaseMaintainer {
             expires_at_ms = initial.lease.expires_at_ms,
             "host lease registered"
         );
-        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        let shutdown = CancellationToken::new();
+        let task_shutdown = shutdown.clone();
         let (lease_lost_tx, lease_lost) = watch::channel(false);
         let manager = self.clone();
         let task = tokio::spawn(async move {
@@ -139,7 +137,7 @@ impl HostLeaseMaintainer {
                 tokio::pin!(renewal_due);
                 tokio::select! {
                     biased;
-                    _ = &mut shutdown_rx => break,
+                    _ = task_shutdown.cancelled() => break,
                     _ = tokio::time::sleep_until(local_deadline) => {
                         warn!(
                             host_id = %manager.endpoint.id,
@@ -155,7 +153,7 @@ impl HostLeaseMaintainer {
                 tokio::pin!(renewal);
                 tokio::select! {
                     biased;
-                    _ = &mut shutdown_rx => break,
+                    _ = task_shutdown.cancelled() => break,
                     _ = tokio::time::sleep_until(local_deadline) => {
                         warn!(
                             host_id = %manager.endpoint.id,
@@ -186,7 +184,7 @@ impl HostLeaseMaintainer {
         });
 
         Ok(LeaseRenewalTask {
-            shutdown: Some(shutdown_tx),
+            shutdown,
             task,
             lease_lost,
         })
@@ -199,7 +197,7 @@ struct ConfirmedHostLease {
 }
 
 pub(crate) struct LeaseRenewalTask {
-    shutdown: Option<oneshot::Sender<()>>,
+    shutdown: CancellationToken,
     task: JoinHandle<()>,
     lease_lost: watch::Receiver<bool>,
 }
@@ -210,9 +208,7 @@ impl LeaseRenewalTask {
     }
 
     pub(crate) async fn shutdown(mut self) -> Result<()> {
-        if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
-        }
+        self.shutdown.cancel();
         match tokio::time::timeout(LEASE_RENEWAL_SHUTDOWN_TIMEOUT, &mut self.task).await {
             Ok(result) => result?,
             Err(_) => {
@@ -348,10 +344,6 @@ mod tests {
 
         Ok(())
     }
-
-    // ========================================================================
-    // Host identity and lease renewal
-    // ========================================================================
 
     #[test]
     fn new_hosts_receive_unique_session_ids() {

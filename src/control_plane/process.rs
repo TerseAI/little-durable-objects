@@ -134,21 +134,31 @@ pub async fn serve_control_plane(
     let storage_urls = Arc::new(GcsStorageUrlSigner::from_adc(
         config.storage.standard_buckets,
     )?);
-    let mut service = ControlPlaneService::new(leases, placements, storage_urls, auth).with_admin(
-        config.admin_token,
-        registry,
-        issuer,
-    )?;
-    if let Some(provider) = config.sandbox_provider {
-        service = service
-            .with_sandbox_provider(Arc::new(CommandSandboxProvider::new(
-                provider.provider_name,
-                provider.command,
-                provider.environment,
-            )?))
-            .with_sandbox_runtime(provider.runtime);
-    }
-    let public_api = super::public_api::router(service.clone());
+    let provisioner = config
+        .sandbox_provider
+        .map(
+            |config| -> Result<Arc<dyn super::service::HostProvisioner>> {
+                let provider = Arc::new(CommandSandboxProvider::new(
+                    config.provider_name,
+                    config.command,
+                    config.environment,
+                )?);
+                Ok(Arc::new(super::service::SandboxHostProvisioner::new(
+                    provider,
+                    config.runtime,
+                    issuer.clone(),
+                    leases.clone(),
+                )))
+            },
+        )
+        .transpose()?;
+    let service = ControlPlaneService::new(leases, placements, storage_urls, auth).with_routing(
+        registry.clone(),
+        issuer.clone(),
+        provisioner,
+    );
+    let admin = super::admin::AdminService::new(config.admin_token, registry, issuer)?;
+    let public_api = super::public_api::router(service.clone(), admin);
     let internal_api = service.into_internal_service();
     let routes = tonic::service::Routes::from(public_api).add_service(internal_api);
     info!(bind = %config.bind, "durable-object control plane is ready");

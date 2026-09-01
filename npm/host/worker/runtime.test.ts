@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import { test } from "node:test"
 
 import { Actor, registerActorClass } from "../../shared/actor.js"
-import { configureActorClientForTests } from "../../workflow/client.js"
+import { runWithActorClientForTests } from "../../workflow/client.js"
 
 import { ActorRuntime } from "./runtime.js"
 
@@ -123,59 +123,59 @@ test("keeps a successful actor instance resident and restores it after failure",
 
 test("Actor.get returns a typed forwarding reference", async () => {
     const calls: unknown[] = []
-    configureActorClientForTests({
-        requestId: () => "fixed-request",
-        invoke: async request => {
-            calls.push(request)
-            return 7
-        }
-    })
-    try {
-        const counter = Counter.get("counter-1")
-
-        assert.equal(Reflect.get(counter, "missingMethod"), undefined)
-        assert.equal(await counter.increment(3), 7)
-        assert.deepEqual(calls, [
-            {
-                requestId: "fixed-request",
-                actorType: "Counter",
-                actorId: "counter-1",
-                method: "increment",
-                args: [3]
+    await runWithActorClientForTests(
+        {
+            requestId: () => "fixed-request",
+            invoke: async request => {
+                calls.push(request)
+                return 7
             }
-        ])
-    } finally {
-        configureActorClientForTests(undefined)
-    }
+        },
+        async () => {
+            const counter = Counter.get("counter-1")
+
+            assert.equal(Reflect.get(counter, "missingMethod"), undefined)
+            assert.equal(await counter.increment(3), 7)
+            assert.deepEqual(calls, [
+                {
+                    requestId: "fixed-request",
+                    actorType: "Counter",
+                    actorId: "counter-1",
+                    method: "increment",
+                    args: [3]
+                }
+            ])
+        }
+    )
 })
 
 test("the injected invoker remains available inside actor unit tests", async () => {
-    configureActorClientForTests({
-        requestId: () => "nested-request",
-        invoke: async request => {
-            throw new Error(`unexpected external nested invocation ${request.requestId}`)
-        }
-    })
-    try {
-        const runtime = new ActorRuntime(forwarderDefinition)
-        assert.deepEqual(
-            await runtime.handle({
-                type: "invoke",
-                request_id: "parent-request",
-                actor: forwarderIdentity,
-                method: "incrementCounter",
-                args: [],
-                state: null
-            }),
-            {
-                type: "failed",
-                code: "actor_method_failed",
-                message: "unexpected external nested invocation nested-request"
+    await runWithActorClientForTests(
+        {
+            requestId: () => "nested-request",
+            invoke: async request => {
+                throw new Error(`unexpected external nested invocation ${request.requestId}`)
             }
-        )
-    } finally {
-        configureActorClientForTests(undefined)
-    }
+        },
+        async () => {
+            const runtime = new ActorRuntime(forwarderDefinition)
+            assert.deepEqual(
+                await runtime.handle({
+                    type: "invoke",
+                    request_id: "parent-request",
+                    actor: forwarderIdentity,
+                    method: "incrementCounter",
+                    args: [],
+                    state: null
+                }),
+                {
+                    type: "failed",
+                    code: "actor_method_failed",
+                    message: "unexpected external nested invocation nested-request"
+                }
+            )
+        }
+    )
 })
 
 class CounterExplosionError extends Error {

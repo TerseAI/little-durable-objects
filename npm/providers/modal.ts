@@ -1,5 +1,5 @@
 import { AlreadyExistsError, ModalClient, NotFoundError } from "modal"
-import type { App, Sandbox } from "modal"
+import type { App, Image, Sandbox } from "modal"
 import { createHash } from "node:crypto"
 
 import { canonicalRegionForModal, modalPlacement } from "../regions.js"
@@ -18,6 +18,8 @@ interface ModalSandboxProviderOptions {
     readonly catalog?: CanonicalRegionCatalog
     readonly client?: ModalClient
 }
+
+type SandboxAcquisition = { readonly sandbox: Sandbox } | { readonly handle: ActorHostHandle }
 
 class ModalSandboxProvider implements SandboxProvider {
     private readonly modal: ModalClient
@@ -44,18 +46,27 @@ class ModalSandboxProvider implements SandboxProvider {
         validateEnsureRequest(request)
         const placement = modalPlacement(request.canonicalRegion, this.options.catalog)
         const [app, image] = await Promise.all([this.modal.apps.fromName(this.appName, { createIfMissing: true }), this.modal.images.fromId(request.imageRef)])
-        const existing = await this.existing(app, name)
-        if (existing) {
-            try {
-                return await this.readHandle(existing, request.canonicalRegion)
-            } catch {
-                await existing.terminate()
-            }
-        }
+        const existing = await this.reuseExisting(app, name, request.canonicalRegion)
+        if (existing) return existing
+        const acquired = await this.createSandbox(request, name, app, image, placement)
+        if ("handle" in acquired) return acquired.handle
+        return this.activate(acquired.sandbox, request)
+    }
 
-        let sandbox: Sandbox
+    private async reuseExisting(app: App, name: string, canonicalRegion: string): Promise<ActorHostHandle | undefined> {
+        const existing = await this.existing(app, name)
+        if (!existing) return undefined
         try {
-            sandbox = await this.modal.sandboxes.create(app, image, {
+            return await this.readHandle(existing, canonicalRegion)
+        } catch {
+            await existing.terminate()
+            return undefined
+        }
+    }
+
+    private async createSandbox(request: EnsureHostRequest, name: string, app: App, image: Image, placement: ReturnType<typeof modalPlacement>): Promise<SandboxAcquisition> {
+        try {
+            const sandbox = await this.modal.sandboxes.create(app, image, {
                 name,
                 timeoutMs: maximumSandboxLifetimeMs,
                 idleTimeoutMs: request.hostIdleTimeoutMs,
@@ -73,22 +84,28 @@ class ModalSandboxProvider implements SandboxProvider {
                 regions: [...placement.regions],
                 cloud: placement.cloud
             })
+            return { sandbox }
         } catch (error) {
             if (!(error instanceof AlreadyExistsError)) throw error
             const raced = (await this.existing(app, name)) ?? (await this.modal.sandboxes.fromName(this.appName, name))
-            return this.readHandle(raced, request.canonicalRegion)
+            return { handle: await this.readHandle(raced, request.canonicalRegion) }
         }
+    }
 
-        const observed = await runtimePlacement(sandbox)
-        const observedCanonical = canonicalRegionForModal(observed.cloud, observed.region, this.options.catalog)
-        if (observedCanonical !== request.canonicalRegion) {
-            await sandbox.terminate()
-            throw new Error(`Modal placed host in ${observedCanonical ?? "an unknown region"}; expected ${request.canonicalRegion}`)
-        }
-
+    private async activate(sandbox: Sandbox, request: EnsureHostRequest): Promise<ActorHostHandle> {
+        await this.validatePlacement(sandbox, request.canonicalRegion)
         const handle = await this.start(sandbox, request)
         await writeMetadata(sandbox, handle)
         return handle
+    }
+
+    private async validatePlacement(sandbox: Sandbox, expectedRegion: string): Promise<void> {
+        const observed = await runtimePlacement(sandbox)
+        const observedCanonical = canonicalRegionForModal(observed.cloud, observed.region, this.options.catalog)
+        if (observedCanonical !== expectedRegion) {
+            await sandbox.terminate()
+            throw new Error(`Modal placed host in ${observedCanonical ?? "an unknown region"}; expected ${expectedRegion}`)
+        }
     }
 
     private async existing(app: App, name: string): Promise<Sandbox | undefined> {

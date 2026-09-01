@@ -6,8 +6,11 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
+use subtle::ConstantTimeEq;
 
 use crate::{actor::ActorScope, postgres::PostgresDatabase};
+
+use super::{ActorJwtIssuer, issuer::IssuedActorToken};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HostLaunchSpec {
@@ -45,7 +48,8 @@ impl HostLaunchSpec {
 
 #[async_trait]
 pub(crate) trait AdminRegistry: Send + Sync {
-    async fn register_deployment(&self, spec: &HostLaunchSpec) -> Result<bool>;
+    async fn ensure_namespace_and_register_deployment(&self, spec: &HostLaunchSpec)
+    -> Result<bool>;
     async fn launch_spec(&self, namespace_id: &str) -> Result<Option<HostLaunchSpec>>;
 }
 
@@ -65,7 +69,10 @@ struct LocalAdminState {
 #[cfg(test)]
 #[async_trait]
 impl AdminRegistry for LocalAdminRegistry {
-    async fn register_deployment(&self, spec: &HostLaunchSpec) -> Result<bool> {
+    async fn ensure_namespace_and_register_deployment(
+        &self,
+        spec: &HostLaunchSpec,
+    ) -> Result<bool> {
         spec.validate()?;
         let mut state = self
             .state
@@ -103,7 +110,10 @@ impl PostgresAdminRegistry {
 
 #[async_trait]
 impl AdminRegistry for PostgresAdminRegistry {
-    async fn register_deployment(&self, spec: &HostLaunchSpec) -> Result<bool> {
+    async fn ensure_namespace_and_register_deployment(
+        &self,
+        spec: &HostLaunchSpec,
+    ) -> Result<bool> {
         spec.validate()?;
         Ok(self
             .database
@@ -163,6 +173,71 @@ impl AdminRegistry for PostgresAdminRegistry {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct AdminService {
+    token: String,
+    registry: std::sync::Arc<dyn AdminRegistry>,
+    issuer: ActorJwtIssuer,
+}
+
+impl AdminService {
+    pub(crate) fn new(
+        token: String,
+        registry: std::sync::Arc<dyn AdminRegistry>,
+        issuer: ActorJwtIssuer,
+    ) -> Result<Self> {
+        ensure!(
+            !token.is_empty() && token.trim() == token,
+            "admin token is invalid"
+        );
+        Ok(Self {
+            token,
+            registry,
+            issuer,
+        })
+    }
+
+    pub(crate) fn authenticate(&self, authorization: &str) -> Result<()> {
+        let token = authorization
+            .strip_prefix("Bearer ")
+            .context("admin credential must use Bearer authentication")?;
+        ensure!(
+            !token.is_empty()
+                && token.trim() == token
+                && bool::from(token.as_bytes().ct_eq(self.token.as_bytes())),
+            "admin credential is invalid"
+        );
+        Ok(())
+    }
+
+    pub(crate) async fn ensure_namespace_and_register_deployment(
+        &self,
+        spec: &HostLaunchSpec,
+    ) -> Result<bool> {
+        self.registry
+            .ensure_namespace_and_register_deployment(spec)
+            .await
+    }
+
+    pub(crate) async fn deployment_exists(&self, namespace_id: &str) -> Result<bool> {
+        Ok(self.registry.launch_spec(namespace_id).await?.is_some())
+    }
+
+    pub(crate) fn issue_workflow_token(
+        &self,
+        namespace_id: &str,
+        execution_id: &str,
+        deadline_unix_ms: i64,
+    ) -> Result<IssuedActorToken> {
+        self.issuer
+            .issue_workflow(namespace_id, execution_id, deadline_unix_ms)
+    }
+
+    pub(crate) fn jwks_json(&self) -> Result<Vec<u8>> {
+        self.issuer.jwks_json()
+    }
+}
+
 fn validate_namespace(namespace_id: &str) -> Result<()> {
     ActorScope {
         namespace_id: namespace_id.to_owned(),
@@ -202,11 +277,23 @@ mod tests {
     #[tokio::test]
     async fn registration_replaces_the_projects_active_revision() -> Result<()> {
         let registry = LocalAdminRegistry::default();
-        assert!(registry.register_deployment(&spec("im-1")).await?);
-        assert!(!registry.register_deployment(&spec("im-1")).await?);
+        assert!(
+            registry
+                .ensure_namespace_and_register_deployment(&spec("im-1"))
+                .await?
+        );
+        assert!(
+            !registry
+                .ensure_namespace_and_register_deployment(&spec("im-1"))
+                .await?
+        );
         let mut replacement = spec("im-2");
         replacement.code_revision = "revision-2".into();
-        assert!(registry.register_deployment(&replacement).await?);
+        assert!(
+            registry
+                .ensure_namespace_and_register_deployment(&replacement)
+                .await?
+        );
         assert_eq!(registry.launch_spec("project-1").await?, Some(replacement));
         assert!(
             registry
@@ -216,6 +303,37 @@ mod tests {
                 .namespaces
                 .contains("project-1")
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn postgres_registration_ensures_the_namespace_and_deployment_atomically() -> Result<()> {
+        let Some(url) = std::env::var("DURABLE_OBJECT_TEST_POSTGRES_URL").ok() else {
+            return Ok(());
+        };
+        let database = PostgresDatabase::connect(&url).await?;
+        let registry = PostgresAdminRegistry::from_database(database.clone());
+        let mut deployment = spec("image-1");
+        deployment.namespace_id = format!("project-{}", uuid::Uuid::new_v4());
+
+        assert!(
+            registry
+                .ensure_namespace_and_register_deployment(&deployment)
+                .await?
+        );
+        assert_eq!(
+            registry.launch_spec(&deployment.namespace_id).await?,
+            Some(deployment.clone())
+        );
+        let namespace_exists = database
+            .client()
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM durable_object_namespaces WHERE namespace_id = $1)",
+                &[&deployment.namespace_id],
+            )
+            .await?
+            .get::<_, bool>(0);
+        assert!(namespace_exists);
         Ok(())
     }
 }

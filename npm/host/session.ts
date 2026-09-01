@@ -23,7 +23,7 @@ class ActorSession {
     private startup: Promise<void> | undefined
     private connection: ActorSessionConnection | undefined
 
-    constructor() {}
+    constructor(private readonly settings = ActorSessionSettings.fromEnvironment(process.env)) {}
 
     start(): Promise<void> {
         this.startup ??= this.initialize()
@@ -31,15 +31,14 @@ class ActorSession {
     }
 
     private async initialize(): Promise<void> {
-        const settings = ActorSessionSettings.getInstance()
-        const actorEntrypointUrl = await resolveActorEntrypoint(settings.actorEntrypoint)
+        const actorEntrypointUrl = await resolveActorEntrypoint(this.settings.actorEntrypoint)
         const actorTypes = await loadActorEntrypoint(actorEntrypointUrl)
         const supervisor = new ActorWorkerSupervisor({
             actorEntrypointUrl,
-            actorIdleTimeoutMs: settings.actorIdleTimeoutMs
+            actorIdleTimeoutMs: this.settings.actorIdleTimeoutMs
         })
         const commandHandler = (command: ActorExecutorCommand): Promise<ActorExecutorReply> => supervisor.handle(command)
-        this.connection = await ActorSessionConnection.open(settings.socketPath, actorTypes, commandHandler, settings.startupTimeoutMs)
+        this.connection = await ActorSessionConnection.open(this.settings.socketPath, actorTypes, commandHandler, this.settings.startupTimeoutMs)
     }
 
     waitUntilDisconnected(): Promise<void> {
@@ -210,23 +209,12 @@ function parseActorIdleTimeout(value: string | undefined): number {
 }
 
 class ActorSessionSettings {
-    private static instance: ActorSessionSettings | undefined
-
     private constructor(
         readonly socketPath: string,
         readonly actorEntrypoint: string | undefined,
         readonly startupTimeoutMs: number,
         readonly actorIdleTimeoutMs: number
     ) {}
-
-    static getInstance(): ActorSessionSettings {
-        this.instance ??= ActorSessionSettings.fromEnvironment(process.env)
-        return this.instance
-    }
-
-    static resetForTests(): void {
-        this.instance = undefined
-    }
 
     static fromEnvironment(environment: NodeJS.ProcessEnv): ActorSessionSettings {
         const result = actorSessionSettingsSchema.safeParse(environment)
@@ -240,7 +228,6 @@ class ActorSessionSettings {
     }
 }
 
-/** Start the JavaScript executor inside a dedicated actor-host sandbox. */
 async function runActorHost(): Promise<never> {
     const session = new ActorSession()
     await session.start()

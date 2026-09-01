@@ -21,16 +21,15 @@ test("remote actor client sends one authenticated HTTP invocation", async () => 
         json(response, 200, { result: 7 })
     })
     const port = await listen(server)
-    RemoteActorClient.configure({
+    const client = new RemoteActorClient({
         token: "workflow-token",
         namespaceId: "project-1",
         controlPlaneUrl: `http://127.0.0.1:${port}`
     })
     try {
-        assert.equal(await RemoteActorClient.getInstance().invoke("Counter", "counter-1", "increment", [2]), 7)
+        assert.equal(await client.invoke("Counter", "counter-1", "increment", [2]), 7)
         assert.equal(calls, 1)
     } finally {
-        RemoteActorClient.resetForTests()
         await close(server)
     }
 })
@@ -42,12 +41,11 @@ test("does not retry a control-plane transport failure", async () => {
         request.socket.destroy()
     })
     const port = await listen(server)
-    RemoteActorClient.configure({ token: "workflow-token", namespaceId: "project-1", controlPlaneUrl: `http://127.0.0.1:${port}` })
+    const client = new RemoteActorClient({ token: "workflow-token", namespaceId: "project-1", controlPlaneUrl: `http://127.0.0.1:${port}` })
     try {
-        await assert.rejects(RemoteActorClient.getInstance().invoke("Counter", "counter-1", "increment", [2]), error => error instanceof ActorInvocationError && error.code === "outcome_unknown")
+        await assert.rejects(client.invoke("Counter", "counter-1", "increment", [2]), error => error instanceof ActorInvocationError && error.code === "outcome_unknown")
         assert.equal(calls, 1)
     } finally {
-        RemoteActorClient.resetForTests()
         await close(server)
     }
 })
@@ -63,14 +61,13 @@ test("preserves a structured actor failure from HTTP", async () => {
         })
     })
     const port = await listen(server)
-    RemoteActorClient.configure({ token: "workflow-token", namespaceId: "project-1", controlPlaneUrl: `http://127.0.0.1:${port}` })
+    const client = new RemoteActorClient({ token: "workflow-token", namespaceId: "project-1", controlPlaneUrl: `http://127.0.0.1:${port}` })
     try {
         await assert.rejects(
-            RemoteActorClient.getInstance().invoke("Counter", "counter-1", "increment", [2]),
+            client.invoke("Counter", "counter-1", "increment", [2]),
             error => error instanceof ActorInvocationError && error.code === "actor_error" && error.requestId === "server-request"
         )
     } finally {
-        RemoteActorClient.resetForTests()
         await close(server)
     }
 })

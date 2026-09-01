@@ -1,8 +1,10 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, ensure};
-use aws_lc_rs::signature::{ED25519, VerificationAlgorithm};
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use jsonwebtoken::{
+    Algorithm, DecodingKey, Validation, decode, decode_header,
+    jwk::{JwkSet, KeyAlgorithm},
+};
 use serde::Deserialize;
 use tonic::{Request, Status};
 
@@ -56,25 +58,15 @@ impl ActorPrincipal {
 
 #[derive(Clone)]
 pub(crate) struct ActorJwtVerifier {
-    public_keys: Arc<HashMap<String, Vec<u8>>>,
-    issuer: String,
-    audience: String,
+    public_keys: Arc<HashMap<String, DecodingKey>>,
+    validation: Validation,
     purpose: ActorTokenPurpose,
     max_lifetime: Duration,
 }
 
 #[derive(Deserialize)]
-struct JwtHeader {
-    alg: String,
-    kid: String,
-    typ: Option<String>,
-}
-
-#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ActorJwtClaims {
-    iss: String,
-    aud: JwtAudience,
     sub: String,
     namespace_id: String,
     #[serde(rename = "processId")]
@@ -87,24 +79,9 @@ struct ActorJwtClaims {
     code_revision: Option<String>,
     scope: String,
     iat: i64,
-    nbf: i64,
+    #[serde(rename = "nbf")]
+    _not_before: i64,
     exp: i64,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum JwtAudience {
-    One(String),
-    Many(Vec<String>),
-}
-
-impl JwtAudience {
-    fn contains(&self, expected: &str) -> bool {
-        match self {
-            Self::One(audience) => audience == expected,
-            Self::Many(audiences) => audiences.iter().any(|audience| audience == expected),
-        }
-    }
 }
 
 impl ActorJwtVerifier {
@@ -136,7 +113,7 @@ impl ActorJwtVerifier {
     }
 
     fn from_decoded_public_keys(
-        public_keys: HashMap<String, Vec<u8>>,
+        public_keys: HashMap<String, DecodingKey>,
         issuer: impl Into<String>,
         audience: impl Into<String>,
         purpose: ActorTokenPurpose,
@@ -154,10 +131,15 @@ impl ActorJwtVerifier {
         let audience = audience.into();
         ensure!(!issuer.is_empty(), "actor JWT issuer must not be empty");
         ensure!(!audience.is_empty(), "actor JWT audience must not be empty");
+        let mut validation = Validation::new(Algorithm::EdDSA);
+        validation.set_issuer(&[issuer]);
+        validation.set_audience(&[audience]);
+        validation.set_required_spec_claims(&["exp", "nbf", "iss", "aud", "sub"]);
+        validation.validate_nbf = true;
+        validation.leeway = CLOCK_SKEW.as_secs();
         Ok(Self {
             public_keys: Arc::new(public_keys),
-            issuer,
-            audience,
+            validation,
             purpose,
             max_lifetime,
         })
@@ -179,50 +161,36 @@ impl ActorJwtVerifier {
 
     pub(crate) fn authenticate_authorization(&self, authorization: &str) -> Result<ActorPrincipal> {
         let token = bearer_token(authorization)?;
-        let header = token_header(token).context("actor token header is invalid")?;
+        let header = decode_header(token).context("actor token header is invalid")?;
         self.verify_with_header(token, header)
     }
 
     #[cfg(test)]
     fn verify(&self, token: &str) -> Result<ActorPrincipal> {
-        self.verify_with_header(token, token_header(token)?)
+        self.verify_with_header(token, decode_header(token)?)
     }
 
-    fn verify_with_header(&self, token: &str, header: JwtHeader) -> Result<ActorPrincipal> {
-        let mut segments = token.split('.');
-        let encoded_header = segments.next().context("actor token omitted its header")?;
-        let encoded_claims = segments.next().context("actor token omitted its claims")?;
-        let encoded_signature = segments
-            .next()
-            .context("actor token omitted its signature")?;
-        ensure!(
-            segments.next().is_none(),
-            "actor token must contain exactly three segments"
-        );
-
-        ensure!(header.alg == "EdDSA", "actor token must use EdDSA");
+    fn verify_with_header(
+        &self,
+        token: &str,
+        header: jsonwebtoken::Header,
+    ) -> Result<ActorPrincipal> {
         ensure!(
             header.typ.as_deref().is_none_or(|value| value == "JWT"),
             "actor token has an invalid type"
         );
+        let key_id = header.kid.context("actor token key ID is empty")?;
         let public_key = self
             .public_keys
-            .get(&header.kid)
-            .with_context(|| format!("actor token uses unknown key ID {:?}", header.kid))?;
-        let signature = URL_SAFE_NO_PAD
-            .decode(encoded_signature)
-            .context("decode actor token signature")?;
-        let signing_input = format!("{encoded_header}.{encoded_claims}");
-        ED25519
-            .verify_sig(public_key, signing_input.as_bytes(), &signature)
-            .map_err(|_| anyhow::anyhow!("actor token signature is invalid"))?;
+            .get(&key_id)
+            .with_context(|| format!("actor token uses unknown key ID {key_id:?}"))?;
+        let claims = decode::<ActorJwtClaims>(token, public_key, &self.validation)
+            .context("verify actor JWT")?
+            .claims;
+        self.validate_claims(claims)
+    }
 
-        let claims: ActorJwtClaims = decode_json_segment(encoded_claims, "claims")?;
-        ensure!(claims.iss == self.issuer, "actor token issuer is invalid");
-        ensure!(
-            claims.aud.contains(&self.audience),
-            "actor token audience is invalid"
-        );
+    fn validate_claims(&self, claims: ActorJwtClaims) -> Result<ActorPrincipal> {
         ensure!(
             claims
                 .scope
@@ -260,15 +228,6 @@ impl ActorJwtVerifier {
             claims.iat <= now.saturating_add(skew_seconds),
             "actor token was issued in the future"
         );
-        ensure!(
-            claims.nbf <= now.saturating_add(skew_seconds),
-            "actor token is not active yet"
-        );
-        ensure!(
-            claims.exp > now.saturating_sub(skew_seconds),
-            "actor token expired"
-        );
-
         let principal = ActorPrincipal {
             scope: ActorScope {
                 namespace_id: claims.namespace_id,
@@ -306,44 +265,30 @@ impl ActorJwtVerifier {
     }
 }
 
-fn token_header(token: &str) -> Result<JwtHeader> {
-    let encoded_header = token
-        .split('.')
-        .next()
-        .context("actor token omitted its header")?;
-    let header: JwtHeader = decode_json_segment(encoded_header, "header")?;
-    ensure!(!header.kid.is_empty(), "actor token key ID is empty");
-    Ok(header)
-}
-
-fn decode_public_keys(public_keys_json: &str) -> Result<HashMap<String, Vec<u8>>> {
-    let encoded_keys: HashMap<String, String> = serde_json::from_str(public_keys_json)
-        .context("parse durable-object JWT public keys as a JSON object")?;
+fn decode_public_keys(public_keys_json: &str) -> Result<HashMap<String, DecodingKey>> {
+    let keys: JwkSet = serde_json::from_str(public_keys_json)
+        .context("parse durable-object JWT public keys as a JWK set")?;
     ensure!(
-        !encoded_keys.is_empty(),
+        !keys.keys.is_empty(),
         "durable-object JWT public keys must contain at least one key"
     );
-    encoded_keys
+    keys.keys
         .into_iter()
-        .map(|(key_id, encoded)| {
-            ensure!(!key_id.is_empty(), "actor JWT key ID must not be empty");
-            let key = URL_SAFE_NO_PAD
-                .decode(encoded)
-                .with_context(|| format!("decode actor JWT public key {key_id:?}"))?;
+        .map(|key| {
+            let key_id = key
+                .common
+                .key_id
+                .clone()
+                .context("actor JWT key ID must not be empty")?;
             ensure!(
-                key.len() == 32,
-                "actor JWT public key {key_id:?} must be a 32-byte Ed25519 key"
+                key.common.key_algorithm == Some(KeyAlgorithm::EdDSA),
+                "actor JWT public key {key_id:?} must use EdDSA"
             );
-            Ok((key_id, key))
+            let decoding_key = DecodingKey::from_jwk(&key)
+                .with_context(|| format!("decode actor JWT public key {key_id:?}"))?;
+            Ok((key_id, decoding_key))
         })
         .collect()
-}
-
-fn decode_json_segment<T: for<'de> Deserialize<'de>>(segment: &str, name: &str) -> Result<T> {
-    let bytes = URL_SAFE_NO_PAD
-        .decode(segment)
-        .with_context(|| format!("decode actor token {name}"))?;
-    serde_json::from_slice(&bytes).with_context(|| format!("parse actor token {name}"))
 }
 
 fn bearer_token(authorization: &str) -> Result<&str> {
@@ -370,6 +315,7 @@ mod tests {
         rand::SystemRandom,
         signature::{Ed25519KeyPair, KeyPair},
     };
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     use serde_json::json;
 
     use super::*;
@@ -377,10 +323,7 @@ mod tests {
     fn verifier_and_key_pair() -> Result<(ActorJwtVerifier, Ed25519KeyPair)> {
         let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())?;
         let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref())?;
-        let keys = serde_json::to_string(&HashMap::from([(
-            "test-key",
-            URL_SAFE_NO_PAD.encode(key_pair.public_key().as_ref()),
-        )]))?;
+        let keys = public_key_set(&key_pair)?;
         Ok((
             ActorJwtVerifier::new(
                 keys,
@@ -402,6 +345,19 @@ mod tests {
         let input = format!("{header}.{claims}");
         let signature = URL_SAFE_NO_PAD.encode(key_pair.sign(input.as_bytes()).as_ref());
         Ok(format!("{input}.{signature}"))
+    }
+
+    fn public_key_set(key_pair: &Ed25519KeyPair) -> Result<String> {
+        Ok(serde_json::to_string(&json!({
+            "keys": [{
+                "alg": "EdDSA",
+                "crv": "Ed25519",
+                "kid": "test-key",
+                "kty": "OKP",
+                "use": "sig",
+                "x": URL_SAFE_NO_PAD.encode(key_pair.public_key().as_ref())
+            }]
+        }))?)
     }
 
     fn valid_claims(now: i64) -> serde_json::Value {
@@ -444,10 +400,7 @@ mod tests {
     fn invocation_credentials_are_distinct_from_control_plane_credentials() -> Result<()> {
         let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())?;
         let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref())?;
-        let keys = serde_json::to_string(&HashMap::from([(
-            "test-key",
-            URL_SAFE_NO_PAD.encode(key_pair.public_key().as_ref()),
-        )]))?;
+        let keys = public_key_set(&key_pair)?;
         let invocation = ActorJwtVerifier::for_scope(
             &keys,
             "durable-object-control-plane",

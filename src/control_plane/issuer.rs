@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
@@ -6,8 +6,11 @@ use base64::{
     Engine,
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
+use jsonwebtoken::{
+    Algorithm, EncodingKey, Header, encode,
+    jwk::{Jwk, JwkSet, PublicKeyUse},
+};
 use serde::Serialize;
-use serde_json::json;
 
 use crate::host::{ActorProcessRole, HostId};
 
@@ -15,7 +18,8 @@ const WORKFLOW_DEADLINE_GRACE: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub(crate) struct ActorJwtIssuer {
-    key_pair: Arc<Ed25519KeyPair>,
+    encoding_key: EncodingKey,
+    public_key: Jwk,
     key_id: String,
     issuer: String,
     authority_audience: String,
@@ -61,11 +65,21 @@ impl ActorJwtIssuer {
         let pkcs8 = STANDARD
             .decode(encoded_key)
             .context("DURABLE_OBJECT_JWT_SIGNING_KEY must be base64-encoded PKCS#8")?;
-        let key_pair = Ed25519KeyPair::from_pkcs8(&pkcs8).map_err(|_| {
-            anyhow::anyhow!("DURABLE_OBJECT_JWT_SIGNING_KEY is not an Ed25519 PKCS#8 key")
-        })?;
+        let key_pair = Ed25519KeyPair::from_pkcs8(&pkcs8)
+            .context("DURABLE_OBJECT_JWT_SIGNING_KEY is not an Ed25519 PKCS#8 key")?;
+        let encoding_key = EncodingKey::from_ed_der(&pkcs8);
+        let mut public_key: Jwk = serde_json::from_value(serde_json::json!({
+            "alg": "EdDSA",
+            "crv": "Ed25519",
+            "kty": "OKP",
+            "x": URL_SAFE_NO_PAD.encode(key_pair.public_key().as_ref())
+        }))
+        .context("derive the actor JWT public key")?;
+        public_key.common.key_id = Some(key_id.clone());
+        public_key.common.public_key_use = Some(PublicKeyUse::Signature);
         Ok(Self {
-            key_pair: Arc::new(key_pair),
+            encoding_key,
+            public_key,
             key_id,
             issuer,
             authority_audience,
@@ -74,27 +88,14 @@ impl ActorJwtIssuer {
         })
     }
 
-    pub(crate) fn public_keys_json(&self) -> Result<String> {
-        Ok(serde_json::to_string(&json!({
-            self.key_id.clone(): URL_SAFE_NO_PAD.encode(self.key_pair.public_key().as_ref())
-        }))?)
-    }
-
     pub(crate) fn jwks_json(&self) -> Result<Vec<u8>> {
-        Ok(serde_json::to_vec(&json!({
-            "keys": [{
-                "alg": "EdDSA",
-                "crv": "Ed25519",
-                "kid": self.key_id,
-                "kty": "OKP",
-                "use": "sig",
-                "x": URL_SAFE_NO_PAD.encode(self.key_pair.public_key().as_ref())
-            }]
-        }))?)
+        Ok(serde_json::to_vec(&JwkSet {
+            keys: vec![self.public_key.clone()],
+        })?)
     }
 
     pub(crate) fn verifier_keys_json(&self) -> Result<String> {
-        self.public_keys_json()
+        Ok(String::from_utf8(self.jwks_json()?)?)
     }
 
     pub(crate) fn issue_workflow(
@@ -168,17 +169,10 @@ impl ActorJwtIssuer {
             .exp
             .checked_mul(1_000)
             .context("issued actor token expiration overflow")?;
-        let header = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&json!({
-            "alg": "EdDSA",
-            "kid": self.key_id,
-            "typ": "JWT"
-        }))?);
-        let claims = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims)?);
-        let signing_input = format!("{header}.{claims}");
-        let signature =
-            URL_SAFE_NO_PAD.encode(self.key_pair.sign(signing_input.as_bytes()).as_ref());
+        let mut header = Header::new(Algorithm::EdDSA);
+        header.kid = Some(self.key_id.clone());
         Ok(IssuedActorToken {
-            token: format!("{signing_input}.{signature}"),
+            token: encode(&header, &claims, &self.encoding_key).context("sign actor JWT")?,
             expires_at_ms,
         })
     }
@@ -214,4 +208,43 @@ fn unix_millis() -> Result<i64> {
 
 fn duration_millis(duration: Duration) -> Result<i64> {
     i64::try_from(duration.as_millis()).context("duration exceeds supported JWT range")
+}
+
+#[cfg(test)]
+mod tests {
+    use aws_lc_rs::{rand::SystemRandom, signature::Ed25519KeyPair};
+    use base64::{Engine, engine::general_purpose::STANDARD};
+
+    use super::*;
+    use crate::control_plane::{ActorJwtVerifier, ActorTokenPurpose};
+
+    #[test]
+    fn issued_workflow_tokens_round_trip_through_the_public_key_set() -> Result<()> {
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())?;
+        let issuer = ActorJwtIssuer::from_base64_pkcs8(
+            &STANDARD.encode(pkcs8.as_ref()),
+            "test-key",
+            "issuer",
+            "authority",
+            "invocation",
+            Duration::from_secs(60),
+        )?;
+        let verifier = ActorJwtVerifier::for_scope(
+            issuer.verifier_keys_json()?,
+            "issuer",
+            "invocation",
+            ActorTokenPurpose::Invocation,
+            Duration::from_secs(60),
+        )?;
+        let issued = issuer.issue_workflow("project-1", "execution-1", unix_millis()? + 10_000)?;
+
+        let principal = verifier.authenticate_authorization(&format!("Bearer {}", issued.token))?;
+
+        assert_eq!(principal.scope.namespace_id, "project-1");
+        assert_eq!(principal.process_role, ActorProcessRole::Workflow);
+        let jwks: serde_json::Value = serde_json::from_slice(&issuer.jwks_json()?)?;
+        assert_eq!(jwks["keys"][0]["kid"], "test-key");
+        assert_eq!(jwks["keys"][0]["crv"], "Ed25519");
+        Ok(())
+    }
 }

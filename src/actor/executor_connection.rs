@@ -15,9 +15,10 @@ use serde_json::Value;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, unix::OwnedWriteHalf},
-    sync::{Mutex as AsyncMutex, oneshot, watch},
+    sync::{Mutex as AsyncMutex, oneshot},
     task::JoinHandle,
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use super::{ActorInvocationFailure, ActorKey};
@@ -150,7 +151,7 @@ impl ActorExecutorConnection {
         Ok(())
     }
 
-    pub(crate) async fn run(mut self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
+    pub(crate) async fn run(mut self, shutdown: CancellationToken) -> Result<()> {
         tokio::select! {
             result = &mut self.task => {
                 match result {
@@ -158,7 +159,7 @@ impl ActorExecutorConnection {
                     Err(error) => Err(error.into()),
                 }
             }
-            _ = wait_for_shutdown(&mut shutdown) => {
+            _ = shutdown.cancelled() => {
                 self.executor.close().await;
                 self.task.abort();
                 let _ = (&mut self.task).await;
@@ -368,12 +369,6 @@ async fn remove_socket(path: &Path) -> Result<()> {
     }
 }
 
-async fn wait_for_shutdown(receiver: &mut watch::Receiver<bool>) {
-    if !*receiver.borrow() {
-        let _ = receiver.changed().await;
-    }
-}
-
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ActorExecutorServerMessage {
@@ -435,8 +430,8 @@ mod tests {
         connection.mark_ready().await?;
         assert!(executor.supports("counter"));
 
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let connection_task = tokio::spawn(connection.run(shutdown_rx));
+        let shutdown = CancellationToken::new();
+        let connection_task = tokio::spawn(connection.run(shutdown.clone()));
         let outcome = executor
             .invoke(ActorMethodInvocation {
                 request_id: "request-1".into(),
@@ -457,7 +452,7 @@ mod tests {
                 state: json!({ "count": 2 }),
             }
         );
-        shutdown_tx.send(true)?;
+        shutdown.cancel();
         connection_task.await??;
         customer.await??;
         Ok(())
