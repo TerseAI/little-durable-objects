@@ -1,12 +1,12 @@
 [package]
-name = "durable-object-runtime"
+name = "little-durable-objects"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
-default-run = "durable-object-runtime"
+default-run = "little-durable-objects"
 description = "Standalone regional durable-object control plane, host, and durability runtime"
 readme = "README.md"
-repository = "https://github.com/TerseAI/lil-durable-objects"
+repository = "https://github.com/TerseAI/little-durable-objects"
 license = "MIT"
 keywords = ["actors", "distributed-systems", "durable-objects", "serverless"]
 categories = ["asynchronous", "network-programming"]

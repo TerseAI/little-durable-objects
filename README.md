@@ -1,4 +1,4 @@
-# lil-durable-objects
+# little-durable-objects
 
 A small, provider-neutral durable-object runtime. Modal is the first sandbox provider; actor state is stored as NDJSON in regional GCS buckets and coordination lives in Postgres.
 
@@ -7,16 +7,16 @@ A small, provider-neutral durable-object runtime. Modal is the first sandbox pro
 Install the TypeScript API in actor and workflow projects:
 
 ```sh
-pnpm add lil-durable-objects
+pnpm add little-durable-objects
 ```
 
 Install the Rust runtime from crates.io:
 
 ```sh
-cargo install durable-object-runtime --locked
+cargo install little-durable-objects --locked
 ```
 
-Container builds can copy the binary from `ghcr.io/terseai/lil-durable-objects:latest`. The image is a runtime base, not a complete actor sandbox: actor images also need Node.js, the project code, and `lil-durable-objects` in the project's dependencies.
+Container builds can copy the binary from `ghcr.io/terseai/little-durable-objects:latest`. The image is a runtime base, not a complete actor sandbox: actor images also need Node.js, the project code, and `little-durable-objects` in the project's dependencies.
 
 ## Quickstart
 
@@ -46,13 +46,13 @@ Container builds can copy the binary from `ghcr.io/terseai/lil-durable-objects:l
    export MODAL_TOKEN_ID=...
    export MODAL_TOKEN_SECRET=...
 
-   ./target/release/durable-object-runtime
+   ./target/release/little-durable-objects
    ```
 
 4. Export actors from `src/durable-objects.ts` in your project:
 
    ```ts
-   import { Actor } from "lil-durable-objects"
+   import { Actor } from "little-durable-objects"
 
    export class Counter extends Actor {
      count = 0
@@ -71,12 +71,12 @@ Container builds can copy the binary from `ghcr.io/terseai/lil-durable-objects:l
 
    The deployment call atomically ensures the namespace and registers its active deployment. Its body is `{ "codeRevision", "imageRef", "workingDirectory", "actorEntrypoint" }`. The workflow-token body is `{ "executionId", "deadlineUnixMs" }`.
 
-   `image_ref` is a Modal image containing Node.js, your built project, its dependencies, and `durable-object-runtime` at `/usr/local/bin/durable-object-runtime`.
+   `image_ref` is a Modal image containing Node.js, your built project, its dependencies, and `little-durable-objects` at `/usr/local/bin/little-durable-objects`.
 
 6. Give the issued project token to the workflow and call the actor. The package sends an authenticated JSON `POST` to the control plane:
 
    ```ts
-   import { configureDurableObjects } from "lil-durable-objects"
+   import { configureDurableObjects } from "little-durable-objects"
    import { Counter } from "./durable-objects.js"
 
    configureDurableObjects({

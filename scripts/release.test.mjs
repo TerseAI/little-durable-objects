@@ -1,21 +1,22 @@
 import assert from "node:assert/strict"
+import { readFile } from "node:fs/promises"
 import { test } from "node:test"
 
 import { parseVersion, readReleaseVersion, stampReleaseVersion, verifyReleaseVersion } from "./release.mjs"
 
 const manifests = {
     cargoLock: `[[package]]
-name = "durable-object-runtime"
+name = "little-durable-objects"
 version = "0.4.7"
 dependencies = []
 `,
     cargoToml: `[package]
-name = "durable-object-runtime"
+name = "little-durable-objects"
 version = "0.4.7"
 edition = "2024"
 `,
     npmPackage: `{
-    "name": "lil-durable-objects",
+    "name": "little-durable-objects",
     "version": "0.4.7"
 }
 `
@@ -45,4 +46,9 @@ test("accepts stable semantic versions only", () => {
     for (const invalid of ["v1.2.3", "1.2", "1.2.3-beta.1", "01.2.3"]) {
         assert.throws(() => parseVersion(invalid), /version must look like 1\.2\.3/iu)
     }
+})
+
+test("container builds include compile-time migration assets", async () => {
+    const dockerfile = await readFile(new URL("../Dockerfile", import.meta.url), "utf8")
+    assert.match(dockerfile, /^COPY migrations \.\/migrations$/mu)
 })

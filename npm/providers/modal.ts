@@ -32,7 +32,7 @@ class ModalSandboxProvider implements SandboxProvider {
     constructor(private readonly options: ModalSandboxProviderOptions = {}) {
         this.modal = options.client ?? new ModalClient()
         this.appName = options.appName ?? "durable-object-hosts"
-        this.binaryPath = options.binaryPath ?? "/usr/local/bin/durable-object-runtime"
+        this.binaryPath = options.binaryPath ?? "/usr/local/bin/little-durable-objects"
     }
 
     async ensureHost(request: EnsureHostRequest): Promise<ActorHostHandle> {
@@ -75,12 +75,13 @@ class ModalSandboxProvider implements SandboxProvider {
                 command: [
                     "sh",
                     "-c",
-                    'until test -s "$1"; do sleep 0.05; done; export DURABLE_OBJECT_HOST_ROUTE="$(cat "$1")"; "$2" 2>"$3"; status=$?; printf \'%s\n\' "$status" >"$4"; sleep 300; exit "$status"',
+                    'until test -s "$1"; do sleep 0.05; done; export DURABLE_OBJECT_HOST_ROUTE="$(cat "$1")"; "$2" 2>"$3"; status=$?; printf \'%s\n\' "$status" >"$4"; if ! test -f "$5"; then sleep 60; fi; exit "$status"',
                     "durable-object-host-bootstrap",
                     hostRouteFile,
                     this.binaryPath,
                     hostStderrFile,
-                    hostExitedFile
+                    hostExitedFile,
+                    readyFile
                 ],
                 workdir: request.workingDirectory,
                 env: hostEnvironment(request),

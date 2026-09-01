@@ -416,41 +416,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
-name = "durable-object-runtime"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "aws-lc-rs",
- "axum",
- "base64",
- "bytes",
- "google-cloud-auth",
- "google-cloud-storage",
- "jsonwebtoken",
- "native-tls",
- "postgres-native-tls",
- "prost",
- "protoc-bin-vendored",
- "refinery",
- "reqwest",
- "serde",
- "serde_json",
- "subtle",
- "tempfile",
- "tokio",
- "tokio-postgres",
- "tokio-stream",
- "tokio-util",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
 name = "dyn-clone"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1427,6 +1392,41 @@ name = "litemap"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
+
+[[package]]
+name = "little-durable-objects"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aws-lc-rs",
+ "axum",
+ "base64",
+ "bytes",
+ "google-cloud-auth",
+ "google-cloud-storage",
+ "jsonwebtoken",
+ "native-tls",
+ "postgres-native-tls",
+ "prost",
+ "protoc-bin-vendored",
+ "refinery",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "subtle",
+ "tempfile",
+ "tokio",
+ "tokio-postgres",
+ "tokio-stream",
+ "tokio-util",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
 
 [[package]]
 name = "lock_api"

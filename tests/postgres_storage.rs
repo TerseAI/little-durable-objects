@@ -1,7 +1,7 @@
 use std::env;
 
 use anyhow::Result;
-use durable_object_runtime::{
+use little_durable_objects::{
     actor_state::ActorStorageKey,
     host::HostId,
     host_leases::{HostLeaseRegistry, HostLeaseRequest, HostLeaseStore, PostgresHostLeaseStore},

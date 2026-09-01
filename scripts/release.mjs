@@ -45,7 +45,7 @@ export function verifyReleaseVersion(manifests, expected) {
 export function stampReleaseVersion(manifests, version) {
     parseVersion(version)
     return {
-        cargoLock: replaceOne(manifests.cargoLock, /^(\[\[package\]\]\nname = "durable-object-runtime"\nversion = ")[^"]+(")/mu, `$1${version}$2`, "Cargo.lock"),
+        cargoLock: replaceOne(manifests.cargoLock, /^(\[\[package\]\]\nname = "little-durable-objects"\nversion = ")[^"]+(")/mu, `$1${version}$2`, "Cargo.lock"),
         cargoToml: replaceOne(manifests.cargoToml, /^(version = ")[^"]+(")/mu, `$1${version}$2`, "Cargo.toml"),
         npmPackage: replaceOne(manifests.npmPackage, /^( {4}"version": ")[^"]+(",?)/mu, `$1${version}$2`, "npm/package.json")
     }
@@ -72,7 +72,7 @@ function manifestVersions(manifests) {
         { path: manifestFiles.cargoToml, version: matchVersion(manifests.cargoToml, /^version = "([^"]+)"/mu, manifestFiles.cargoToml) },
         {
             path: manifestFiles.cargoLock,
-            version: matchVersion(manifests.cargoLock, /^\[\[package\]\]\nname = "durable-object-runtime"\nversion = "([^"]+)"/mu, manifestFiles.cargoLock)
+            version: matchVersion(manifests.cargoLock, /^\[\[package\]\]\nname = "little-durable-objects"\nversion = "([^"]+)"/mu, manifestFiles.cargoLock)
         },
         { path: manifestFiles.npmPackage, version: JSON.parse(manifests.npmPackage).version }
     ]

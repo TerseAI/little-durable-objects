@@ -1,5 +1,5 @@
 use anyhow::Result;
-use durable_object_runtime::{
+use little_durable_objects::{
     control_plane::{ControlPlaneProcessConfig, serve_control_plane},
     host::{ActorHostConfig, serve_actor_host},
 };

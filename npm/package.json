@@ -1,5 +1,5 @@
 {
-    "name": "lil-durable-objects",
+    "name": "little-durable-objects",
     "version": "0.1.0",
     "description": "Provider-neutral durable objects for sandbox compute",
     "type": "module",
@@ -18,12 +18,12 @@
     ],
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/TerseAI/lil-durable-objects.git",
+        "url": "git+https://github.com/TerseAI/little-durable-objects.git",
         "directory": "npm"
     },
-    "homepage": "https://github.com/TerseAI/lil-durable-objects#readme",
+    "homepage": "https://github.com/TerseAI/little-durable-objects#readme",
     "bugs": {
-        "url": "https://github.com/TerseAI/lil-durable-objects/issues"
+        "url": "https://github.com/TerseAI/little-durable-objects/issues"
     },
     "publishConfig": {
         "access": "public"
@@ -31,7 +31,7 @@
     "main": "dist/index.js",
     "types": "dist/index.d.ts",
     "bin": {
-        "lil-durable-objects-modal": "./dist/providers/modalCli.js"
+        "little-durable-objects-modal": "./dist/providers/modalCli.js"
     },
     "exports": {
         ".": {

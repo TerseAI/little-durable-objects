@@ -322,7 +322,7 @@ fn spawn_javascript_process() -> Result<tokio::process::Child> {
         .args([
             "--input-type=module",
             "--eval",
-            "import(\"lil-durable-objects/host\").then(module => module.runDurableObjectHost())",
+            "import(\"little-durable-objects/host\").then(module => module.runDurableObjectHost())",
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())

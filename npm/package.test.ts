@@ -18,15 +18,15 @@ interface PackageMetadata {
 
 test("package metadata describes a public, buildable MIT package", async () => {
     const metadata = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8")) as PackageMetadata
-    assert.equal(metadata.name, "lil-durable-objects")
+    assert.equal(metadata.name, "little-durable-objects")
     assert.equal(metadata.license, "MIT")
     assert.equal(metadata.engines?.node, ">=20")
     assert.equal(metadata.publishConfig?.access, "public")
-    assert.equal(metadata.repository?.url, "git+https://github.com/TerseAI/lil-durable-objects.git")
+    assert.equal(metadata.repository?.url, "git+https://github.com/TerseAI/little-durable-objects.git")
     assert.equal(metadata.repository?.directory, "npm")
-    assert.equal(metadata.homepage, "https://github.com/TerseAI/lil-durable-objects#readme")
-    assert.equal(metadata.bugs?.url, "https://github.com/TerseAI/lil-durable-objects/issues")
-    assert.equal(metadata.bin?.["lil-durable-objects-modal"], "./dist/providers/modalCli.js")
+    assert.equal(metadata.homepage, "https://github.com/TerseAI/little-durable-objects#readme")
+    assert.equal(metadata.bugs?.url, "https://github.com/TerseAI/little-durable-objects/issues")
+    assert.equal(metadata.bin?.["little-durable-objects-modal"], "./dist/providers/modalCli.js")
     assert.ok(metadata.files?.includes("LICENSE.md"))
     assert.equal(metadata.scripts?.prepack, "pnpm run clean && pnpm run build && pnpm run package:check")
 })
