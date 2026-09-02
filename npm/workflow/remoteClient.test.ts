@@ -7,28 +7,61 @@ import { ActorInvocationError } from "../shared/errors.js"
 
 import { RemoteActorClient } from "./remoteClient.js"
 
-test("remote actor client sends one authenticated HTTP invocation", async () => {
-    let calls = 0
+test("remote actor client resolves once and invokes the actor host directly", async () => {
+    let resolutions = 0
+    const hostInvocations: unknown[] = []
     const server = createServer(async (request, response) => {
-        calls += 1
+        resolutions += 1
         assert.equal(request.method, "POST")
-        assert.equal(request.url, "/v1/namespaces/project-1/actors/Counter/counter-1/invocations")
+        assert.equal(request.url, "/v1/namespaces/project-1/actors/Counter/counter-1/target")
         assert.equal(request.headers.authorization, "Bearer workflow-token")
-        const body = JSON.parse(await readBody(request)) as Record<string, unknown>
-        assert.equal(body.method, "increment")
-        assert.deepEqual(body.args, [2])
-        assert.equal(body.timeoutMs, undefined)
-        json(response, 200, { result: 7 })
+        json(response, 200, {
+            route: "https://actor.example.com",
+            token: "direct-token",
+            ownerEpoch: 3,
+            stateReadUrl: "https://storage.example.com/state",
+            expiresAtMs: 4_000_000_000_000
+        })
     })
     const port = await listen(server)
-    const client = new RemoteActorClient({
-        token: "workflow-token",
-        namespaceId: "project-1",
-        controlPlaneUrl: `http://127.0.0.1:${port}`
-    })
+    const client = new RemoteActorClient(
+        {
+            token: "workflow-token",
+            namespaceId: "project-1",
+            controlPlaneUrl: `http://127.0.0.1:${port}`
+        },
+        {
+            requestId: () => "00000000-0000-4000-8000-000000000000",
+            actorHost: {
+                async invoke(target, invocation) {
+                    hostInvocations.push({ target, invocation })
+                    return { type: "completed", result: 7 }
+                }
+            }
+        }
+    )
     try {
         assert.equal(await client.invoke("Counter", "counter-1", "increment", [2]), 7)
-        assert.equal(calls, 1)
+        assert.equal(await client.invoke("Counter", "counter-1", "increment", [3]), 7)
+        assert.equal(resolutions, 1)
+        assert.equal(hostInvocations.length, 2)
+        assert.deepEqual(hostInvocations[0], {
+            target: {
+                route: "https://actor.example.com",
+                token: "direct-token",
+                ownerEpoch: 3,
+                stateReadUrl: "https://storage.example.com/state",
+                expiresAtMs: 4_000_000_000_000
+            },
+            invocation: {
+                requestId: "00000000-0000-4000-8000-000000000000",
+                namespaceId: "project-1",
+                actorType: "Counter",
+                actorId: "counter-1",
+                method: "increment",
+                args: [2]
+            }
+        })
     } finally {
         await close(server)
     }
@@ -45,6 +78,29 @@ test("does not retry a control-plane transport failure", async () => {
     try {
         await assert.rejects(client.invoke("Counter", "counter-1", "increment", [2]), error => error instanceof ActorInvocationError && error.code === "outcome_unknown")
         assert.equal(calls, 1)
+    } finally {
+        await close(server)
+    }
+})
+
+test("falls back to proxied invocation with an older control plane", async () => {
+    const calls: string[] = []
+    const server = createServer(async (request, response) => {
+        calls.push(request.url ?? "")
+        if (request.url?.endsWith("/target")) {
+            json(response, 404, { error: { code: "not_found", message: "not found" } })
+            return
+        }
+        const body = JSON.parse(await readBody(request)) as Record<string, unknown>
+        assert.equal(body.method, "increment")
+        assert.deepEqual(body.args, [2])
+        json(response, 200, { result: 7 })
+    })
+    const port = await listen(server)
+    const client = new RemoteActorClient({ token: "workflow-token", namespaceId: "project-1", controlPlaneUrl: `http://127.0.0.1:${port}` })
+    try {
+        assert.equal(await client.invoke("Counter", "counter-1", "increment", [2]), 7)
+        assert.deepEqual(calls, ["/v1/namespaces/project-1/actors/Counter/counter-1/target", "/v1/namespaces/project-1/actors/Counter/counter-1/invocations"])
     } finally {
         await close(server)
     }

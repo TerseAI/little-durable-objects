@@ -17,7 +17,9 @@ use crate::{
     host::{ActorProcessRole, HostId},
     host_leases::{HostLease, HostLeaseStore},
     placement::{ObjectPlacement, ObjectPlacementStore, PlacementClaim},
-    sandbox::{EnsureHostRequest, HostSandboxRuntimeConfig, SandboxProvider},
+    sandbox::{
+        EnsureHostRequest, HostSandboxRuntimeConfig, ImageWarmup, SandboxProvider, WarmImageRequest,
+    },
     storage_urls::StorageUrlSigner,
 };
 
@@ -95,6 +97,54 @@ impl ControlPlaneService {
         self.auth.authenticate_authorization(authorization)
     }
 
+    pub(super) fn warm_deployment_image(&self, spec: HostLaunchSpec, region: String) {
+        let Some(provisioner) = self
+            .routing
+            .as_ref()
+            .and_then(|routing| routing.provisioner.clone())
+        else {
+            return;
+        };
+        if !self.storage_urls.regions().contains(&region) {
+            warn!(
+                event = "actor_image_warmup",
+                namespace_id = %spec.namespace_id,
+                code_revision = %spec.code_revision,
+                region,
+                outcome = "invalid_region",
+                "actor image warmup skipped"
+            );
+            return;
+        }
+        tokio::spawn(async move {
+            let started_at = Instant::now();
+            match provisioner.warm_image(&spec, &region).await {
+                Ok(warmup) => info!(
+                    event = "actor_image_warmup",
+                    namespace_id = %spec.namespace_id,
+                    code_revision = %spec.code_revision,
+                    region,
+                    provider = %warmup.provider,
+                    provider_resource_id = %warmup.resource_id,
+                    provider_total_ms = warmup.total_ms,
+                    total_ms = elapsed_ms(started_at),
+                    outcome = "warmed",
+                    "actor image warmup completed"
+                ),
+                Err(error) => warn!(
+                    event = "actor_image_warmup",
+                    namespace_id = %spec.namespace_id,
+                    code_revision = %spec.code_revision,
+                    region,
+                    total_ms = elapsed_ms(started_at),
+                    outcome = "failed",
+                    error = %format!("{error:#}"),
+                    "actor image warmup failed"
+                ),
+            }
+        });
+    }
+
     pub(super) async fn invoke_workflow(
         &self,
         principal: ActorPrincipal,
@@ -118,6 +168,52 @@ impl ControlPlaneService {
             "actor ownership changed repeatedly before execution",
         )
     }
+
+    pub(super) async fn resolve_workflow_target(
+        &self,
+        principal: &ActorPrincipal,
+        actor: &ActorKey,
+    ) -> Result<WorkflowActorTarget> {
+        actor.validate()?;
+        ensure!(
+            principal.process_role == ActorProcessRole::Workflow && principal.scope.contains(actor),
+            "workflow token cannot resolve this actor"
+        );
+        let target = self.route_actor(actor, &principal.region).await?;
+        let state_read_url = self
+            .storage_urls
+            .read_url(&target.placement.home_region, actor)
+            .await?;
+        let issued = self
+            .host_token_issuer
+            .as_ref()
+            .context("JWT issuer is not configured")?
+            .issue_invocation_target(
+                actor,
+                &target.lease.id,
+                &target.lease.session_id,
+                &target.spec.code_revision,
+                &target.placement.home_region,
+                target.placement.owner_epoch,
+                &state_read_url,
+                principal.expires_at,
+            )?;
+        Ok(WorkflowActorTarget {
+            route: target.lease.route,
+            token: issued.token,
+            owner_epoch: target.placement.owner_epoch,
+            state_read_url,
+            expires_at_ms: issued.expires_at_ms,
+        })
+    }
+}
+
+pub(super) struct WorkflowActorTarget {
+    pub route: String,
+    pub token: String,
+    pub owner_epoch: u64,
+    pub state_read_url: String,
+    pub expires_at_ms: i64,
 }
 
 #[tonic::async_trait]
@@ -470,6 +566,7 @@ fn select_target_region(
 #[async_trait]
 pub(crate) trait HostProvisioner: Send + Sync {
     async fn ensure_host(&self, spec: &HostLaunchSpec, region: &str) -> Result<HostLease>;
+    async fn warm_image(&self, spec: &HostLaunchSpec, region: &str) -> Result<ImageWarmup>;
 }
 
 pub(crate) struct SandboxHostProvisioner {
@@ -548,6 +645,17 @@ impl HostProvisioner for SandboxHostProvisioner {
             "actor host provisioning completed"
         );
         Ok(lease)
+    }
+
+    async fn warm_image(&self, spec: &HostLaunchSpec, region: &str) -> Result<ImageWarmup> {
+        self.provider
+            .warm_image(&WarmImageRequest {
+                namespace_id: spec.namespace_id.clone(),
+                code_revision: spec.code_revision.clone(),
+                canonical_region: region.to_owned(),
+                image_ref: spec.image_ref.clone(),
+            })
+            .await
     }
 }
 
@@ -945,7 +1053,7 @@ mod tests {
     #[async_trait]
     impl StorageUrlSigner for FakeStorageUrls {
         async fn read_url(&self, _region: &str, _actor: &ActorKey) -> Result<String> {
-            anyhow::bail!("the injected host invoker should own read authorization")
+            Ok("https://storage.example.com/state".into())
         }
 
         async fn write_url(
@@ -977,6 +1085,66 @@ mod tests {
             }
             .into())
         }
+    }
+
+    struct FakeWarmProvisioner {
+        warmed: tokio::sync::mpsc::UnboundedSender<(HostLaunchSpec, String)>,
+    }
+
+    #[async_trait]
+    impl HostProvisioner for FakeWarmProvisioner {
+        async fn ensure_host(&self, _spec: &HostLaunchSpec, _region: &str) -> Result<HostLease> {
+            anyhow::bail!("host creation is outside this test")
+        }
+
+        async fn warm_image(&self, spec: &HostLaunchSpec, region: &str) -> Result<ImageWarmup> {
+            self.warmed.send((spec.clone(), region.to_owned()))?;
+            Ok(ImageWarmup {
+                provider: "test".into(),
+                resource_id: "sandbox-1".into(),
+                total_ms: 1,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn deployment_image_warmup_runs_in_the_background_without_creating_an_actor() -> Result<()>
+    {
+        let issuer = test_issuer()?;
+        let auth = ActorJwtVerifier::for_scope(
+            issuer.verifier_keys_json()?,
+            "issuer",
+            "invocation",
+            ActorTokenPurpose::Invocation,
+            Duration::from_secs(60),
+        )?;
+        let leases = Arc::new(FakeLeaseStore {
+            leases: Mutex::new(HashMap::new()),
+        });
+        let placements = Arc::new(LocalObjectPlacementStore::default());
+        let registry = Arc::new(LocalAdminRegistry::default());
+        let (warmed_tx, mut warmed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let service = ControlPlaneService::new(leases, placements, Arc::new(FakeStorageUrls), auth)
+            .with_routing(
+                registry,
+                issuer,
+                Some(Arc::new(FakeWarmProvisioner { warmed: warmed_tx })),
+            );
+        let spec = HostLaunchSpec {
+            namespace_id: "project-1".into(),
+            code_revision: "revision-1".into(),
+            image_ref: "image-1".into(),
+            working_directory: "/workspace".into(),
+            actor_entrypoint: None,
+        };
+
+        service.warm_deployment_image(spec.clone(), "us-east".into());
+
+        let warmed = tokio::time::timeout(Duration::from_secs(1), warmed_rx.recv())
+            .await?
+            .context("warmup task stopped")?;
+        assert_eq!(warmed, (spec, "us-east".into()));
+        Ok(())
     }
 
     #[tokio::test]
@@ -1036,6 +1204,7 @@ mod tests {
                     region: "auto".into(),
                     code_revision: None,
                     expires_at: i64::MAX,
+                    invocation: None,
                 },
                 ActorInvocation {
                     request_id: "request-1".into(),
@@ -1051,6 +1220,89 @@ mod tests {
             ActorExecutionResult::Completed {
                 result: json!({ "count": 1 })
             }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workflow_target_resolves_a_direct_host_capability() -> Result<()> {
+        let issuer = test_issuer()?;
+        let auth = ActorJwtVerifier::for_scope(
+            issuer.verifier_keys_json()?,
+            "issuer",
+            "invocation",
+            ActorTokenPurpose::Invocation,
+            Duration::from_secs(60),
+        )?;
+        let host_id = HostId::new("host.v1.project-1.revision-1.host-1");
+        let leases = Arc::new(FakeLeaseStore {
+            leases: Mutex::new(HashMap::from([(
+                host_id.clone(),
+                HostLease {
+                    id: host_id.clone(),
+                    session_id: "00000000-0000-4000-8000-000000000001".into(),
+                    route: "https://actor.example.com/".into(),
+                    expires_at_ms: 10_000,
+                },
+            )])),
+        });
+        let placements = Arc::new(LocalObjectPlacementStore::default());
+        let registry = Arc::new(LocalAdminRegistry::default());
+        let actor = ActorKey {
+            namespace_id: "project-1".into(),
+            actor_type: "Counter".into(),
+            actor_id: "counter-1".into(),
+        };
+        registry
+            .ensure_namespace_and_register_deployment(&HostLaunchSpec {
+                namespace_id: "project-1".into(),
+                code_revision: "revision-1".into(),
+                image_ref: "image-1".into(),
+                working_directory: "/workspace".into(),
+                actor_entrypoint: None,
+            })
+            .await?;
+        placements
+            .claim(&actor.storage_key(), None, &host_id, "us-east")
+            .await?;
+        let service = ControlPlaneService::new(leases, placements, Arc::new(FakeStorageUrls), auth)
+            .with_routing(registry, issuer.clone(), None);
+
+        let target = service
+            .resolve_workflow_target(
+                &ActorPrincipal {
+                    scope: ActorScope {
+                        namespace_id: "project-1".into(),
+                    },
+                    host_id: HostId::new("workflow.v1.project-1.execution-1"),
+                    session_id: uuid::Uuid::new_v4().to_string(),
+                    process_role: ActorProcessRole::Workflow,
+                    region: "us-east".into(),
+                    code_revision: None,
+                    expires_at: unix_seconds()? + 30,
+                    invocation: None,
+                },
+                &actor,
+            )
+            .await?;
+
+        assert_eq!(target.route, "https://actor.example.com/");
+        assert_eq!(target.owner_epoch, 1);
+        assert_eq!(target.state_read_url, "https://storage.example.com/state");
+        let verifier = ActorJwtVerifier::for_scope(
+            issuer.verifier_keys_json()?,
+            "issuer",
+            "invocation",
+            ActorTokenPurpose::Invocation,
+            Duration::from_secs(60),
+        )?;
+        let principal = verifier.authenticate_authorization(&format!("Bearer {}", target.token))?;
+        assert_eq!(
+            principal
+                .invocation
+                .expect("direct invocation capability")
+                .actor,
+            actor
         );
         Ok(())
     }

@@ -37,10 +37,24 @@ interface ActorHostProvisioning {
     readonly totalMs: number
 }
 
-interface SandboxProvider {
-    ensureHost(request: EnsureHostRequest): Promise<ActorHostHandle>
+interface WarmImageRequest {
+    readonly namespaceId: string
+    readonly codeRevision: string
+    readonly canonicalRegion: string
+    readonly imageRef: string
 }
 
-type SandboxProviderCommand = { readonly operation: "ensure_host"; readonly request: EnsureHostRequest }
+interface ImageWarmup {
+    readonly provider: string
+    readonly resourceId: string
+    readonly totalMs: number
+}
 
-export type { ActorHostHandle, ActorHostProvisioning, EnsureHostRequest, SandboxProvider, SandboxProviderCommand }
+interface SandboxProvider {
+    ensureHost(request: EnsureHostRequest): Promise<ActorHostHandle>
+    warmImage(request: WarmImageRequest): Promise<ImageWarmup>
+}
+
+type SandboxProviderCommand = { readonly operation: "ensure_host"; readonly request: EnsureHostRequest } | { readonly operation: "warm_image"; readonly request: WarmImageRequest }
+
+export type { ActorHostHandle, ActorHostProvisioning, EnsureHostRequest, ImageWarmup, SandboxProvider, SandboxProviderCommand, WarmImageRequest }

@@ -40,6 +40,10 @@ pub(super) fn router(invocations: ControlPlaneService, admin: AdminService) -> R
             "/v1/namespaces/{namespace_id}/actors/{actor_type}/{actor_id}/invocations",
             post(invoke_actor),
         )
+        .route(
+            "/v1/namespaces/{namespace_id}/actors/{actor_type}/{actor_id}/target",
+            post(resolve_actor_target),
+        )
         .layer(DefaultBodyLimit::max(MAX_CONTROL_PLANE_MESSAGE_BYTES))
         .with_state(PublicApiState { invocations, admin })
 }
@@ -51,17 +55,21 @@ async fn register_deployment(
     Json(request): Json<RegisterDeploymentRequest>,
 ) -> Result<Json<DeploymentReply>, ApiError> {
     authorized_admin(&state.admin, &headers)?;
+    let spec = HostLaunchSpec {
+        namespace_id,
+        code_revision: request.code_revision,
+        image_ref: request.image_ref,
+        working_directory: request.working_directory,
+        actor_entrypoint: request.actor_entrypoint,
+    };
     let changed = state
         .admin
-        .ensure_namespace_and_register_deployment(&HostLaunchSpec {
-            namespace_id,
-            code_revision: request.code_revision,
-            image_ref: request.image_ref,
-            working_directory: request.working_directory,
-            actor_entrypoint: request.actor_entrypoint,
-        })
+        .ensure_namespace_and_register_deployment(&spec)
         .await
         .map_err(ApiError::bad_request)?;
+    if let Some(region) = request.warm_region {
+        state.invocations.warm_deployment_image(spec, region);
+    }
     Ok(Json(DeploymentReply { changed }))
 }
 
@@ -141,18 +149,7 @@ async fn invoke_actor_inner(
     invocation: ActorInvocation,
 ) -> Result<ActorExecutionResult, ApiError> {
     invocation.validate().map_err(ApiError::bad_request)?;
-    let authorization = authorization(&headers)?;
-    let principal = service
-        .authenticate_workflow(authorization)
-        .map_err(|_| ApiError::unauthorized("workflow token was rejected"))?;
-    if principal.process_role != ActorProcessRole::Workflow {
-        return Err(ApiError::forbidden("credential is not a workflow token"));
-    }
-    if !principal.scope.contains(&invocation.actor) {
-        return Err(ApiError::forbidden(
-            "workflow token cannot cross namespace scope",
-        ));
-    }
+    let principal = authorized_workflow(&service, &headers, &invocation.actor)?;
 
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
@@ -165,6 +162,51 @@ async fn invoke_actor_inner(
             "actor invocation task stopped without a reply",
         )),
     }
+}
+
+async fn resolve_actor_target(
+    State(state): State<PublicApiState>,
+    Path((namespace_id, actor_type, actor_id)): Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<ActorTargetReply>, ApiError> {
+    let actor = ActorKey {
+        namespace_id,
+        actor_type,
+        actor_id,
+    };
+    actor.validate().map_err(ApiError::bad_request)?;
+    let principal = authorized_workflow(&state.invocations, &headers, &actor)?;
+    let target = state
+        .invocations
+        .resolve_workflow_target(&principal, &actor)
+        .await
+        .map_err(|error| ApiError::unavailable(format!("actor host is unavailable: {error:#}")))?;
+    Ok(Json(ActorTargetReply {
+        route: target.route,
+        token: target.token,
+        owner_epoch: target.owner_epoch,
+        state_read_url: target.state_read_url,
+        expires_at_ms: target.expires_at_ms,
+    }))
+}
+
+fn authorized_workflow(
+    service: &ControlPlaneService,
+    headers: &HeaderMap,
+    actor: &ActorKey,
+) -> Result<super::auth::ActorPrincipal, ApiError> {
+    let principal = service
+        .authenticate_workflow(authorization(headers)?)
+        .map_err(|_| ApiError::unauthorized("workflow token was rejected"))?;
+    if principal.process_role != ActorProcessRole::Workflow {
+        return Err(ApiError::forbidden("credential is not a workflow token"));
+    }
+    if !principal.scope.contains(actor) {
+        return Err(ApiError::forbidden(
+            "workflow token cannot cross namespace scope",
+        ));
+    }
+    Ok(principal)
 }
 
 fn authorized_admin(admin: &AdminService, headers: &HeaderMap) -> Result<(), ApiError> {
@@ -229,6 +271,8 @@ struct RegisterDeploymentRequest {
     working_directory: String,
     #[serde(default)]
     actor_entrypoint: Option<String>,
+    #[serde(default)]
+    warm_region: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -257,6 +301,16 @@ struct DeploymentReply {
 #[serde(rename_all = "camelCase")]
 struct IssueWorkflowTokenReply {
     token: String,
+    expires_at_ms: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ActorTargetReply {
+    route: String,
+    token: String,
+    owner_epoch: u64,
+    state_read_url: String,
     expires_at_ms: i64,
 }
 
@@ -364,6 +418,19 @@ mod tests {
         .unwrap();
 
         assert_eq!(request.storage_region, "north-america-west");
+    }
+
+    #[test]
+    fn deployment_registration_accepts_a_background_warm_region() {
+        let request: RegisterDeploymentRequest = serde_json::from_value(serde_json::json!({
+            "codeRevision": "revision-1",
+            "imageRef": "im-actor",
+            "workingDirectory": "/workspace",
+            "warmRegion": "north-america-west"
+        }))
+        .unwrap();
+
+        assert_eq!(request.warm_region.as_deref(), Some("north-america-west"));
     }
 
     #[test]

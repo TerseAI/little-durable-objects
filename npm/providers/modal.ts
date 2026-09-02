@@ -3,10 +3,10 @@ import type { App, Image, Sandbox } from "modal"
 import { createHash } from "node:crypto"
 import { performance } from "node:perf_hooks"
 
-import { canonicalRegionForModal, modalPlacement } from "../regions.js"
+import { modalPlacement } from "../regions.js"
 import type { CanonicalRegionCatalog } from "../regions.js"
 
-import type { ActorHostHandle, ActorHostProvisioning, EnsureHostRequest, SandboxProvider } from "./types.js"
+import type { ActorHostHandle, ActorHostProvisioning, EnsureHostRequest, ImageWarmup, SandboxProvider, WarmImageRequest } from "./types.js"
 
 const hostPort = 7101
 const hostRouteFile = "/tmp/durable-object-route"
@@ -40,6 +40,26 @@ class ModalSandboxProvider implements SandboxProvider {
         this.appName = options.appName ?? "durable-object-hosts"
         this.binaryPath = options.binaryPath ?? "/usr/local/bin/little-durable-objects"
         this.now = options.now ?? (() => performance.now())
+    }
+
+    async warmImage(request: WarmImageRequest): Promise<ImageWarmup> {
+        const startedAt = this.now()
+        validateWarmImageRequest(request)
+        const placement = modalPlacement(request.canonicalRegion, this.options.catalog)
+        const [app, image] = await Promise.all([this.modal.apps.fromName(this.appName, { createIfMissing: true }), this.modal.images.fromId(request.imageRef)])
+        const sandbox = await this.modal.sandboxes.experimentalCreate(app, image, {
+            command: ["true"],
+            timeoutMs: 120_000,
+            regions: [...placement.regions],
+            cloud: placement.cloud
+        })
+        try {
+            const exitCode = await sandbox.wait()
+            if (exitCode !== 0) throw new Error(`Modal image warmup exited with status ${exitCode}`)
+            return { provider: "modal", resourceId: sandbox.sandboxId, totalMs: elapsedMs(startedAt, this.now()) }
+        } finally {
+            await sandbox.terminate().catch(() => undefined)
+        }
     }
 
     async ensureHost(request: EnsureHostRequest): Promise<ActorHostHandle> {
@@ -121,8 +141,6 @@ class ModalSandboxProvider implements SandboxProvider {
     }
 
     private async activate(sandbox: Sandbox, request: EnsureHostRequest, startedAt: number, phases: ProvisioningPhases): Promise<ActorHostHandle> {
-        const placement = await this.timed(() => this.validatePlacement(sandbox, request.canonicalRegion))
-        phases.placementMs = placement.durationMs
         const started = await this.start(sandbox, request)
         phases.tunnelMs = started.tunnelMs
         phases.readyMs = started.readyMs
@@ -151,15 +169,6 @@ class ModalSandboxProvider implements SandboxProvider {
         const handle = JSON.parse(document) as ActorHostHandle
         if (handle.canonicalRegion !== canonicalRegion) throw new Error("existing Modal host has the wrong canonical region")
         return handle
-    }
-
-    private async validatePlacement(sandbox: Sandbox, expectedRegion: string): Promise<void> {
-        const observed = await runtimePlacement(sandbox)
-        const observedCanonical = canonicalRegionForModal(observed.cloud, observed.region, this.options.catalog)
-        if (observedCanonical !== expectedRegion) {
-            await sandbox.terminate()
-            throw new Error(`Modal placed host in ${observedCanonical ?? "an unknown region"}; expected ${expectedRegion}`)
-        }
     }
 
     private async start(sandbox: Sandbox, request: EnsureHostRequest): Promise<StartedHost> {
@@ -238,17 +247,13 @@ function validateEnsureRequest(request: EnsureHostRequest): void {
     }
 }
 
+function validateWarmImageRequest(request: WarmImageRequest): void {
+    if (!request.namespaceId || !request.codeRevision || !request.imageRef) throw new Error("image warmup request is invalid")
+}
+
 function resourceName(kind: string, request: EnsureHostRequest): string {
     const digest = createHash("sha256").update(request.namespaceId).update("\0").update(request.codeRevision).update("\0").update(request.canonicalRegion).digest("hex").slice(0, 32)
     return `do-${kind}-${digest}`
-}
-
-async function runtimePlacement(sandbox: Sandbox): Promise<{ cloud?: string; region?: string }> {
-    const process = await sandbox.exec(["sh", "-c", 'printf \'%s\\n%s\\n\' "${MODAL_CLOUD_PROVIDER:-}" "${MODAL_REGION:-}"'], { stdout: "pipe", stderr: "pipe" })
-    const [stdout, exitCode] = await Promise.all([process.stdout.readText(), process.wait()])
-    if (exitCode !== 0) throw new Error("could not inspect Modal host placement")
-    const [cloud, region] = stdout.split("\n").map(value => value.trim())
-    return { ...(cloud ? { cloud } : {}), ...(region ? { region } : {}) }
 }
 
 async function writeMetadata(sandbox: Sandbox, handle: ActorHostHandle): Promise<void> {

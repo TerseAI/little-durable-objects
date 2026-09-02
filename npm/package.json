@@ -1,6 +1,6 @@
 {
     "name": "little-durable-objects",
-    "version": "0.1.4",
+    "version": "0.1.5",
     "description": "Provider-neutral durable objects for sandbox compute",
     "type": "module",
     "license": "MIT",
@@ -71,11 +71,14 @@
         "format:check": "prettier --config ../.prettierrc --check \"*.ts\" \"{fixtures,host,providers,shared,workflow}/**/*.ts\" \"scripts/*.mjs\""
     },
     "dependencies": {
+        "@grpc/grpc-js": "^1.14.4",
         "modal": "^0.10.0",
+        "protobufjs": "^7.6.6",
         "tsx": "^4.0.0",
         "zod": "^4.3.6"
     },
     "devDependencies": {
+        "@grpc/proto-loader": "^0.8.1",
         "@types/node": "^22.0.0",
         "typescript": "^5.0.0"
     }

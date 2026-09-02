@@ -17,9 +17,15 @@ importers:
 
   npm:
     dependencies:
+      '@grpc/grpc-js':
+        specifier: ^1.14.4
+        version: 1.14.4
       modal:
         specifier: ^0.10.0
         version: 0.10.0
+      protobufjs:
+        specifier: ^7.6.6
+        version: 7.6.6
       tsx:
         specifier: ^4.0.0
         version: 4.23.13
@@ -27,6 +33,9 @@ importers:
         specifier: ^4.3.6
         version: 4.5.4
     devDependencies:
+      '@grpc/proto-loader':
+        specifier: ^0.8.1
+        version: 0.8.1
       '@types/node':
         specifier: ^22.0.0
         version: 22.20.1

@@ -5,6 +5,9 @@ import { currentActorInvocation } from "../shared/invocationContext.js"
 import { JsonActorStateSerializer, validateActorComponent } from "../shared/types.js"
 import type { JsonValue } from "../shared/types.js"
 
+import { GrpcActorHostTransport } from "./actorHostGrpc.js"
+import type { ActorHostTarget, ActorHostTransport, DirectActorInvocation } from "./actorHostGrpc.js"
+
 const namespaceIdSchema = z.string().regex(/^[A-Za-z0-9._-]+$/u)
 const remoteSettingsSchema = z.object({
     DURABLE_OBJECT_TOKEN: z.string().trim().min(1),
@@ -26,17 +29,32 @@ const errorDocumentSchema = z.object({
     })
 })
 
+const actorHostTargetSchema = z.object({
+    route: z.string().url(),
+    token: z.string().trim().min(1),
+    ownerEpoch: z.number().int().positive(),
+    stateReadUrl: z.string().url(),
+    expiresAtMs: z.number().int().positive()
+})
+
+const TARGET_EXPIRATION_SAFETY_MS = 5_000
+
 class RemoteActorClient {
     private readonly serializer = new JsonActorStateSerializer()
     private settingsValue: RemoteActorSettings | undefined
     private readonly environment: NodeJS.ProcessEnv
     private readonly fetchRequest: typeof globalThis.fetch
     private readonly requestId: () => string
+    private readonly actorHost: ActorHostTransport
+    private readonly now: () => number
+    private readonly targets = new Map<string, Promise<ActorHostTarget | undefined>>()
 
     constructor(options?: DurableObjectsClientOptions, dependencies: RemoteActorClientDependencies = {}) {
         this.environment = dependencies.environment ?? process.env
         this.fetchRequest = dependencies.fetch ?? globalThis.fetch
         this.requestId = dependencies.requestId ?? (() => globalThis.crypto.randomUUID())
+        this.actorHost = dependencies.actorHost ?? new GrpcActorHostTransport()
+        this.now = dependencies.now ?? Date.now
         this.settingsValue = options === undefined ? undefined : configuredSettings(options)
     }
 
@@ -45,37 +63,94 @@ class RemoteActorClient {
         if (currentActorInvocation() !== undefined) {
             throw new ActorInvocationError("actor_error", requestId, "actor-to-actor calls are not available")
         }
-        const response = await this.send(requestId, actorType, actorId, method, args)
-        return this.result(response, requestId)
+        const invocation = this.invocation(requestId, actorType, actorId, method, args)
+        const target = await this.target(invocation)
+        if (!target) return this.proxied(invocation)
+        return this.direct(target, invocation, true)
     }
 
-    private async send(requestId: string, actorType: string, actorId: string, method: string, args: readonly unknown[]): Promise<Response> {
+    private async direct(target: ActorHostTarget, invocation: DirectActorInvocation, retryReroute: boolean): Promise<unknown> {
         try {
-            return await this.fetchRequest(invocationUrl(this.settings, actorType, actorId), {
+            const reply = await this.actorHost.invoke(target, invocation)
+            if (reply.type === "completed") return reply.result
+            if (reply.type === "failed") throw new ActorInvocationError(reply.code, invocation.requestId, reply.message)
+            if (!retryReroute) throw new ActorInvocationError("unavailable", invocation.requestId, "actor ownership changed repeatedly before execution")
+            this.targets.delete(actorKey(invocation.actorType, invocation.actorId))
+            const rerouted = await this.target(invocation)
+            if (!rerouted) return this.proxied(invocation)
+            return this.direct(rerouted, invocation, false)
+        } catch (error) {
+            if (error instanceof ActorInvocationError || error instanceof ActorProtocolError) throw error
+            this.targets.delete(actorKey(invocation.actorType, invocation.actorId))
+            const message = error instanceof Error ? error.message : String(error)
+            throw new ActorInvocationError("outcome_unknown", invocation.requestId, `actor-host gRPC request failed after dispatch: ${message}`)
+        }
+    }
+
+    private async target(invocation: DirectActorInvocation): Promise<ActorHostTarget | undefined> {
+        const key = actorKey(invocation.actorType, invocation.actorId)
+        const current = this.targets.get(key)
+        if (current) {
+            const target = await current
+            if (!target) {
+                this.targets.delete(key)
+                return undefined
+            }
+            if (target.expiresAtMs > this.now() + TARGET_EXPIRATION_SAFETY_MS) return target
+            this.targets.delete(key)
+        }
+        const resolving = this.resolveTarget(invocation).catch(error => {
+            this.targets.delete(key)
+            throw error
+        })
+        this.targets.set(key, resolving)
+        return resolving
+    }
+
+    private async resolveTarget(invocation: DirectActorInvocation): Promise<ActorHostTarget | undefined> {
+        let response: Response
+        try {
+            response = await this.fetchRequest(targetUrl(this.settings, invocation.actorType, invocation.actorId), {
+                method: "POST",
+                headers: { accept: "application/json", authorization: `Bearer ${this.settings.token}` }
+            })
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            throw new ActorInvocationError("outcome_unknown", invocation.requestId, `control-plane HTTP request failed before dispatch: ${message}`)
+        }
+        if (response.status === 404 || response.status === 405) return undefined
+        const document = await responseDocument(response)
+        if (!response.ok) this.throwResponseFailure(response, document, invocation.requestId)
+        const target = actorHostTargetSchema.safeParse(document)
+        if (!target.success) throw new ActorProtocolError("control-plane response did not contain a valid actor host target")
+        return target.data
+    }
+
+    private async proxied(invocation: DirectActorInvocation): Promise<unknown> {
+        let response: Response
+        try {
+            response = await this.fetchRequest(invocationUrl(this.settings, invocation.actorType, invocation.actorId), {
                 method: "POST",
                 headers: {
                     accept: "application/json",
                     authorization: `Bearer ${this.settings.token}`,
                     "content-type": "application/json"
                 },
-                body: JSON.stringify({
-                    requestId,
-                    method: validateActorComponent("actor method", method),
-                    args: this.jsonArguments(args)
-                })
+                body: JSON.stringify({ requestId: invocation.requestId, method: invocation.method, args: invocation.args })
             })
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error)
-            throw new ActorInvocationError("outcome_unknown", requestId, `control-plane HTTP request failed after dispatch: ${message}`)
+            throw new ActorInvocationError("outcome_unknown", invocation.requestId, `control-plane HTTP request failed after dispatch: ${message}`)
         }
-    }
-
-    private async result(response: Response, requestId: string): Promise<unknown> {
         const document = await responseDocument(response)
         if (response.ok) {
             if (isObject(document) && Object.hasOwn(document, "result")) return document.result
             throw new ActorProtocolError("control-plane response did not contain an actor result")
         }
+        this.throwResponseFailure(response, document, invocation.requestId)
+    }
+
+    private throwResponseFailure(response: Response, document: unknown, requestId: string): never {
         if (response.status === 401 || response.status === 403) {
             throw new ActorInvocationError("unauthenticated", requestId, "the durable-object workflow token was rejected")
         }
@@ -84,6 +159,17 @@ class RemoteActorClient {
             throw new ActorProtocolError(`control-plane HTTP ${response.status} response did not contain a valid error`)
         }
         throw new ActorInvocationError(failure.data.error.code, failure.data.error.requestId ?? requestId, failure.data.error.message)
+    }
+
+    private invocation(requestId: string, actorType: string, actorId: string, method: string, args: readonly unknown[]): DirectActorInvocation {
+        return {
+            requestId,
+            namespaceId: this.settings.namespaceId,
+            actorType: validateActorComponent("actor type", actorType),
+            actorId: validateActorComponent("actor ID", actorId),
+            method: validateActorComponent("actor method", method),
+            args: this.jsonArguments(args)
+        }
     }
 
     private get settings(): RemoteActorSettings {
@@ -130,6 +216,16 @@ function invocationUrl(settings: RemoteActorSettings, actorType: string, actorId
     return `${settings.controlPlaneUrl}/v1/namespaces/${encodeURIComponent(settings.namespaceId)}/actors/${encodeURIComponent(actor)}/${encodeURIComponent(id)}/invocations`
 }
 
+function targetUrl(settings: RemoteActorSettings, actorType: string, actorId: string): string {
+    const actor = validateActorComponent("actor type", actorType)
+    const id = validateActorComponent("actor ID", actorId)
+    return `${settings.controlPlaneUrl}/v1/namespaces/${encodeURIComponent(settings.namespaceId)}/actors/${encodeURIComponent(actor)}/${encodeURIComponent(id)}/target`
+}
+
+function actorKey(actorType: string, actorId: string): string {
+    return `${actorType}\u001f${actorId}`
+}
+
 async function responseDocument(response: Response): Promise<unknown> {
     try {
         return (await response.json()) as unknown
@@ -158,6 +254,8 @@ interface RemoteActorClientDependencies {
     readonly environment?: NodeJS.ProcessEnv
     readonly fetch?: typeof globalThis.fetch
     readonly requestId?: () => string
+    readonly actorHost?: ActorHostTransport
+    readonly now?: () => number
 }
 
 export { RemoteActorClient }

@@ -8,7 +8,7 @@ Requires Node.js 20 or newer.
 pnpm add little-durable-objects
 ```
 
-Workflow sandboxes receive one system-issued project JWT and use it only with the control plane:
+Workflow sandboxes receive one system-issued project JWT. The client uses it to resolve a short-lived actor target through the control plane, then invokes the regional actor host directly over gRPC:
 
 ```ts
 import { Actor, configureDurableObjects } from "little-durable-objects"
@@ -40,7 +40,7 @@ DURABLE_OBJECT_CONTROL_PLANE_URL
 
 The control plane selects one sandbox provider globally. For Modal, set `DURABLE_OBJECT_SANDBOX_PROVIDER=modal`; optionally override its executable with `DURABLE_OBJECT_SANDBOX_COMMAND`.
 
-The `little-durable-objects-modal` executable reads one JSON command from stdin, uses `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET` through the Modal TypeScript SDK, and writes one JSON result to stdout. The Rust control plane invokes it locally; no provider HTTP server is required.
+The `little-durable-objects-modal` executable reads one host-provisioning or disposable image-warmup command from stdin, uses `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET` through the Modal TypeScript SDK, and writes one JSON result to stdout. The Rust control plane invokes it locally; no provider HTTP server is required.
 
 Actor hosts conventionally load `src/durable-objects.ts`. See the [runtime repository](https://github.com/TerseAI/little-durable-objects) for backend configuration, the REST admin API, authentication, and lifecycle behavior.
 

@@ -13,11 +13,14 @@ use jsonwebtoken::{
 use serde::Serialize;
 
 use crate::{
+    actor::ActorKey,
+    control_plane::auth::ActorInvocationCapability,
     host::{ActorProcessRole, HostId},
     placement::validate_region,
 };
 
 const WORKFLOW_DEADLINE_GRACE: Duration = Duration::from_secs(30);
+const INVOCATION_TARGET_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub(crate) struct ActorJwtIssuer {
@@ -136,6 +139,7 @@ impl ActorJwtIssuer {
             iat: now_ms / 1000,
             nbf: now_ms / 1000,
             exp: expires_at_ms / 1000,
+            invocation: None,
         })
     }
 
@@ -166,6 +170,53 @@ impl ActorJwtIssuer {
             iat: now_ms / 1000,
             nbf: now_ms / 1000,
             exp: expires_at_ms / 1000,
+            invocation: None,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn issue_invocation_target(
+        &self,
+        actor: &ActorKey,
+        host_id: &HostId,
+        session_id: &str,
+        code_revision: &str,
+        region: &str,
+        owner_epoch: u64,
+        state_read_url: &str,
+        workflow_expires_at: i64,
+    ) -> Result<IssuedActorToken> {
+        actor.validate()?;
+        validate_region(region)?;
+        ensure!(owner_epoch > 0, "actor owner epoch must be positive");
+        let now_ms = unix_millis()?;
+        let now = now_ms / 1_000;
+        let target_expires_at = now.saturating_add(i64::try_from(INVOCATION_TARGET_TTL.as_secs())?);
+        let issuer_expires_at = now.saturating_add(i64::try_from(self.max_lifetime.as_secs())?);
+        let expires_at = workflow_expires_at
+            .min(target_expires_at)
+            .min(issuer_expires_at);
+        ensure!(expires_at > now, "workflow credential expires too soon");
+        self.issue(ActorJwtClaims {
+            iss: self.issuer.clone(),
+            aud: vec![self.invocation_audience.clone()],
+            sub: host_id.as_str().to_owned(),
+            namespace_id: actor.namespace_id.clone(),
+            process_id: host_id.as_str().to_owned(),
+            session_id: session_id.to_owned(),
+            process_role: ActorProcessRole::Host,
+            region: region.to_owned(),
+            code_revision: Some(code_revision.to_owned()),
+            scope: "actor:invoke".into(),
+            iat: now,
+            nbf: now,
+            exp: expires_at,
+            invocation: Some(ActorInvocationCapability {
+                actor: actor.clone(),
+                host_id: host_id.clone(),
+                owner_epoch,
+                state_read_url: state_read_url.to_owned(),
+            }),
         })
     }
 
@@ -202,6 +253,8 @@ struct ActorJwtClaims {
     iat: i64,
     nbf: i64,
     exp: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    invocation: Option<ActorInvocationCapability>,
 }
 
 fn unix_millis() -> Result<i64> {
@@ -256,6 +309,66 @@ mod tests {
         let jwks: serde_json::Value = serde_json::from_slice(&issuer.jwks_json()?)?;
         assert_eq!(jwks["keys"][0]["kid"], "test-key");
         assert_eq!(jwks["keys"][0]["crv"], "Ed25519");
+        Ok(())
+    }
+
+    #[test]
+    fn direct_invocation_tokens_are_bound_to_one_actor_target_without_host_authority() -> Result<()>
+    {
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())?;
+        let issuer = ActorJwtIssuer::from_base64_pkcs8(
+            &STANDARD.encode(pkcs8.as_ref()),
+            "test-key",
+            "issuer",
+            "authority",
+            "invocation",
+            Duration::from_secs(60),
+        )?;
+        let actor = crate::actor::ActorKey {
+            namespace_id: "project-1".into(),
+            actor_type: "Counter".into(),
+            actor_id: "counter-1".into(),
+        };
+        let host_id = HostId::new("host.v1.project-1.revision-1.host-1");
+        let issued = issuer.issue_invocation_target(
+            &actor,
+            &host_id,
+            "00000000-0000-4000-8000-000000000001",
+            "revision-1",
+            "north-america-east",
+            3,
+            "https://storage.example.com/state",
+            unix_millis()? / 1_000 + 30,
+        )?;
+        let invocation_verifier = ActorJwtVerifier::for_scope(
+            issuer.verifier_keys_json()?,
+            "issuer",
+            "invocation",
+            ActorTokenPurpose::Invocation,
+            Duration::from_secs(60),
+        )?;
+        let principal =
+            invocation_verifier.authenticate_authorization(&format!("Bearer {}", issued.token))?;
+
+        assert_eq!(principal.host_id, host_id);
+        assert_eq!(
+            principal.invocation.expect("invocation capability").actor,
+            actor
+        );
+        assert!(issued.expires_at_ms <= (unix_millis()? + 30_000));
+
+        let authority_verifier = ActorJwtVerifier::for_scope(
+            issuer.verifier_keys_json()?,
+            "issuer",
+            "authority",
+            ActorTokenPurpose::ControlPlane,
+            Duration::from_secs(60),
+        )?;
+        assert!(
+            authority_verifier
+                .authenticate_authorization(&format!("Bearer {}", issued.token))
+                .is_err()
+        );
         Ok(())
     }
 }

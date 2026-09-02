@@ -69,13 +69,13 @@ Container builds can copy the binary from `us-central1-docker.pkg.dev/fluid-anal
    POST /v1/namespaces/{namespaceId}/workflow-tokens
    ```
 
-   The deployment call atomically ensures the namespace and registers its active deployment. Its body is `{ "codeRevision", "imageRef", "workingDirectory", "actorEntrypoint" }`. The workflow-token body is `{ "executionId", "deadlineUnixMs", "storageRegion" }`.
+   The deployment call atomically ensures the namespace and registers its active deployment. Its body is `{ "codeRevision", "imageRef", "workingDirectory", "actorEntrypoint", "warmRegion" }`; `warmRegion` is optional and starts a disposable background sandbox to warm the image cache without delaying or failing registration. The workflow-token body is `{ "executionId", "deadlineUnixMs", "storageRegion" }`.
 
-   `storageRegion` selects the home region only when an actor is first created. Later invocations route over gRPC to the actor's existing host region.
+   `storageRegion` selects the home region only when an actor is first created. Later invocations resolve the actor's existing host region.
 
    `image_ref` is a Modal image containing Node.js, your built project, its dependencies, and `little-durable-objects` at `/usr/local/bin/little-durable-objects`.
 
-6. Give the issued project token to the workflow and call the actor. The package sends an authenticated JSON `POST` to the control plane:
+6. Give the issued project token to the workflow and call the actor. The package resolves a short-lived actor target through the control plane, caches it, and invokes the regional host directly over gRPC:
 
    ```ts
    import { configureDurableObjects } from "little-durable-objects"

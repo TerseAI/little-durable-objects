@@ -4,20 +4,66 @@ import assert from "node:assert/strict"
 import { test } from "node:test"
 
 import { ModalSandboxProvider } from "./modal.js"
-import type { EnsureHostRequest } from "./types.js"
+import type { EnsureHostRequest, WarmImageRequest } from "./types.js"
+
+test("warms an image in a disposable regional V2 sandbox", async () => {
+    let createOptions: SandboxCreateParams | undefined
+    let waited = false
+    let terminated = false
+    const sandbox = {
+        sandboxId: "sb-v2-warmup",
+        async wait() {
+            waited = true
+            return 0
+        },
+        async terminate() {
+            terminated = true
+        }
+    }
+    const client = {
+        apps: {
+            async fromName() {
+                return { name: "durable-object-hosts" }
+            }
+        },
+        images: {
+            async fromId() {
+                return { imageId: "im-actor" }
+            }
+        },
+        sandboxes: {
+            async experimentalCreate(_app: unknown, _image: unknown, options: SandboxCreateParams) {
+                createOptions = options
+                return sandbox
+            }
+        }
+    }
+    const provider = new ModalSandboxProvider({ client: client as unknown as ModalClient, now: () => 0 })
+
+    const result = await provider.warmImage(warmImageRequest())
+
+    assert.deepEqual(result, { provider: "modal", resourceId: "sb-v2-warmup", totalMs: 0 })
+    assert.deepEqual(createOptions?.command, ["true"])
+    assert.deepEqual(createOptions?.regions, ["us-east"])
+    assert.equal(createOptions?.cloud, "gcp")
+    assert.equal(createOptions?.name, undefined)
+    assert.equal(waited, true)
+    assert.equal(terminated, true)
+})
 
 test("creates a V2 Modal sandbox with the host as its main process and reports provisioning timings", async () => {
     let createOptions: SandboxCreateParams | undefined
     let usedLegacyCreate = false
     const files = new Map<string, string>()
+    const executedCommands: string[][] = []
     const sandbox = {
         sandboxId: "sb-v2-actor",
         async exec(command: string[]) {
-            const placement = command.join(" ").includes("MODAL_CLOUD_PROVIDER")
+            executedCommands.push(command)
             return {
                 stdout: {
                     async readText() {
-                        return placement ? "gcp\nus-east-1\n" : ""
+                        return ""
                     }
                 },
                 stderr: {
@@ -106,6 +152,8 @@ test("creates a V2 Modal sandbox with the host as its main process and reports p
     assert.equal(createOptions?.env?.MODAL_TOKEN_ID, undefined)
     assert.equal(files.get("/tmp/durable-object-route"), "https://host.example.com")
     assert.match(files.get("/tmp/durable-object-host.json") ?? "", /host\.v1\.project-1/u)
+    assert.equal(executedCommands.length, 1)
+    assert.doesNotMatch(executedCommands[0]?.join(" ") ?? "", /MODAL_(?:CLOUD_PROVIDER|REGION)/u)
 })
 
 test("surfaces host stderr when the main process exits before readiness", async () => {
@@ -183,5 +231,14 @@ function request(): EnsureHostRequest {
         actorEntrypoint: "src/durable-objects.ts",
         actorIdleTimeoutMs: 60_000,
         hostIdleTimeoutMs: 300_000
+    }
+}
+
+function warmImageRequest(): WarmImageRequest {
+    return {
+        namespaceId: "project-1",
+        codeRevision: "revision-1",
+        canonicalRegion: "north-america-east",
+        imageRef: "im-actor"
     }
 }

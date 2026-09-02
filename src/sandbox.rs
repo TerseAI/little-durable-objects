@@ -54,9 +54,27 @@ pub struct ActorHostProvisioning {
     pub total_ms: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WarmImageRequest {
+    pub namespace_id: String,
+    pub code_revision: String,
+    pub canonical_region: String,
+    pub image_ref: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageWarmup {
+    pub provider: String,
+    pub resource_id: String,
+    pub total_ms: u64,
+}
+
 #[async_trait]
 pub trait SandboxProvider: Send + Sync {
     async fn ensure_host(&self, request: &EnsureHostRequest) -> Result<ActorHostHandle>;
+    async fn warm_image(&self, request: &WarmImageRequest) -> Result<ImageWarmup>;
 }
 
 #[derive(Clone)]
@@ -114,6 +132,10 @@ impl SandboxProvider for CommandSandboxProvider {
             self.provider_name
         );
         Ok(response)
+    }
+
+    async fn warm_image(&self, request: &WarmImageRequest) -> Result<ImageWarmup> {
+        self.execute("warm_image", request).await
     }
 }
 

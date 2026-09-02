@@ -12,7 +12,7 @@ use crate::{
         ActorExecutionResult, ActorInvocation, ActorInvocationFailure,
         MAX_ACTOR_EXECUTOR_MESSAGE_BYTES,
     },
-    control_plane::ActorJwtVerifier,
+    control_plane::{ActorJwtVerifier, ActorPrincipal},
     host::{ActorHost, ActorProcessRole, HostId},
 };
 
@@ -55,11 +55,6 @@ impl ActorHostGrpcService {
         request: Request<HostInvokeActorRequest>,
     ) -> Result<AuthorizedHostInvocation, Status> {
         let principal = self.invocation_auth.authenticate(&request).await?;
-        if principal.process_role != ActorProcessRole::Host || principal.host_id != self.host_id {
-            return Err(Status::permission_denied(
-                "actor invocation credential is not for this host",
-            ));
-        }
         let request = request.into_inner();
         let invocation: ActorInvocation = request
             .invocation
@@ -76,6 +71,13 @@ impl ActorHostGrpcService {
                 "actor ownership capability is incomplete",
             ));
         }
+        validate_invocation_principal(
+            &principal,
+            &self.host_id,
+            &invocation.actor,
+            request.owner_epoch,
+            &request.state_read_url,
+        )?;
         Ok(AuthorizedHostInvocation {
             invocation,
             owner_epoch: request.owner_epoch,
@@ -127,8 +129,100 @@ impl ActorHostGrpcService {
     }
 }
 
+fn validate_invocation_principal(
+    principal: &ActorPrincipal,
+    host_id: &HostId,
+    actor: &crate::actor::ActorKey,
+    owner_epoch: u64,
+    state_read_url: &str,
+) -> Result<(), Status> {
+    if principal.process_role != ActorProcessRole::Host || principal.host_id != *host_id {
+        return Err(Status::permission_denied(
+            "actor invocation credential is not for this host",
+        ));
+    }
+    if let Some(capability) = &principal.invocation
+        && (capability.actor != *actor
+            || capability.host_id != *host_id
+            || capability.owner_epoch != owner_epoch
+            || capability.state_read_url != state_read_url)
+    {
+        return Err(Status::permission_denied(
+            "actor invocation does not match its direct capability",
+        ));
+    }
+    Ok(())
+}
+
 struct AuthorizedHostInvocation {
     invocation: ActorInvocation,
     owner_epoch: u64,
     state_read_url: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        actor::{ActorKey, ActorScope},
+        control_plane::{ActorInvocationCapability, ActorPrincipal},
+    };
+
+    #[test]
+    fn direct_capability_is_bound_to_the_actor_epoch_and_state_url() {
+        let actor = ActorKey {
+            namespace_id: "project-1".into(),
+            actor_type: "Counter".into(),
+            actor_id: "counter-1".into(),
+        };
+        let host_id = HostId::new("host.v1.project-1.revision-1.host-1");
+        let principal = ActorPrincipal {
+            scope: ActorScope {
+                namespace_id: "project-1".into(),
+            },
+            host_id: host_id.clone(),
+            session_id: "00000000-0000-4000-8000-000000000001".into(),
+            process_role: ActorProcessRole::Host,
+            region: "north-america-east".into(),
+            code_revision: Some("revision-1".into()),
+            expires_at: i64::MAX,
+            invocation: Some(ActorInvocationCapability {
+                actor: actor.clone(),
+                host_id: host_id.clone(),
+                owner_epoch: 3,
+                state_read_url: "https://storage.example.com/state".into(),
+            }),
+        };
+
+        assert!(
+            validate_invocation_principal(
+                &principal,
+                &host_id,
+                &actor,
+                3,
+                "https://storage.example.com/state"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_invocation_principal(
+                &principal,
+                &host_id,
+                &actor,
+                4,
+                "https://storage.example.com/state"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_invocation_principal(
+                &principal,
+                &host_id,
+                &actor,
+                3,
+                "https://storage.example.com/other"
+            )
+            .is_err()
+        );
+    }
 }

@@ -9,8 +9,16 @@ async function main(): Promise<void> {
     for await (const chunk of stdin) chunks.push(Buffer.from(chunk))
     const command = JSON.parse(Buffer.concat(chunks).toString("utf8")) as SandboxProviderCommand
     const provider = new ModalSandboxProvider()
-    if (command.operation !== "ensure_host") throw new Error(`unsupported sandbox operation ${String(command.operation)}`)
-    stdout.write(JSON.stringify(await provider.ensureHost(command.request)))
+    switch (command.operation) {
+        case "ensure_host":
+            stdout.write(JSON.stringify(await provider.ensureHost(command.request)))
+            return
+        case "warm_image":
+            stdout.write(JSON.stringify(await provider.warmImage(command.request)))
+            return
+        default:
+            throw new Error("unsupported sandbox operation")
+    }
 }
 
 main().catch(error => {

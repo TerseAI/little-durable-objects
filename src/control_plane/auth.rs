@@ -5,7 +5,7 @@ use jsonwebtoken::{
     Algorithm, DecodingKey, Validation, decode, decode_header,
     jwk::{JwkSet, KeyAlgorithm},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tonic::{Request, Status};
 
 use crate::actor::ActorScope;
@@ -40,6 +40,16 @@ pub(crate) struct ActorPrincipal {
     pub region: String,
     pub code_revision: Option<String>,
     pub expires_at: i64,
+    pub invocation: Option<ActorInvocationCapability>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ActorInvocationCapability {
+    pub actor: crate::actor::ActorKey,
+    pub host_id: HostId,
+    pub owner_epoch: u64,
+    pub state_read_url: String,
 }
 
 impl ActorPrincipal {
@@ -82,6 +92,8 @@ struct ActorJwtClaims {
     #[serde(rename = "nbf")]
     _not_before: i64,
     exp: i64,
+    #[serde(default)]
+    invocation: Option<ActorInvocationCapability>,
 }
 
 impl ActorJwtVerifier {
@@ -238,6 +250,7 @@ impl ActorJwtVerifier {
             region: claims.region,
             code_revision: claims.code_revision,
             expires_at: claims.exp,
+            invocation: claims.invocation,
         };
         principal.scope.validate()?;
         let process_prefix = match principal.process_role {
@@ -261,6 +274,31 @@ impl ActorJwtVerifier {
                         || matches!(byte, b'.' | b'_' | b'-')),
             "actor token storage region is invalid"
         );
+        if let Some(capability) = &principal.invocation {
+            ensure!(
+                principal.process_role == ActorProcessRole::Host,
+                "actor invocation capability has an invalid process role"
+            );
+            ensure!(
+                capability.host_id == principal.host_id,
+                "actor invocation capability targets another host"
+            );
+            ensure!(
+                principal.scope.contains(&capability.actor),
+                "actor invocation capability crossed namespace scope"
+            );
+            ensure!(
+                capability.owner_epoch > 0,
+                "actor invocation capability owner epoch is invalid"
+            );
+            let state_read_url = reqwest::Url::parse(&capability.state_read_url)
+                .context("actor invocation capability state URL is invalid")?;
+            ensure!(
+                matches!(state_read_url.scheme(), "http" | "https")
+                    && state_read_url.host_str().is_some(),
+                "actor invocation capability state URL must be HTTP or HTTPS"
+            );
+        }
         Ok(principal)
     }
 }
