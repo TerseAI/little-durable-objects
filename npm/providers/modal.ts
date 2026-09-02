@@ -6,7 +6,7 @@ import { performance } from "node:perf_hooks"
 import { modalPlacement } from "../regions.js"
 import type { CanonicalRegionCatalog } from "../regions.js"
 
-import type { ActorHostHandle, ActorHostProvisioning, EnsureHostRequest, ImageWarmup, SandboxProvider, WarmImageRequest } from "./types.js"
+import type { ActorHostHandle, ActorHostProvisioning, EnsureHostRequest, HostTermination, ImageWarmup, SandboxProvider, TerminateHostsRequest, WarmImageRequest } from "./types.js"
 
 const hostPort = 7101
 const hostRouteFile = "/tmp/durable-object-route"
@@ -62,8 +62,31 @@ class ModalSandboxProvider implements SandboxProvider {
         }
     }
 
+    async terminateHosts(request: TerminateHostsRequest): Promise<HostTermination> {
+        validateTerminateHostsRequest(request, this.options.catalog)
+        let app: App
+        try {
+            app = await this.modal.apps.fromName(this.appName, { createIfMissing: false })
+        } catch (error) {
+            if (error instanceof NotFoundError) return { provider: "modal", resourceIds: [] }
+            throw error
+        }
+        const resourceIds: string[] = []
+        for (const region of request.canonicalRegions) {
+            const name = resourceName("host", request.namespaceId, request.codeRevision, region)
+            try {
+                const sandbox = await this.modal.sandboxes.experimentalFromName(app.name ?? this.appName, name)
+                await sandbox.terminate()
+                resourceIds.push(sandbox.sandboxId)
+            } catch (error) {
+                if (!(error instanceof NotFoundError)) throw error
+            }
+        }
+        return { provider: "modal", resourceIds }
+    }
+
     async ensureHost(request: EnsureHostRequest): Promise<ActorHostHandle> {
-        const key = resourceName("host", request)
+        const key = resourceName("host", request.namespaceId, request.codeRevision, request.canonicalRegion)
         const current = this.activations.get(key)
         if (current) return current
         const activation = this.ensureHostOnce(request, key).finally(() => this.activations.delete(key))
@@ -251,8 +274,13 @@ function validateWarmImageRequest(request: WarmImageRequest): void {
     if (!request.namespaceId || !request.codeRevision || !request.imageRef) throw new Error("image warmup request is invalid")
 }
 
-function resourceName(kind: string, request: EnsureHostRequest): string {
-    const digest = createHash("sha256").update(request.namespaceId).update("\0").update(request.codeRevision).update("\0").update(request.canonicalRegion).digest("hex").slice(0, 32)
+function validateTerminateHostsRequest(request: TerminateHostsRequest, catalog?: CanonicalRegionCatalog): void {
+    if (!request.namespaceId || !request.codeRevision || request.canonicalRegions.length === 0) throw new Error("host termination request is invalid")
+    for (const region of request.canonicalRegions) modalPlacement(region, catalog)
+}
+
+function resourceName(kind: string, namespaceId: string, codeRevision: string, canonicalRegion: string): string {
+    const digest = createHash("sha256").update(namespaceId).update("\0").update(codeRevision).update("\0").update(canonicalRegion).digest("hex").slice(0, 32)
     return `do-${kind}-${digest}`
 }
 

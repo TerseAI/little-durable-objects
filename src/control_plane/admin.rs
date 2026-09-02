@@ -99,6 +99,13 @@ impl AdminService {
             .await
     }
 
+    pub(crate) async fn current_deployment(
+        &self,
+        namespace_id: &str,
+    ) -> Result<Option<HostLaunchSpec>> {
+        self.registry.launch_spec(namespace_id).await
+    }
+
     pub(crate) async fn deployment_exists(&self, namespace_id: &str) -> Result<bool> {
         Ok(self.registry.launch_spec(namespace_id).await?.is_some())
     }

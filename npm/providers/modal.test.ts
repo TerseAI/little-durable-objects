@@ -4,7 +4,39 @@ import assert from "node:assert/strict"
 import { test } from "node:test"
 
 import { ModalSandboxProvider } from "./modal.js"
-import type { EnsureHostRequest, WarmImageRequest } from "./types.js"
+import type { EnsureHostRequest, TerminateHostsRequest, WarmImageRequest } from "./types.js"
+
+test("terminates every cached host for a replaced deployment revision", async () => {
+    const lookedUp: string[] = []
+    const terminated: string[] = []
+    const client = {
+        apps: {
+            async fromName() {
+                return { name: "durable-object-hosts" }
+            }
+        },
+        sandboxes: {
+            async experimentalFromName(_appName: string, name: string) {
+                lookedUp.push(name)
+                if (lookedUp.length === 2) throw new NotFoundError("not found")
+                return {
+                    sandboxId: `sb-${lookedUp.length}`,
+                    async terminate() {
+                        terminated.push(name)
+                    }
+                }
+            }
+        }
+    }
+    const provider = new ModalSandboxProvider({ client: client as unknown as ModalClient })
+
+    const result = await provider.terminateHosts(terminateHostsRequest())
+
+    assert.equal(lookedUp.length, 3)
+    assert.equal(new Set(lookedUp).size, 3)
+    assert.deepEqual(terminated, [lookedUp[0], lookedUp[2]])
+    assert.deepEqual(result, { provider: "modal", resourceIds: ["sb-1", "sb-3"] })
+})
 
 test("warms an image in a disposable regional V2 sandbox", async () => {
     let createOptions: SandboxCreateParams | undefined
@@ -240,5 +272,13 @@ function warmImageRequest(): WarmImageRequest {
         codeRevision: "revision-1",
         canonicalRegion: "north-america-east",
         imageRef: "im-actor"
+    }
+}
+
+function terminateHostsRequest(): TerminateHostsRequest {
+    return {
+        namespaceId: "project-1",
+        codeRevision: "revision-1",
+        canonicalRegions: ["north-america-east", "north-america-central", "north-america-west"]
     }
 }

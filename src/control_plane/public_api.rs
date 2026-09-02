@@ -63,8 +63,8 @@ async fn register_deployment(
         actor_entrypoint: request.actor_entrypoint,
     };
     let changed = state
-        .admin
-        .ensure_namespace_and_register_deployment(&spec)
+        .invocations
+        .register_deployment(&state.admin, &spec)
         .await
         .map_err(ApiError::bad_request)?;
     if let Some(region) = request.warm_region {

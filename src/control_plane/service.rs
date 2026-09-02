@@ -20,14 +20,15 @@ use crate::{
         ObjectPlacement, ObjectPlacementStore, PlacementClaim, StateCommit, StateCommitRequest,
     },
     sandbox::{
-        EnsureHostRequest, HostSandboxRuntimeConfig, ImageWarmup, SandboxProvider, WarmImageRequest,
+        EnsureHostRequest, HostSandboxRuntimeConfig, HostTermination, ImageWarmup, SandboxProvider,
+        TerminateHostsRequest, WarmImageRequest,
     },
     storage_urls::{StateWriteTicket, StorageUrlSigner, validate_snapshot_object_name},
 };
 
 use super::{
     MAX_CONTROL_PLANE_MESSAGE_BYTES,
-    admin::{AdminRegistry, HostLaunchSpec},
+    admin::{AdminRegistry, AdminService, HostLaunchSpec},
     auth::{ActorJwtVerifier, ActorPrincipal},
     issuer::ActorJwtIssuer,
     protocol::{ControlPlaneCommand, ControlPlaneCommandReply, decode_command, encode_reply},
@@ -99,6 +100,19 @@ impl ControlPlaneService {
         self.auth.authenticate_authorization(authorization)
     }
 
+    pub(super) async fn register_deployment(
+        &self,
+        admin: &AdminService,
+        spec: &HostLaunchSpec,
+    ) -> Result<bool> {
+        let previous = admin.current_deployment(&spec.namespace_id).await?;
+        let changed = admin.ensure_namespace_and_register_deployment(spec).await?;
+        if changed && let Some(previous) = previous {
+            self.terminate_deployment_hosts(&previous).await;
+        }
+        Ok(changed)
+    }
+
     pub(super) fn warm_deployment_image(&self, spec: HostLaunchSpec, region: String) {
         let Some(provisioner) = self
             .routing
@@ -145,6 +159,41 @@ impl ControlPlaneService {
                 ),
             }
         });
+    }
+
+    async fn terminate_deployment_hosts(&self, spec: &HostLaunchSpec) {
+        let Some(provisioner) = self
+            .routing
+            .as_ref()
+            .and_then(|routing| routing.provisioner.as_ref())
+        else {
+            return;
+        };
+        let started_at = Instant::now();
+        match provisioner
+            .terminate_hosts(spec, &self.storage_urls.regions())
+            .await
+        {
+            Ok(termination) => info!(
+                event = "actor_hosts_terminated",
+                namespace_id = %spec.namespace_id,
+                code_revision = %spec.code_revision,
+                provider = %termination.provider,
+                resource_count = termination.resource_ids.len(),
+                total_ms = elapsed_ms(started_at),
+                outcome = "terminated",
+                "replaced deployment hosts terminated"
+            ),
+            Err(error) => warn!(
+                event = "actor_hosts_terminated",
+                namespace_id = %spec.namespace_id,
+                code_revision = %spec.code_revision,
+                total_ms = elapsed_ms(started_at),
+                outcome = "failed",
+                error = %format!("{error:#}"),
+                "replaced deployment hosts could not be terminated"
+            ),
+        }
     }
 
     pub(super) async fn invoke_workflow(
@@ -672,6 +721,11 @@ fn select_target_region(
 pub(crate) trait HostProvisioner: Send + Sync {
     async fn ensure_host(&self, spec: &HostLaunchSpec, region: &str) -> Result<HostLease>;
     async fn warm_image(&self, spec: &HostLaunchSpec, region: &str) -> Result<ImageWarmup>;
+    async fn terminate_hosts(
+        &self,
+        spec: &HostLaunchSpec,
+        regions: &[String],
+    ) -> Result<HostTermination>;
 }
 
 pub(crate) struct SandboxHostProvisioner {
@@ -759,6 +813,20 @@ impl HostProvisioner for SandboxHostProvisioner {
                 code_revision: spec.code_revision.clone(),
                 canonical_region: region.to_owned(),
                 image_ref: spec.image_ref.clone(),
+            })
+            .await
+    }
+
+    async fn terminate_hosts(
+        &self,
+        spec: &HostLaunchSpec,
+        regions: &[String],
+    ) -> Result<HostTermination> {
+        self.provider
+            .terminate_hosts(&TerminateHostsRequest {
+                namespace_id: spec.namespace_id.clone(),
+                code_revision: spec.code_revision.clone(),
+                canonical_regions: regions.to_vec(),
             })
             .await
     }
@@ -1221,6 +1289,95 @@ mod tests {
                 total_ms: 1,
             })
         }
+
+        async fn terminate_hosts(
+            &self,
+            _spec: &HostLaunchSpec,
+            _regions: &[String],
+        ) -> Result<HostTermination> {
+            anyhow::bail!("host termination is outside this test")
+        }
+    }
+
+    struct FakeRetiringProvisioner {
+        retired: tokio::sync::mpsc::UnboundedSender<(HostLaunchSpec, Vec<String>)>,
+    }
+
+    #[async_trait]
+    impl HostProvisioner for FakeRetiringProvisioner {
+        async fn ensure_host(&self, _spec: &HostLaunchSpec, _region: &str) -> Result<HostLease> {
+            anyhow::bail!("host creation is outside this test")
+        }
+
+        async fn warm_image(&self, _spec: &HostLaunchSpec, _region: &str) -> Result<ImageWarmup> {
+            anyhow::bail!("image warmup is outside this test")
+        }
+
+        async fn terminate_hosts(
+            &self,
+            spec: &HostLaunchSpec,
+            regions: &[String],
+        ) -> Result<HostTermination> {
+            self.retired.send((spec.clone(), regions.to_vec()))?;
+            Ok(HostTermination {
+                provider: "test".into(),
+                resource_ids: vec!["sandbox-1".into()],
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn replacing_a_deployment_terminates_the_previous_revision_hosts() -> Result<()> {
+        let issuer = test_issuer()?;
+        let auth = ActorJwtVerifier::for_scope(
+            issuer.verifier_keys_json()?,
+            "issuer",
+            "invocation",
+            ActorTokenPurpose::Invocation,
+            Duration::from_secs(60),
+        )?;
+        let registry = Arc::new(LocalAdminRegistry::default());
+        let admin = super::super::admin::AdminService::new(
+            "admin-token".into(),
+            registry.clone(),
+            issuer.clone(),
+        )?;
+        let (retired_tx, mut retired_rx) = tokio::sync::mpsc::unbounded_channel();
+        let service = ControlPlaneService::new(
+            Arc::new(FakeLeaseStore {
+                leases: Mutex::new(HashMap::new()),
+            }),
+            Arc::new(LocalObjectPlacementStore::default()),
+            Arc::new(FakeStorageUrls),
+            auth,
+        )
+        .with_routing(
+            registry,
+            issuer,
+            Some(Arc::new(FakeRetiringProvisioner {
+                retired: retired_tx,
+            })),
+        );
+        let first = HostLaunchSpec {
+            namespace_id: "project-1".into(),
+            code_revision: "revision-1".into(),
+            image_ref: "image-1".into(),
+            working_directory: "/workspace".into(),
+            actor_entrypoint: None,
+        };
+        let mut replacement = first.clone();
+        replacement.code_revision = "revision-2".into();
+        replacement.image_ref = "image-2".into();
+
+        assert!(service.register_deployment(&admin, &first).await?);
+        assert!(retired_rx.try_recv().is_err());
+        assert!(service.register_deployment(&admin, &replacement).await?);
+
+        assert_eq!(
+            retired_rx.recv().await,
+            Some((first, vec!["us-east".into()]))
+        );
+        Ok(())
     }
 
     #[tokio::test]

@@ -50,11 +50,26 @@ interface ImageWarmup {
     readonly totalMs: number
 }
 
+interface TerminateHostsRequest {
+    readonly namespaceId: string
+    readonly codeRevision: string
+    readonly canonicalRegions: readonly string[]
+}
+
+interface HostTermination {
+    readonly provider: string
+    readonly resourceIds: readonly string[]
+}
+
 interface SandboxProvider {
     ensureHost(request: EnsureHostRequest): Promise<ActorHostHandle>
     warmImage(request: WarmImageRequest): Promise<ImageWarmup>
+    terminateHosts(request: TerminateHostsRequest): Promise<HostTermination>
 }
 
-type SandboxProviderCommand = { readonly operation: "ensure_host"; readonly request: EnsureHostRequest } | { readonly operation: "warm_image"; readonly request: WarmImageRequest }
+type SandboxProviderCommand =
+    | { readonly operation: "ensure_host"; readonly request: EnsureHostRequest }
+    | { readonly operation: "warm_image"; readonly request: WarmImageRequest }
+    | { readonly operation: "terminate_hosts"; readonly request: TerminateHostsRequest }
 
-export type { ActorHostHandle, ActorHostProvisioning, EnsureHostRequest, ImageWarmup, SandboxProvider, SandboxProviderCommand, WarmImageRequest }
+export type { ActorHostHandle, ActorHostProvisioning, EnsureHostRequest, HostTermination, ImageWarmup, SandboxProvider, SandboxProviderCommand, TerminateHostsRequest, WarmImageRequest }

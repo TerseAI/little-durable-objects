@@ -71,10 +71,26 @@ pub struct ImageWarmup {
     pub total_ms: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminateHostsRequest {
+    pub namespace_id: String,
+    pub code_revision: String,
+    pub canonical_regions: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostTermination {
+    pub provider: String,
+    pub resource_ids: Vec<String>,
+}
+
 #[async_trait]
 pub trait SandboxProvider: Send + Sync {
     async fn ensure_host(&self, request: &EnsureHostRequest) -> Result<ActorHostHandle>;
     async fn warm_image(&self, request: &WarmImageRequest) -> Result<ImageWarmup>;
+    async fn terminate_hosts(&self, request: &TerminateHostsRequest) -> Result<HostTermination>;
 }
 
 #[derive(Clone)]
@@ -136,6 +152,10 @@ impl SandboxProvider for CommandSandboxProvider {
 
     async fn warm_image(&self, request: &WarmImageRequest) -> Result<ImageWarmup> {
         self.execute("warm_image", request).await
+    }
+
+    async fn terminate_hosts(&self, request: &TerminateHostsRequest) -> Result<HostTermination> {
+        self.execute("terminate_hosts", request).await
     }
 }
 

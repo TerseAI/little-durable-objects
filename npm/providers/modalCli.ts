@@ -16,6 +16,9 @@ async function main(): Promise<void> {
         case "warm_image":
             stdout.write(JSON.stringify(await provider.warmImage(command.request)))
             return
+        case "terminate_hosts":
+            stdout.write(JSON.stringify(await provider.terminateHosts(command.request)))
+            return
         default:
             throw new Error("unsupported sandbox operation")
     }
