@@ -183,6 +183,7 @@ jobs:
         runs-on: blacksmith-2vcpu-ubuntu-2404
         timeout-minutes: 10
         permissions:
+            artifact-metadata: write
             attestations: write
             contents: read
             id-token: write

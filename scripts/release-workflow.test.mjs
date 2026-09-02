@@ -12,6 +12,7 @@ test("release images use the established Terse Artifact Registry", () => {
     assert.match(workflow, /IMAGE: us-central1-docker\.pkg\.dev\/fluid-analogy-473415-c2\/public\/little-durable-objects/)
     assert.match(workflow, /google-github-actions\/auth@/)
     assert.match(workflow, /docker\/login-action@/)
+    assert.match(workflow, /artifact-metadata: write/)
     assert.doesNotMatch(workflow, /ghcr\.io/)
 })
 
