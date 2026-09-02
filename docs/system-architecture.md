@@ -38,5 +38,5 @@ GitHub release
     |
     +----> Blacksmith amd64 build ----+
     |                                 |
-    +----> Blacksmith arm64 build ----+----> GHCR manifest + provenance attestation
+    +----> Blacksmith arm64 build ----+----> Artifact Registry manifest + provenance attestation
 ```

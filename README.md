@@ -16,7 +16,7 @@ Install the Rust runtime from crates.io:
 cargo install little-durable-objects --locked
 ```
 
-Container builds can copy the binary from `ghcr.io/terseai/little-durable-objects:latest`. The image is a runtime base, not a complete actor sandbox: actor images also need Node.js, the project code, and `little-durable-objects` in the project's dependencies.
+Container builds can copy the binary from `us-central1-docker.pkg.dev/fluid-analogy-473415-c2/public/little-durable-objects:latest`. The image is a runtime base, not a complete actor sandbox: actor images also need Node.js, the project code, and `little-durable-objects` in the project's dependencies.
 
 ## Quickstart
 
