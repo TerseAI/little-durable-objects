@@ -1,8 +1,9 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 use tonic::{Request, Response, Status, metadata::MetadataValue, transport::Endpoint};
+use tracing::{info, warn};
 
 use crate::{
     actor::{ActorExecutionResult, ActorInvocation, ActorInvocationFailure, ActorKey},
@@ -102,8 +103,11 @@ impl ControlPlaneService {
         if let Err(failure) = validate_workflow_invocation(&principal, &invocation) {
             return failure;
         }
-        for _ in 0..MAX_ROUTE_ATTEMPTS {
-            match self.invoke_once(&invocation, &principal.region).await {
+        for attempt in 1..=MAX_ROUTE_ATTEMPTS {
+            match self
+                .invoke_once(&invocation, &principal.region, attempt)
+                .await
+            {
                 Ok(ActorExecutionResult::Reroute) => continue,
                 Ok(result) => return result,
                 Err(failure) => return failure,
@@ -183,31 +187,96 @@ impl ControlPlaneService {
         &self,
         invocation: &ActorInvocation,
         storage_region: &str,
+        attempt: usize,
     ) -> std::result::Result<ActorExecutionResult, ActorExecutionResult> {
-        let target = self
-            .route_actor(&invocation.actor, storage_region)
-            .await
-            .map_err(|error| {
-                failed(
+        let started_at = Instant::now();
+        let route_started_at = Instant::now();
+        let target = match self.route_actor(&invocation.actor, storage_region).await {
+            Ok(target) => target,
+            Err(error) => {
+                warn!(
+                    event = "actor_invocation",
+                    request_id = %invocation.request_id,
+                    namespace_id = %invocation.actor.namespace_id,
+                    actor_type = %invocation.actor.actor_type,
+                    actor_id = %invocation.actor.actor_id,
+                    method = %invocation.method,
+                    storage_region,
+                    attempt,
+                    route_ms = elapsed_ms(route_started_at),
+                    total_ms = elapsed_ms(started_at),
+                    outcome = "route_failed",
+                    error = %format!("{error:#}"),
+                    "actor invocation routing failed"
+                );
+                return Err(failed(
                     "unavailable",
                     format!("actor host is unavailable: {error:#}"),
-                )
-            })?;
+                ));
+            }
+        };
+        let route_ms = elapsed_ms(route_started_at);
         let routing = self
             .routing
             .as_ref()
             .expect("route_actor requires routing dependencies");
-        let reply = routing
+        let host_rpc_started_at = Instant::now();
+        let reply = match routing
             .invoker
             .invoke(invocation.clone(), &invocation.actor, &target)
             .await
-            .map_err(host_call_failure)?;
-        ActorExecutionResult::try_from(reply).map_err(|error| {
+        {
+            Ok(reply) => reply,
+            Err(error) => {
+                warn!(
+                    event = "actor_invocation",
+                    request_id = %invocation.request_id,
+                    namespace_id = %invocation.actor.namespace_id,
+                    actor_type = %invocation.actor.actor_type,
+                    actor_id = %invocation.actor.actor_id,
+                    method = %invocation.method,
+                    storage_region,
+                    home_region = %target.placement.home_region,
+                    host_id = %target.lease.id,
+                    host_reused = target.host_reused,
+                    attempt,
+                    route_ms,
+                    host_rpc_ms = elapsed_ms(host_rpc_started_at),
+                    total_ms = elapsed_ms(started_at),
+                    outcome = host_call_error_label(&error),
+                    error = %host_call_error_message(&error),
+                    "actor host invocation failed"
+                );
+                return Err(host_call_failure(error));
+            }
+        };
+        let host_rpc_ms = elapsed_ms(host_rpc_started_at);
+        let result = ActorExecutionResult::try_from(reply).map_err(|error| {
             failed(
                 "outcome_unknown",
                 format!("actor host returned an invalid reply: {error:#}"),
             )
-        })
+        })?;
+        info!(
+            event = "actor_invocation",
+            request_id = %invocation.request_id,
+            namespace_id = %invocation.actor.namespace_id,
+            actor_type = %invocation.actor.actor_type,
+            actor_id = %invocation.actor.actor_id,
+            method = %invocation.method,
+            storage_region,
+            home_region = %target.placement.home_region,
+            host_id = %target.lease.id,
+            host_reused = target.host_reused,
+            attempt,
+            route_ms,
+            host_rpc_ms,
+            total_ms = elapsed_ms(started_at),
+            outcome = actor_execution_outcome(&result),
+            failure_code = actor_execution_failure_code(&result).unwrap_or(""),
+            "actor invocation completed"
+        );
+        Ok(result)
     }
 
     async fn register_lease(
@@ -298,6 +367,7 @@ impl ControlPlaneService {
                         placement,
                         lease,
                         spec,
+                        host_reused: false,
                     });
                 }
                 PlacementClaim::Acquired(_) | PlacementClaim::Current(_) => continue,
@@ -367,6 +437,7 @@ impl ControlPlaneService {
             placement: placement.clone(),
             lease: status.lease.context("active lease is missing")?,
             spec: spec.clone(),
+            host_reused: true,
         }))
     }
 
@@ -427,11 +498,56 @@ impl SandboxHostProvisioner {
 #[async_trait]
 impl HostProvisioner for SandboxHostProvisioner {
     async fn ensure_host(&self, spec: &HostLaunchSpec, region: &str) -> Result<HostLease> {
-        let handle = self
-            .provider
-            .ensure_host(&self.request(spec, region)?)
-            .await?;
-        self.active_lease(handle, region).await
+        let started_at = Instant::now();
+        let request = self.request(spec, region)?;
+        let provider_started_at = Instant::now();
+        let handle = match self.provider.ensure_host(&request).await {
+            Ok(handle) => handle,
+            Err(error) => {
+                warn!(
+                    event = "actor_host_provisioning",
+                    namespace_id = %spec.namespace_id,
+                    code_revision = %spec.code_revision,
+                    region,
+                    host_id = %request.host_id,
+                    provider_command_ms = elapsed_ms(provider_started_at),
+                    total_ms = elapsed_ms(started_at),
+                    outcome = "provider_failed",
+                    error = %format!("{error:#}"),
+                    "actor host provisioning failed"
+                );
+                return Err(error);
+            }
+        };
+        let provider_command_ms = elapsed_ms(provider_started_at);
+        let provisioning = handle.provisioning.clone();
+        let lease_started_at = Instant::now();
+        let lease = self.active_lease(handle, region).await?;
+        let lease_validation_ms = elapsed_ms(lease_started_at);
+        info!(
+            event = "actor_host_provisioning",
+            namespace_id = %spec.namespace_id,
+            code_revision = %spec.code_revision,
+            region,
+            host_id = %lease.id,
+            provider = provisioning.as_ref().map(|value| value.provider.as_str()).unwrap_or("unknown"),
+            provider_resource_id = provisioning.as_ref().map(|value| value.resource_id.as_str()).unwrap_or(""),
+            provider_reused = provisioning.as_ref().is_some_and(|value| value.reused),
+            provider_resource_lookup_ms = provisioning.as_ref().map_or(0, |value| value.resource_lookup_ms),
+            provider_existing_lookup_ms = provisioning.as_ref().map_or(0, |value| value.existing_lookup_ms),
+            provider_create_ms = provisioning.as_ref().map_or(0, |value| value.create_ms),
+            provider_placement_ms = provisioning.as_ref().map_or(0, |value| value.placement_ms),
+            provider_tunnel_ms = provisioning.as_ref().map_or(0, |value| value.tunnel_ms),
+            provider_ready_ms = provisioning.as_ref().map_or(0, |value| value.ready_ms),
+            provider_metadata_ms = provisioning.as_ref().map_or(0, |value| value.metadata_ms),
+            provider_total_ms = provisioning.as_ref().map_or(0, |value| value.total_ms),
+            provider_command_ms,
+            lease_validation_ms,
+            total_ms = elapsed_ms(started_at),
+            outcome = "ready",
+            "actor host provisioning completed"
+        );
+        Ok(lease)
     }
 }
 
@@ -526,21 +642,39 @@ impl HostInvoker for GrpcHostInvoker {
         actor: &ActorKey,
         target: &RoutedActor,
     ) -> std::result::Result<InvokeActorReply, HostCallError> {
-        let request = Self::request(
-            invocation,
-            target,
-            self.read_url(actor, target).await?,
-            self.token(actor, target)?,
-        )?;
-        ActorHostServiceClient::new(self.connect(target).await?)
-            .invoke(request)
-            .await
-            .map(|reply| reply.into_inner())
-            .map_err(|error| {
-                HostCallError::OutcomeUnknown(format!(
-                    "actor host RPC failed after dispatch: {error}"
-                ))
-            })
+        let started_at = Instant::now();
+        let request_id = invocation.request_id.clone();
+        let state_read_url_started_at = Instant::now();
+        let read_url = self.read_url(actor, target).await?;
+        let state_read_url_ms = elapsed_ms(state_read_url_started_at);
+        let request_started_at = Instant::now();
+        let request = Self::request(invocation, target, read_url, self.token(actor, target)?)?;
+        let request_setup_ms = elapsed_ms(request_started_at);
+        let connect_started_at = Instant::now();
+        let channel = self.connect(target).await?;
+        let connect_ms = elapsed_ms(connect_started_at);
+        let rpc_started_at = Instant::now();
+        let response = ActorHostServiceClient::new(channel).invoke(request).await;
+        let rpc_ms = elapsed_ms(rpc_started_at);
+        info!(
+            event = "actor_host_rpc",
+            request_id,
+            namespace_id = %actor.namespace_id,
+            actor_type = %actor.actor_type,
+            actor_id = %actor.actor_id,
+            home_region = %target.placement.home_region,
+            host_id = %target.lease.id,
+            state_read_url_ms,
+            request_setup_ms,
+            connect_ms,
+            rpc_ms,
+            total_ms = elapsed_ms(started_at),
+            outcome = if response.is_ok() { "rpc_ok" } else { "rpc_error" },
+            "actor host RPC completed"
+        );
+        response.map(|reply| reply.into_inner()).map_err(|error| {
+            HostCallError::OutcomeUnknown(format!("actor host RPC failed after dispatch: {error}"))
+        })
     }
 }
 
@@ -619,11 +753,45 @@ struct RoutedActor {
     placement: ObjectPlacement,
     lease: HostLease,
     spec: HostLaunchSpec,
+    host_reused: bool,
 }
 
 enum HostCallError {
     Unavailable(String),
     OutcomeUnknown(String),
+}
+
+fn actor_execution_outcome(result: &ActorExecutionResult) -> &'static str {
+    match result {
+        ActorExecutionResult::Completed { .. } => "completed",
+        ActorExecutionResult::Failed { .. } => "failed",
+        ActorExecutionResult::Reroute => "reroute",
+        ActorExecutionResult::HostUnavailable => "host_unavailable",
+    }
+}
+
+fn actor_execution_failure_code(result: &ActorExecutionResult) -> Option<&str> {
+    match result {
+        ActorExecutionResult::Failed { failure } => Some(&failure.code),
+        _ => None,
+    }
+}
+
+fn host_call_error_label(error: &HostCallError) -> &'static str {
+    match error {
+        HostCallError::Unavailable(_) => "host_unavailable",
+        HostCallError::OutcomeUnknown(_) => "outcome_unknown",
+    }
+}
+
+fn host_call_error_message(error: &HostCallError) -> &str {
+    match error {
+        HostCallError::Unavailable(message) | HostCallError::OutcomeUnknown(message) => message,
+    }
+}
+
+fn elapsed_ms(started_at: Instant) -> f64 {
+    started_at.elapsed().as_secs_f64() * 1_000.0
 }
 
 fn validate_workflow_invocation(

@@ -6,10 +6,12 @@ import { test } from "node:test"
 import { ModalSandboxProvider } from "./modal.js"
 import type { EnsureHostRequest } from "./types.js"
 
-test("creates Modal with the host as its main process and injects only runtime credentials", async () => {
+test("creates a V2 Modal sandbox with the host as its main process and reports provisioning timings", async () => {
     let createOptions: SandboxCreateParams | undefined
+    let usedLegacyCreate = false
     const files = new Map<string, string>()
     const sandbox = {
+        sandboxId: "sb-v2-actor",
         async exec(command: string[]) {
             const placement = command.join(" ").includes("MODAL_CLOUD_PROVIDER")
             return {
@@ -31,16 +33,9 @@ test("creates Modal with the host as its main process and injects only runtime c
         async tunnels() {
             return { 7101: { url: "https://host.example.com" } }
         },
-        async open(path: string) {
-            let contents = ""
-            return {
-                async write(value: Uint8Array) {
-                    contents += new TextDecoder().decode(value)
-                },
-                async flush() {
-                    files.set(path, contents)
-                },
-                async close() {}
+        filesystem: {
+            async writeText(contents: string, path: string) {
+                files.set(path, contents)
             }
         },
         async terminate() {}
@@ -64,24 +59,42 @@ test("creates Modal with the host as its main process and injects only runtime c
             async delete() {}
         },
         sandboxes: {
-            async fromName() {
+            async experimentalFromName() {
                 throw new NotFoundError("not found")
             },
-            async create(_app: unknown, _image: unknown, options: SandboxCreateParams) {
+            async experimentalCreate(_app: unknown, _image: unknown, options: SandboxCreateParams) {
                 createOptions = options
                 return sandbox
+            },
+            async create() {
+                usedLegacyCreate = true
+                throw new Error("legacy Sandbox creation must not be used")
             }
         }
     }
-    const provider = new ModalSandboxProvider({ client: client as unknown as ModalClient })
+    const provider = new ModalSandboxProvider({ client: client as unknown as ModalClient, now: () => 0 })
 
     const handle = await provider.ensureHost(request())
 
     assert.deepEqual(handle, {
         hostId: "host.v1.project-1.00000000-0000-4000-8000-000000000001",
         route: "https://host.example.com",
-        canonicalRegion: "north-america-east"
+        canonicalRegion: "north-america-east",
+        provisioning: {
+            provider: "modal",
+            resourceId: "sb-v2-actor",
+            reused: false,
+            resourceLookupMs: 0,
+            existingLookupMs: 0,
+            createMs: 0,
+            placementMs: 0,
+            tunnelMs: 0,
+            readyMs: 0,
+            metadataMs: 0,
+            totalMs: 0
+        }
     })
+    assert.equal(usedLegacyCreate, false)
     assert.equal(createOptions?.timeoutMs, 86_400_000)
     assert.equal(createOptions?.idleTimeoutMs, 300_000)
     assert.equal(createOptions?.command?.[5], "/usr/local/bin/little-durable-objects")
@@ -98,6 +111,7 @@ test("creates Modal with the host as its main process and injects only runtime c
 test("surfaces host stderr when the main process exits before readiness", async () => {
     let terminated = false
     const sandbox = {
+        sandboxId: "sb-v2-failed",
         async exec(command: string[]) {
             const placement = command.join(" ").includes("MODAL_CLOUD_PROVIDER")
             return {
@@ -119,12 +133,8 @@ test("surfaces host stderr when the main process exits before readiness", async 
         async tunnels() {
             return { 7101: { url: "https://host.example.com" } }
         },
-        async open() {
-            return {
-                async write() {},
-                async flush() {},
-                async close() {}
-            }
+        filesystem: {
+            async writeText() {}
         },
         async terminate() {
             terminated = true
@@ -142,10 +152,10 @@ test("surfaces host stderr when the main process exits before readiness", async 
             }
         },
         sandboxes: {
-            async fromName() {
+            async experimentalFromName() {
                 throw new NotFoundError("not found")
             },
-            async create() {
+            async experimentalCreate() {
                 return sandbox
             }
         }

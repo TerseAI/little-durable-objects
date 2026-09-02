@@ -18,8 +18,8 @@ importers:
   npm:
     dependencies:
       modal:
-        specifier: ^0.7.2
-        version: 0.7.6
+        specifier: ^0.10.0
+        version: 0.10.0
       tsx:
         specifier: ^4.0.0
         version: 4.23.13
@@ -430,8 +430,8 @@ packages:
     resolution: {integrity: sha512-OBwBN9AL4dqmETlpS2zasx+vTeWclWzkblfZk7KTA5j3jeOONz/tRCnZomUyvNg83wL5Zv9Ss6HMJXAgL8R2Yg==}
     engines: {node: '>=16 || 14 >=14.17'}
 
-  modal@0.7.6:
-    resolution: {integrity: sha512-AOFRO/eGl4fcNKxHkNLx55+tL318IeAiTDJCMh/Q1ZXhoaZFnpmlirVV2J5BhO32XLA7AiH6KYGA7gRBGA09lQ==}
+  modal@0.10.0:
+    resolution: {integrity: sha512-RNjl05KEizIYHRa3t43PBEOhiU2w6O+MXCzMLgkBdx3qSw+oA4dSspG3YiNFdCOZZEg8ikmFMcmtsr/xj+rASQ==}
 
   ms@2.1.3:
     resolution: {integrity: sha512-6FlzubTLZG3J2a/NVCAleEhjzq5oxgHyaCU9yYXvcLsvoVaHJq/s5xXI6/XXP6tz7R9xAOtHnSO/tXtF3WRTlA==}
@@ -835,7 +835,7 @@ snapshots:
     dependencies:
       brace-expansion: 2.1.4
 
-  modal@0.7.6:
+  modal@0.10.0:
     dependencies:
       cbor-x: 1.6.6
       long: 5.3.2

@@ -20,6 +20,21 @@ interface ActorHostHandle {
     readonly hostId: string
     readonly route: string
     readonly canonicalRegion: string
+    readonly provisioning?: ActorHostProvisioning
+}
+
+interface ActorHostProvisioning {
+    readonly provider: string
+    readonly resourceId: string
+    readonly reused: boolean
+    readonly resourceLookupMs: number
+    readonly existingLookupMs: number
+    readonly createMs: number
+    readonly placementMs: number
+    readonly tunnelMs: number
+    readonly readyMs: number
+    readonly metadataMs: number
+    readonly totalMs: number
 }
 
 interface SandboxProvider {
@@ -28,4 +43,4 @@ interface SandboxProvider {
 
 type SandboxProviderCommand = { readonly operation: "ensure_host"; readonly request: EnsureHostRequest }
 
-export type { ActorHostHandle, EnsureHostRequest, SandboxProvider, SandboxProviderCommand }
+export type { ActorHostHandle, ActorHostProvisioning, EnsureHostRequest, SandboxProvider, SandboxProviderCommand }

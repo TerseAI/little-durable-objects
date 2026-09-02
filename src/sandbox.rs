@@ -35,6 +35,23 @@ pub struct ActorHostHandle {
     pub host_id: HostId,
     pub route: String,
     pub canonical_region: String,
+    pub provisioning: Option<ActorHostProvisioning>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActorHostProvisioning {
+    pub provider: String,
+    pub resource_id: String,
+    pub reused: bool,
+    pub resource_lookup_ms: u64,
+    pub existing_lookup_ms: u64,
+    pub create_ms: u64,
+    pub placement_ms: u64,
+    pub tunnel_ms: u64,
+    pub ready_ms: u64,
+    pub metadata_ms: u64,
+    pub total_ms: u64,
 }
 
 #[async_trait]
@@ -158,6 +175,34 @@ struct ProviderCommand<'a, Request> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decodes_provider_provisioning_timings() {
+        let handle: ActorHostHandle = serde_json::from_value(serde_json::json!({
+            "hostId": "host.v1.namespace.revision.session",
+            "route": "https://host.example.com",
+            "canonicalRegion": "north-america-east",
+            "provisioning": {
+                "provider": "modal",
+                "resourceId": "sb-actor",
+                "reused": false,
+                "resourceLookupMs": 12,
+                "existingLookupMs": 34,
+                "createMs": 56,
+                "placementMs": 78,
+                "tunnelMs": 90,
+                "readyMs": 123,
+                "metadataMs": 4,
+                "totalMs": 397
+            }
+        }))
+        .expect("actor host handle");
+
+        let provisioning = handle.provisioning.expect("provisioning timings");
+        assert_eq!(provisioning.resource_id, "sb-actor");
+        assert_eq!(provisioning.create_ms, 56);
+        assert_eq!(provisioning.total_ms, 397);
+    }
 
     #[test]
     fn rejects_ambiguous_command_configuration() {

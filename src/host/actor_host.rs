@@ -3,14 +3,14 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio::sync::{Notify, watch};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::{
     actor::{
@@ -106,38 +106,110 @@ impl ActorHost {
         owner_epoch: u64,
         state_read_url: String,
     ) -> Result<ActorExecutionResult> {
-        if let Some(result) = self.validate_invocation(&invocation)? {
+        let started_at = Instant::now();
+        let mut timings = InvocationTimings::default();
+        let outcome = self
+            .invoke_actor_once(&invocation, owner_epoch, &state_read_url, &mut timings)
+            .await;
+        self.log_invocation(&invocation, started_at, &timings, &outcome);
+        outcome
+    }
+
+    async fn invoke_actor_once(
+        &self,
+        invocation: &ActorInvocation,
+        owner_epoch: u64,
+        state_read_url: &str,
+        timings: &mut InvocationTimings,
+    ) -> Result<ActorExecutionResult> {
+        if let Some(result) = self.validate_invocation(invocation)? {
             return Ok(result);
         }
         let _activity = ActivityGuard::begin(self);
         let object = invocation.actor.storage_key();
+        let queue_started_at = Instant::now();
         let _execution = match self.executions.admit(&object).await? {
             ActorExecutionAdmission::Acquired(guard) => guard,
             ActorExecutionAdmission::Full => return Ok(ActorExecutionResult::HostUnavailable),
         };
+        timings.queue_ms = elapsed_ms(queue_started_at);
         if !self.accepting.load(Ordering::SeqCst) {
             return Ok(ActorExecutionResult::HostUnavailable);
         }
-        let mut loaded = match self
-            .load_owned_state(&invocation, owner_epoch, &state_read_url)
-            .await?
-        {
+        let state_load_started_at = Instant::now();
+        let loaded = self
+            .load_owned_state(invocation, owner_epoch, state_read_url)
+            .await;
+        timings.state_load_ms = elapsed_ms(state_load_started_at);
+        let mut loaded = match loaded? {
             OwnershipRead::Owned(loaded) => loaded,
             OwnershipRead::Reroute => return Ok(ActorExecutionResult::Reroute),
         };
-        let (result, next_state) = match self.execute_method(&invocation, &loaded).await {
+        let execution_started_at = Instant::now();
+        let executed = self.execute_method(invocation, &loaded).await;
+        timings.actor_execution_ms = elapsed_ms(execution_started_at);
+        let (result, next_state) = match executed {
             Ok(outcome) => outcome,
             Err(failure) => return Ok(failure),
         };
         let append = match loaded.log.append(owner_epoch, next_state) {
             Ok(append) => append,
-            Err(error) => return Ok(self.state_failure(&invocation, error).await),
+            Err(error) => return Ok(self.state_failure(invocation, error).await),
         };
         if append == StateAppend::Unchanged {
             return Ok(ActorExecutionResult::Completed { result });
         }
-        self.publish_result(&invocation, owner_epoch, loaded, result)
-            .await
+        let state_publish_started_at = Instant::now();
+        let published = self
+            .publish_result(invocation, owner_epoch, loaded, result)
+            .await;
+        timings.state_publish_ms = elapsed_ms(state_publish_started_at);
+        published
+    }
+
+    fn log_invocation(
+        &self,
+        invocation: &ActorInvocation,
+        started_at: Instant,
+        timings: &InvocationTimings,
+        outcome: &Result<ActorExecutionResult>,
+    ) {
+        match outcome {
+            Ok(result) => info!(
+                event = "actor_host_invocation",
+                request_id = %invocation.request_id,
+                namespace_id = %invocation.actor.namespace_id,
+                actor_type = %invocation.actor.actor_type,
+                actor_id = %invocation.actor.actor_id,
+                method = %invocation.method,
+                host_id = %self.endpoint.id,
+                queue_ms = timings.queue_ms,
+                state_load_ms = timings.state_load_ms,
+                actor_execution_ms = timings.actor_execution_ms,
+                state_publish_ms = timings.state_publish_ms,
+                total_ms = elapsed_ms(started_at),
+                outcome = actor_execution_outcome(result),
+                failure_code = actor_execution_failure_code(result).unwrap_or(""),
+                "actor host invocation completed"
+            ),
+            Err(error) => warn!(
+                event = "actor_host_invocation",
+                request_id = %invocation.request_id,
+                namespace_id = %invocation.actor.namespace_id,
+                actor_type = %invocation.actor.actor_type,
+                actor_id = %invocation.actor.actor_id,
+                method = %invocation.method,
+                host_id = %self.endpoint.id,
+                queue_ms = timings.queue_ms,
+                state_load_ms = timings.state_load_ms,
+                actor_execution_ms = timings.actor_execution_ms,
+                state_publish_ms = timings.state_publish_ms,
+                total_ms = elapsed_ms(started_at),
+                outcome = "host_error",
+                error = %format!("{error:#}"),
+                "actor host invocation failed"
+            ),
+        }
     }
 
     pub(crate) async fn drain(&self, timeout: Duration) -> Result<()> {
@@ -267,11 +339,11 @@ impl ActorHost {
         owner_epoch: u64,
         loaded: &LoadedState,
     ) -> Result<bool> {
-        let write_url = self
-            .authorize_write(invocation, owner_epoch, &loaded.generation)
+        match self
+            .write_state(invocation, owner_epoch, loaded, "ownership_claim")
             .await
-            .context("authorize actor ownership claim")?;
-        match self.state.write(&write_url, loaded.log.encode()?).await? {
+            .context("publish actor ownership claim")?
+        {
             StateWrite::Written => Ok(true),
             StateWrite::GenerationMismatch => Ok(false),
         }
@@ -283,15 +355,90 @@ impl ActorHost {
         owner_epoch: u64,
         loaded: &LoadedState,
     ) -> Result<()> {
-        let write_url = self
-            .authorize_write(invocation, owner_epoch, &loaded.generation)
-            .await?;
-        match self.state.write(&write_url, loaded.log.encode()?).await? {
+        match self
+            .write_state(invocation, owner_epoch, loaded, "result")
+            .await?
+        {
             StateWrite::Written => Ok(()),
             StateWrite::GenerationMismatch => {
                 anyhow::bail!("actor state generation changed during execution")
             }
         }
+    }
+
+    async fn write_state(
+        &self,
+        invocation: &ActorInvocation,
+        owner_epoch: u64,
+        loaded: &LoadedState,
+        write_kind: &'static str,
+    ) -> Result<StateWrite> {
+        let started_at = Instant::now();
+        let authorization_started_at = Instant::now();
+        let write_url = match self
+            .authorize_write(invocation, owner_epoch, &loaded.generation)
+            .await
+        {
+            Ok(write_url) => write_url,
+            Err(error) => {
+                warn!(
+                    event = "actor_state_write",
+                    request_id = %invocation.request_id,
+                    namespace_id = %invocation.actor.namespace_id,
+                    actor_type = %invocation.actor.actor_type,
+                    actor_id = %invocation.actor.actor_id,
+                    host_id = %self.endpoint.id,
+                    write_kind,
+                    authorization_ms = elapsed_ms(authorization_started_at),
+                    total_ms = elapsed_ms(started_at),
+                    outcome = "authorization_failed",
+                    error = %format!("{error:#}"),
+                    "actor state write failed"
+                );
+                return Err(error);
+            }
+        };
+        let authorization_ms = elapsed_ms(authorization_started_at);
+        let encode_started_at = Instant::now();
+        let bytes = loaded.log.encode()?;
+        let encode_ms = elapsed_ms(encode_started_at);
+        let storage_started_at = Instant::now();
+        let outcome = self.state.write(&write_url, bytes).await;
+        let storage_ms = elapsed_ms(storage_started_at);
+        match &outcome {
+            Ok(result) => info!(
+                event = "actor_state_write",
+                request_id = %invocation.request_id,
+                namespace_id = %invocation.actor.namespace_id,
+                actor_type = %invocation.actor.actor_type,
+                actor_id = %invocation.actor.actor_id,
+                host_id = %self.endpoint.id,
+                write_kind,
+                authorization_ms,
+                encode_ms,
+                storage_ms,
+                total_ms = elapsed_ms(started_at),
+                outcome = state_write_outcome(result),
+                "actor state write completed"
+            ),
+            Err(error) => warn!(
+                event = "actor_state_write",
+                request_id = %invocation.request_id,
+                namespace_id = %invocation.actor.namespace_id,
+                actor_type = %invocation.actor.actor_type,
+                actor_id = %invocation.actor.actor_id,
+                host_id = %self.endpoint.id,
+                write_kind,
+                authorization_ms,
+                encode_ms,
+                storage_ms,
+                total_ms = elapsed_ms(started_at),
+                outcome = "storage_failed",
+                error = %format!("{error:#}"),
+                "actor state write failed"
+            ),
+        }
+        outcome
     }
 
     async fn authorize_write(
@@ -326,6 +473,41 @@ impl ActorHost {
 enum OwnershipRead {
     Owned(LoadedState),
     Reroute,
+}
+
+#[derive(Default)]
+struct InvocationTimings {
+    queue_ms: f64,
+    state_load_ms: f64,
+    actor_execution_ms: f64,
+    state_publish_ms: f64,
+}
+
+fn actor_execution_outcome(result: &ActorExecutionResult) -> &'static str {
+    match result {
+        ActorExecutionResult::Completed { .. } => "completed",
+        ActorExecutionResult::Failed { .. } => "failed",
+        ActorExecutionResult::Reroute => "reroute",
+        ActorExecutionResult::HostUnavailable => "host_unavailable",
+    }
+}
+
+fn actor_execution_failure_code(result: &ActorExecutionResult) -> Option<&str> {
+    match result {
+        ActorExecutionResult::Failed { failure } => Some(&failure.code),
+        _ => None,
+    }
+}
+
+fn state_write_outcome(result: &StateWrite) -> &'static str {
+    match result {
+        StateWrite::Written => "written",
+        StateWrite::GenerationMismatch => "generation_mismatch",
+    }
+}
+
+fn elapsed_ms(started_at: Instant) -> f64 {
+    started_at.elapsed().as_secs_f64() * 1_000.0
 }
 
 fn has_newer_owner(loaded: &LoadedState, owner_epoch: u64) -> bool {
