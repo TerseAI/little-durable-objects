@@ -199,6 +199,20 @@ jobs:
             - name: Configure Docker for Artifact Registry
               run: gcloud auth configure-docker ${{ env.REGISTRY }} --quiet
 
+            - name: Read Artifact Registry access token
+              id: registry
+              run: |
+                  token="$(gcloud auth print-access-token)"
+                  echo "::add-mask::$token"
+                  echo "token=$token" >> "$GITHUB_OUTPUT"
+
+            - name: Sign in for provenance upload
+              uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+              with:
+                  registry: ${{ env.REGISTRY }}
+                  username: oauth2accesstoken
+                  password: ${{ steps.registry.outputs.token }}
+
             - name: Publish multi-platform manifest
               id: manifest
               env:
