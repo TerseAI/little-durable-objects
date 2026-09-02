@@ -69,7 +69,9 @@ Container builds can copy the binary from `us-central1-docker.pkg.dev/fluid-anal
    POST /v1/namespaces/{namespaceId}/workflow-tokens
    ```
 
-   The deployment call atomically ensures the namespace and registers its active deployment. Its body is `{ "codeRevision", "imageRef", "workingDirectory", "actorEntrypoint" }`. The workflow-token body is `{ "executionId", "deadlineUnixMs" }`.
+   The deployment call atomically ensures the namespace and registers its active deployment. Its body is `{ "codeRevision", "imageRef", "workingDirectory", "actorEntrypoint" }`. The workflow-token body is `{ "executionId", "deadlineUnixMs", "storageRegion" }`.
+
+   `storageRegion` selects the home region only when an actor is first created. Later invocations route over gRPC to the actor's existing host region.
 
    `image_ref` is a Modal image containing Node.js, your built project, its dependencies, and `little-durable-objects` at `/usr/local/bin/little-durable-objects`.
 

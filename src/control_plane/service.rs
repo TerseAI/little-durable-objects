@@ -103,7 +103,7 @@ impl ControlPlaneService {
             return failure;
         }
         for _ in 0..MAX_ROUTE_ATTEMPTS {
-            match self.invoke_once(&invocation).await {
+            match self.invoke_once(&invocation, &principal.region).await {
                 Ok(ActorExecutionResult::Reroute) => continue,
                 Ok(result) => return result,
                 Err(failure) => return failure,
@@ -182,13 +182,17 @@ impl ControlPlaneService {
     async fn invoke_once(
         &self,
         invocation: &ActorInvocation,
+        storage_region: &str,
     ) -> std::result::Result<ActorExecutionResult, ActorExecutionResult> {
-        let target = self.route_actor(&invocation.actor).await.map_err(|error| {
-            failed(
-                "unavailable",
-                format!("actor host is unavailable: {error:#}"),
-            )
-        })?;
+        let target = self
+            .route_actor(&invocation.actor, storage_region)
+            .await
+            .map_err(|error| {
+                failed(
+                    "unavailable",
+                    format!("actor host is unavailable: {error:#}"),
+                )
+            })?;
         let routing = self
             .routing
             .as_ref()
@@ -261,7 +265,7 @@ impl ControlPlaneService {
         })
     }
 
-    async fn route_actor(&self, actor: &ActorKey) -> Result<RoutedActor> {
+    async fn route_actor(&self, actor: &ActorKey, storage_region: &str) -> Result<RoutedActor> {
         let routing = self
             .routing
             .as_ref()
@@ -276,7 +280,7 @@ impl ControlPlaneService {
             if let Some(target) = self.active_target(&current, &spec).await? {
                 return Ok(target);
             }
-            let region = self.target_region(current.as_ref())?;
+            let region = self.target_region(current.as_ref(), storage_region)?;
             let provisioner = routing
                 .provisioner
                 .as_ref()
@@ -366,12 +370,30 @@ impl ControlPlaneService {
         }))
     }
 
-    fn target_region(&self, current: Option<&ObjectPlacement>) -> Result<String> {
-        current
-            .map(|placement| placement.home_region.clone())
-            .or_else(|| self.storage_urls.regions().into_iter().next())
-            .context("no sandbox region has a Standard bucket")
+    fn target_region(
+        &self,
+        current: Option<&ObjectPlacement>,
+        storage_region: &str,
+    ) -> Result<String> {
+        select_target_region(current, storage_region, &self.storage_urls.regions())
     }
+}
+
+fn select_target_region(
+    current: Option<&ObjectPlacement>,
+    storage_region: &str,
+    configured_regions: &[String],
+) -> Result<String> {
+    if let Some(placement) = current {
+        return Ok(placement.home_region.clone());
+    }
+    ensure!(
+        configured_regions
+            .iter()
+            .any(|region| region == storage_region),
+        "workflow storage region has no Standard bucket"
+    );
+    Ok(storage_region.to_owned())
 }
 
 #[async_trait]
@@ -709,6 +731,7 @@ mod tests {
     use super::*;
     use crate::{
         actor::ActorScope,
+        actor_state::ActorStorageKey,
         host_leases::{HostLeaseRegistry, HostLeaseRequest, HostLeaseStatus},
         placement::LocalObjectPlacementStore,
     };
@@ -861,6 +884,33 @@ mod tests {
                 result: json!({ "count": 1 })
             }
         );
+        Ok(())
+    }
+
+    #[test]
+    fn new_actors_use_the_workflow_region_and_existing_actors_stay_pinned() -> Result<()> {
+        let regions = vec![
+            "north-america-east".into(),
+            "north-america-central".into(),
+            "north-america-west".into(),
+        ];
+        let actor = ActorStorageKey::new("object.v1.project.Counter.one");
+        let current = ObjectPlacement {
+            object: actor,
+            owner: HostId::new("host.v1.project.revision.host"),
+            owner_epoch: 1,
+            home_region: "north-america-east".into(),
+        };
+
+        assert_eq!(
+            select_target_region(None, "north-america-central", &regions)?,
+            "north-america-central"
+        );
+        assert_eq!(
+            select_target_region(Some(&current), "north-america-west", &regions)?,
+            "north-america-east"
+        );
+        assert!(select_target_region(None, "europe-west", &regions).is_err());
         Ok(())
     }
 

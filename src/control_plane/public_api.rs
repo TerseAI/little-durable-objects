@@ -91,6 +91,7 @@ async fn issue_workflow_token(
         .issue_workflow_token(
             &namespace_id,
             &request.execution_id,
+            &request.storage_region,
             request.deadline_unix_ms,
         )
         .map_err(ApiError::bad_request)?;
@@ -235,6 +236,7 @@ struct RegisterDeploymentRequest {
 struct IssueWorkflowTokenRequest {
     execution_id: String,
     deadline_unix_ms: i64,
+    storage_region: String,
 }
 
 #[derive(Deserialize)]
@@ -351,6 +353,18 @@ struct ErrorBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workflow_token_request_accepts_a_storage_region() {
+        let request: IssueWorkflowTokenRequest = serde_json::from_value(serde_json::json!({
+            "executionId": "execution-1",
+            "deadlineUnixMs": 1_800_000_000_000_i64,
+            "storageRegion": "north-america-west"
+        }))
+        .unwrap();
+
+        assert_eq!(request.storage_region, "north-america-west");
+    }
 
     #[test]
     fn maps_distributed_outcomes_to_http_statuses() {

@@ -107,10 +107,11 @@ impl AdminService {
         &self,
         namespace_id: &str,
         execution_id: &str,
+        storage_region: &str,
         deadline_unix_ms: i64,
     ) -> Result<IssuedActorToken> {
         self.issuer
-            .issue_workflow(namespace_id, execution_id, deadline_unix_ms)
+            .issue_workflow(namespace_id, execution_id, storage_region, deadline_unix_ms)
     }
 
     pub(crate) fn jwks_json(&self) -> Result<Vec<u8>> {

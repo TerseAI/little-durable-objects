@@ -12,7 +12,10 @@ use jsonwebtoken::{
 };
 use serde::Serialize;
 
-use crate::host::{ActorProcessRole, HostId};
+use crate::{
+    host::{ActorProcessRole, HostId},
+    placement::validate_region,
+};
 
 const WORKFLOW_DEADLINE_GRACE: Duration = Duration::from_secs(30);
 
@@ -102,8 +105,10 @@ impl ActorJwtIssuer {
         &self,
         namespace_id: &str,
         execution_id: &str,
+        storage_region: &str,
         deadline_unix_ms: i64,
     ) -> Result<IssuedActorToken> {
+        validate_region(storage_region)?;
         let now_ms = unix_millis()?;
         ensure!(
             deadline_unix_ms > now_ms,
@@ -125,7 +130,7 @@ impl ActorJwtIssuer {
             process_id,
             session_id: uuid::Uuid::new_v4().to_string(),
             process_role: ActorProcessRole::Workflow,
-            region: "auto".into(),
+            region: storage_region.to_owned(),
             code_revision: None,
             scope: "actor:invoke".into(),
             iat: now_ms / 1000,
@@ -236,12 +241,18 @@ mod tests {
             ActorTokenPurpose::Invocation,
             Duration::from_secs(60),
         )?;
-        let issued = issuer.issue_workflow("project-1", "execution-1", unix_millis()? + 10_000)?;
+        let issued = issuer.issue_workflow(
+            "project-1",
+            "execution-1",
+            "north-america-central",
+            unix_millis()? + 10_000,
+        )?;
 
         let principal = verifier.authenticate_authorization(&format!("Bearer {}", issued.token))?;
 
         assert_eq!(principal.scope.namespace_id, "project-1");
         assert_eq!(principal.process_role, ActorProcessRole::Workflow);
+        assert_eq!(principal.region, "north-america-central");
         let jwks: serde_json::Value = serde_json::from_slice(&issuer.jwks_json()?)?;
         assert_eq!(jwks["keys"][0]["kid"], "test-key");
         assert_eq!(jwks["keys"][0]["crv"], "Ed25519");
