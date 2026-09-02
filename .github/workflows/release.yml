@@ -265,7 +265,7 @@ jobs:
                   if npm view "little-durable-objects@$RELEASE_VERSION" version >/dev/null 2>&1; then
                       echo "little-durable-objects@$RELEASE_VERSION already published"
                   else
-                      npm publish dist-tarballs/*.tgz --access public
+                      npm publish ./dist-tarballs/*.tgz --access public
                   fi
 
     crate:
