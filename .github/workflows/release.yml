@@ -183,7 +183,6 @@ jobs:
         runs-on: blacksmith-2vcpu-ubuntu-2404
         timeout-minutes: 10
         permissions:
-            artifact-metadata: write
             attestations: write
             contents: read
             id-token: write
@@ -199,20 +198,6 @@ jobs:
 
             - name: Configure Docker for Artifact Registry
               run: gcloud auth configure-docker ${{ env.REGISTRY }} --quiet
-
-            - name: Read Artifact Registry access token
-              id: registry
-              run: |
-                  token="$(gcloud auth print-access-token)"
-                  echo "::add-mask::$token"
-                  echo "token=$token" >> "$GITHUB_OUTPUT"
-
-            - name: Sign in for provenance upload
-              uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
-              with:
-                  registry: ${{ env.REGISTRY }}
-                  username: oauth2accesstoken
-                  password: ${{ steps.registry.outputs.token }}
 
             - name: Publish multi-platform manifest
               id: manifest
@@ -238,7 +223,6 @@ jobs:
               with:
                   subject-name: ${{ env.IMAGE }}
                   subject-digest: ${{ steps.manifest.outputs.digest }}
-                  push-to-registry: true
 
     npm:
         name: Publish npm package
