@@ -320,7 +320,6 @@ async fn stop_host_tasks(
 fn spawn_javascript_process() -> Result<tokio::process::Child> {
     Command::new("node")
         .args([
-            "--input-type=module",
             "--eval",
             "import(\"little-durable-objects/host\").then(module => module.runDurableObjectHost())",
         ])
