@@ -33,7 +33,8 @@ const actorHostTargetSchema = z.object({
     route: z.string().url(),
     token: z.string().trim().min(1),
     ownerEpoch: z.number().int().positive(),
-    stateReadUrl: z.string().url(),
+    stateVersion: z.number().int().nonnegative(),
+    stateReadUrl: z.union([z.literal(""), z.string().url()]),
     expiresAtMs: z.number().int().positive()
 })
 

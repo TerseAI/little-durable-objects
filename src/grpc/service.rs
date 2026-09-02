@@ -66,7 +66,9 @@ impl ActorHostGrpcService {
                 "actor invocation crossed namespace scope",
             ));
         }
-        if request.owner_epoch == 0 || request.state_read_url.is_empty() {
+        if request.owner_epoch == 0
+            || (request.state_version == 0) != request.state_read_url.is_empty()
+        {
             return Err(Status::invalid_argument(
                 "actor ownership capability is incomplete",
             ));
@@ -76,11 +78,13 @@ impl ActorHostGrpcService {
             &self.host_id,
             &invocation.actor,
             request.owner_epoch,
+            request.state_version,
             &request.state_read_url,
         )?;
         Ok(AuthorizedHostInvocation {
             invocation,
             owner_epoch: request.owner_epoch,
+            state_version: request.state_version,
             state_read_url: request.state_read_url,
         })
     }
@@ -100,6 +104,7 @@ impl ActorHostGrpcService {
                 .invoke_actor(
                     request.invocation,
                     request.owner_epoch,
+                    request.state_version,
                     request.state_read_url,
                 )
                 .await
@@ -134,6 +139,7 @@ fn validate_invocation_principal(
     host_id: &HostId,
     actor: &crate::actor::ActorKey,
     owner_epoch: u64,
+    state_version: u64,
     state_read_url: &str,
 ) -> Result<(), Status> {
     if principal.process_role != ActorProcessRole::Host || principal.host_id != *host_id {
@@ -145,6 +151,7 @@ fn validate_invocation_principal(
         && (capability.actor != *actor
             || capability.host_id != *host_id
             || capability.owner_epoch != owner_epoch
+            || capability.state_version != state_version
             || capability.state_read_url != state_read_url)
     {
         return Err(Status::permission_denied(
@@ -157,6 +164,7 @@ fn validate_invocation_principal(
 struct AuthorizedHostInvocation {
     invocation: ActorInvocation,
     owner_epoch: u64,
+    state_version: u64,
     state_read_url: String,
 }
 
@@ -190,6 +198,7 @@ mod tests {
                 actor: actor.clone(),
                 host_id: host_id.clone(),
                 owner_epoch: 3,
+                state_version: 1,
                 state_read_url: "https://storage.example.com/state".into(),
             }),
         };
@@ -200,6 +209,7 @@ mod tests {
                 &host_id,
                 &actor,
                 3,
+                1,
                 "https://storage.example.com/state"
             )
             .is_ok()
@@ -210,6 +220,7 @@ mod tests {
                 &host_id,
                 &actor,
                 4,
+                1,
                 "https://storage.example.com/state"
             )
             .is_err()
@@ -220,6 +231,7 @@ mod tests {
                 &host_id,
                 &actor,
                 3,
+                1,
                 "https://storage.example.com/other"
             )
             .is_err()

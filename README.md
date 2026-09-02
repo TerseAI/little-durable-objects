@@ -1,6 +1,6 @@
 # little-durable-objects
 
-A small, provider-neutral durable-object runtime. Modal is the first sandbox provider; actor state is stored as NDJSON in regional GCS buckets and coordination lives in Postgres.
+A small, provider-neutral durable-object runtime. Modal is the first sandbox provider; immutable actor-state snapshots live in regional GCS buckets, while placement and each actor's current state head live in Postgres.
 
 ## Install
 

@@ -16,11 +16,13 @@ use crate::{
     },
     host::{ActorProcessRole, HostId},
     host_leases::{HostLease, HostLeaseStore},
-    placement::{ObjectPlacement, ObjectPlacementStore, PlacementClaim},
+    placement::{
+        ObjectPlacement, ObjectPlacementStore, PlacementClaim, StateCommit, StateCommitRequest,
+    },
     sandbox::{
         EnsureHostRequest, HostSandboxRuntimeConfig, ImageWarmup, SandboxProvider, WarmImageRequest,
     },
-    storage_urls::StorageUrlSigner,
+    storage_urls::{StateWriteTicket, StorageUrlSigner, validate_snapshot_object_name},
 };
 
 use super::{
@@ -180,10 +182,14 @@ impl ControlPlaneService {
             "workflow token cannot resolve this actor"
         );
         let target = self.route_actor(actor, &principal.region).await?;
-        let state_read_url = self
-            .storage_urls
-            .read_url(&target.placement.home_region, actor)
-            .await?;
+        let state_read_url = match &target.placement.state_object {
+            Some(object_name) => {
+                self.storage_urls
+                    .read_url(&target.placement.home_region, object_name)
+                    .await?
+            }
+            None => String::new(),
+        };
         let issued = self
             .host_token_issuer
             .as_ref()
@@ -195,6 +201,7 @@ impl ControlPlaneService {
                 &target.spec.code_revision,
                 &target.placement.home_region,
                 target.placement.owner_epoch,
+                target.placement.state_version,
                 &state_read_url,
                 principal.expires_at,
             )?;
@@ -202,6 +209,7 @@ impl ControlPlaneService {
             route: target.lease.route,
             token: issued.token,
             owner_epoch: target.placement.owner_epoch,
+            state_version: target.placement.state_version,
             state_read_url,
             expires_at_ms: issued.expires_at_ms,
         })
@@ -212,6 +220,7 @@ pub(super) struct WorkflowActorTarget {
     pub route: String,
     pub token: String,
     pub owner_epoch: u64,
+    pub state_version: u64,
     pub state_read_url: String,
     pub expires_at_ms: i64,
 }
@@ -261,18 +270,31 @@ impl ControlPlaneService {
             ControlPlaneCommand::UnregisterLease { host_id } => {
                 self.unregister_lease(principal, host_id).await
             }
-            ControlPlaneCommand::AuthorizeStateWrite {
+            ControlPlaneCommand::PrepareStateWrite {
                 actor,
                 host_id,
                 owner_epoch,
-                expected_generation,
+                expected_version,
             } => {
-                self.authorize_state_write(
+                self.prepare_state_write(principal, actor, host_id, owner_epoch, expected_version)
+                    .await
+            }
+            ControlPlaneCommand::CommitState {
+                actor,
+                host_id,
+                owner_epoch,
+                expected_version,
+                state_object,
+                request_id,
+            } => {
+                self.commit_state(
                     principal,
                     actor,
                     host_id,
                     owner_epoch,
-                    expected_generation,
+                    expected_version,
+                    state_object,
+                    request_id,
                 )
                 .await
             }
@@ -405,13 +427,13 @@ impl ControlPlaneService {
         Ok(ControlPlaneCommandReply::Unit)
     }
 
-    async fn authorize_state_write(
+    async fn prepare_state_write(
         &self,
         principal: &ActorPrincipal,
         actor: ActorKey,
         host_id: HostId,
         owner_epoch: u64,
-        expected_generation: String,
+        expected_version: u64,
     ) -> Result<ControlPlaneCommandReply> {
         actor.validate()?;
         ensure!(
@@ -422,12 +444,95 @@ impl ControlPlaneService {
         self.require_active_host(principal).await?;
         let placement = self.current_placement(&actor).await?;
         validate_state_owner(principal, &host_id, owner_epoch, &placement)?;
-        Ok(ControlPlaneCommandReply::StateWriteUrl {
-            url: self
-                .storage_urls
-                .write_url(&placement.home_region, &actor, &expected_generation)
+        ensure!(
+            placement.state_version == expected_version,
+            "actor state version changed before write preparation"
+        );
+        Ok(ControlPlaneCommandReply::StateWriteTicket {
+            ticket: self
+                .state_write_ticket(&placement.home_region, &actor, expected_version)
                 .await?,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_state(
+        &self,
+        principal: &ActorPrincipal,
+        actor: ActorKey,
+        host_id: HostId,
+        owner_epoch: u64,
+        expected_version: u64,
+        state_object: String,
+        request_id: String,
+    ) -> Result<ControlPlaneCommandReply> {
+        actor.validate()?;
+        ensure!(
+            principal.scope.contains(&actor),
+            "actor crossed the host namespace"
+        );
+        principal.validate_host_id(host_id.as_str())?;
+        self.require_active_host(principal).await?;
+        validate_snapshot_object_name(
+            &actor,
+            expected_version
+                .checked_add(1)
+                .context("actor state version overflow")?,
+            &state_object,
+        )?;
+        let committed = self
+            .placements
+            .commit_state(&StateCommitRequest {
+                object: actor.storage_key(),
+                owner: host_id,
+                session_id: principal.session_id.clone(),
+                owner_epoch,
+                expected_version,
+                state_object,
+                request_id,
+            })
+            .await?;
+        let placement = match committed {
+            StateCommit::Committed(placement) => placement,
+            StateCommit::Current(_) => {
+                anyhow::bail!("actor ownership or state version changed before commit")
+            }
+        };
+        let next_write = self
+            .state_write_ticket(&placement.home_region, &actor, placement.state_version)
+            .await
+            .map_err(|error| {
+                warn!(
+                    event = "actor_state_write_ticket",
+                    actor = %actor.storage_key(),
+                    state_version = placement.state_version,
+                    error = %format!("{error:#}"),
+                    "next actor state write ticket could not be prepared"
+                );
+                error
+            })
+            .ok();
+        Ok(ControlPlaneCommandReply::StateCommitted {
+            state_version: placement.state_version,
+            next_write,
+        })
+    }
+
+    async fn state_write_ticket(
+        &self,
+        region: &str,
+        actor: &ActorKey,
+        expected_version: u64,
+    ) -> Result<StateWriteTicket> {
+        self.storage_urls
+            .write_ticket(
+                region,
+                actor,
+                expected_version
+                    .checked_add(1)
+                    .context("actor state version overflow")?,
+            )
+            .await
     }
 
     async fn route_actor(&self, actor: &ActorKey, storage_region: &str) -> Result<RoutedActor> {
@@ -789,11 +894,14 @@ impl HostInvoker for GrpcHostInvoker {
 impl GrpcHostInvoker {
     async fn read_url(
         &self,
-        actor: &ActorKey,
+        _actor: &ActorKey,
         target: &RoutedActor,
     ) -> std::result::Result<String, HostCallError> {
+        let Some(object_name) = &target.placement.state_object else {
+            return Ok(String::new());
+        };
         self.storage_urls
-            .read_url(&target.placement.home_region, actor)
+            .read_url(&target.placement.home_region, object_name)
             .await
             .map_err(|error| {
                 HostCallError::Unavailable(format!("could not authorize state read: {error:#}"))
@@ -842,6 +950,7 @@ impl GrpcHostInvoker {
             invocation: Some(invocation.into()),
             owner_epoch: target.placement.owner_epoch,
             state_read_url: read_url,
+            state_version: target.placement.state_version,
         });
         request.metadata_mut().insert(
             "authorization",
@@ -1052,17 +1161,24 @@ mod tests {
 
     #[async_trait]
     impl StorageUrlSigner for FakeStorageUrls {
-        async fn read_url(&self, _region: &str, _actor: &ActorKey) -> Result<String> {
+        async fn read_url(&self, _region: &str, _object_name: &str) -> Result<String> {
             Ok("https://storage.example.com/state".into())
         }
 
-        async fn write_url(
+        async fn write_ticket(
             &self,
             _region: &str,
             _actor: &ActorKey,
-            _expected_generation: &str,
-        ) -> Result<String> {
-            anyhow::bail!("state writes are outside this test")
+            state_version: u64,
+        ) -> Result<StateWriteTicket> {
+            Ok(StateWriteTicket {
+                state_version,
+                object_name: format!(
+                    "snapshots/00/00000000000000000000000000000000/project-1/Counter/counter-1/{state_version}.json"
+                ),
+                url: "https://storage.example.com/write".into(),
+                expires_at_ms: i64::MAX,
+            })
         }
 
         fn regions(&self) -> Vec<String> {
@@ -1288,7 +1404,8 @@ mod tests {
 
         assert_eq!(target.route, "https://actor.example.com/");
         assert_eq!(target.owner_epoch, 1);
-        assert_eq!(target.state_read_url, "https://storage.example.com/state");
+        assert_eq!(target.state_version, 0);
+        assert!(target.state_read_url.is_empty());
         let verifier = ActorJwtVerifier::for_scope(
             issuer.verifier_keys_json()?,
             "issuer",
@@ -1320,6 +1437,9 @@ mod tests {
             owner: HostId::new("host.v1.project.revision.host"),
             owner_epoch: 1,
             home_region: "north-america-east".into(),
+            state_version: 0,
+            state_object: None,
+            last_request_id: None,
         };
 
         assert_eq!(

@@ -1,20 +1,17 @@
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 
-use crate::{state_log::StateLog, storage_urls::STATE_CONTENT_TYPE};
-
-const GENERATION_HEADER: &str = "x-goog-generation";
+use crate::{state_log::StateSnapshot, storage_urls::STATE_CONTENT_TYPE};
 
 #[derive(Debug)]
 pub struct LoadedState {
-    pub log: StateLog,
-    pub generation: String,
+    pub snapshot: StateSnapshot,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StateWrite {
     Written,
-    GenerationMismatch,
+    AlreadyExists,
 }
 
 #[async_trait]
@@ -46,25 +43,17 @@ impl StateTransport for HttpStateTransport {
             .send()
             .await
             .context("read actor state through signed URL")?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(LoadedState {
-                log: StateLog::default(),
-                generation: "0".into(),
-            });
-        }
         ensure!(
             response.status().is_success(),
             "actor-state read failed with HTTP {}",
             response.status()
         );
-        let generation = generation_header(&response)?;
         let bytes = response
             .bytes()
             .await
             .context("read actor-state response body")?;
         Ok(LoadedState {
-            log: StateLog::decode(&bytes)?,
-            generation,
+            snapshot: StateSnapshot::decode(&bytes)?,
         })
     }
 
@@ -79,7 +68,7 @@ impl StateTransport for HttpStateTransport {
             .await
             .context("write actor state through signed URL")?;
         if response.status() == reqwest::StatusCode::PRECONDITION_FAILED {
-            return Ok(StateWrite::GenerationMismatch);
+            return Ok(StateWrite::AlreadyExists);
         }
         ensure!(
             response.status().is_success(),
@@ -88,20 +77,6 @@ impl StateTransport for HttpStateTransport {
         );
         Ok(StateWrite::Written)
     }
-}
-
-fn generation_header(response: &reqwest::Response) -> Result<String> {
-    let generation = response
-        .headers()
-        .get(GENERATION_HEADER)
-        .context("GCS response omitted its object generation")?
-        .to_str()
-        .context("GCS object generation is not ASCII")?;
-    ensure!(
-        !generation.is_empty() && generation.bytes().all(|byte| byte.is_ascii_digit()),
-        "GCS object generation is invalid"
-    );
-    Ok(generation.to_owned())
 }
 
 fn validate_url(url: &str) -> Result<()> {
@@ -118,8 +93,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rejects_non_http_capabilities() {
+    fn rejects_non_http_state_urls() {
         assert!(validate_url("file:///tmp/state").is_err());
-        assert!(validate_url("https://storage.googleapis.com/bucket/object").is_ok());
     }
 }

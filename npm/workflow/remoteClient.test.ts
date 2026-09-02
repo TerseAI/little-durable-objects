@@ -19,6 +19,7 @@ test("remote actor client resolves once and invokes the actor host directly", as
             route: "https://actor.example.com",
             token: "direct-token",
             ownerEpoch: 3,
+            stateVersion: 7,
             stateReadUrl: "https://storage.example.com/state",
             expiresAtMs: 4_000_000_000_000
         })
@@ -50,6 +51,7 @@ test("remote actor client resolves once and invokes the actor host directly", as
                 route: "https://actor.example.com",
                 token: "direct-token",
                 ownerEpoch: 3,
+                stateVersion: 7,
                 stateReadUrl: "https://storage.example.com/state",
                 expiresAtMs: 4_000_000_000_000
             },

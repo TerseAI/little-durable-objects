@@ -11,6 +11,7 @@ interface ActorHostTarget {
     readonly route: string
     readonly token: string
     readonly ownerEpoch: number
+    readonly stateVersion: number
     readonly stateReadUrl: string
     readonly expiresAtMs: number
 }
@@ -48,6 +49,7 @@ class GrpcActorHostTransport implements ActorHostTransport {
                 argsJson: Buffer.from(JSON.stringify(invocation.args))
             },
             ownerEpoch: target.ownerEpoch,
+            stateVersion: target.stateVersion,
             stateReadUrl: target.stateReadUrl
         }
         const reply = await unaryRequest(this.client(target.route), request, metadata)
@@ -113,6 +115,7 @@ const hostRequestType = new Type("HostInvokeActorRequest")
     .add(new Field("invocation", 1, "InvokeActorRequest"))
     .add(new Field("ownerEpoch", 2, "uint64"))
     .add(new Field("stateReadUrl", 3, "string"))
+    .add(new Field("stateVersion", 4, "uint64"))
     .add(invocationType)
 const completedType = new Type("ActorCompleted").add(new Field("resultJson", 1, "bytes"))
 const failedType = new Type("ActorFailed").add(new Field("code", 1, "string")).add(new Field("message", 2, "string"))
@@ -146,6 +149,7 @@ interface HostInvokeActorRequest {
         readonly argsJson: Uint8Array
     }
     readonly ownerEpoch: number
+    readonly stateVersion: number
     readonly stateReadUrl: string
 }
 

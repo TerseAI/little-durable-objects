@@ -16,6 +16,7 @@ use crate::{
     grpc::proto::actor_control_plane_service_client::ActorControlPlaneServiceClient,
     host::HostId,
     host_leases::{HostLease, HostLeaseRegistry, HostLeaseRequest},
+    storage_urls::StateWriteTicket,
 };
 
 use super::{
@@ -48,24 +49,53 @@ impl ControlPlaneClient {
         })
     }
 
-    pub async fn authorize_state_write(
+    pub async fn prepare_state_write(
         &self,
         actor: &ActorKey,
         host_id: &HostId,
         owner_epoch: u64,
-        expected_generation: &str,
-    ) -> Result<String> {
+        expected_version: u64,
+    ) -> Result<StateWriteTicket> {
         match self
-            .execute(ControlPlaneCommand::AuthorizeStateWrite {
+            .execute(ControlPlaneCommand::PrepareStateWrite {
                 actor: actor.clone(),
                 host_id: host_id.clone(),
                 owner_epoch,
-                expected_generation: expected_generation.to_owned(),
+                expected_version,
             })
             .await?
         {
-            ControlPlaneCommandReply::StateWriteUrl { url } => Ok(url),
-            reply => anyhow::bail!("unexpected state-write authorization reply: {reply:?}"),
+            ControlPlaneCommandReply::StateWriteTicket { ticket } => Ok(ticket),
+            reply => anyhow::bail!("unexpected prepare-state-write reply: {reply:?}"),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn commit_state(
+        &self,
+        actor: &ActorKey,
+        host_id: &HostId,
+        owner_epoch: u64,
+        expected_version: u64,
+        state_object: &str,
+        request_id: &str,
+    ) -> Result<(u64, Option<StateWriteTicket>)> {
+        match self
+            .execute(ControlPlaneCommand::CommitState {
+                actor: actor.clone(),
+                host_id: host_id.clone(),
+                owner_epoch,
+                expected_version,
+                state_object: state_object.to_owned(),
+                request_id: request_id.to_owned(),
+            })
+            .await?
+        {
+            ControlPlaneCommandReply::StateCommitted {
+                state_version,
+                next_write,
+            } => Ok((state_version, next_write)),
+            reply => anyhow::bail!("unexpected commit-state reply: {reply:?}"),
         }
     }
 }

@@ -6,6 +6,7 @@ use crate::{
     grpc::proto::{ControlPlaneReply, ControlPlaneRequest},
     host::HostId,
     host_leases::{HostLease, HostLeaseRequest},
+    storage_urls::StateWriteTicket,
 };
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -17,11 +18,19 @@ pub(crate) enum ControlPlaneCommand {
     UnregisterLease {
         host_id: HostId,
     },
-    AuthorizeStateWrite {
+    PrepareStateWrite {
         actor: ActorKey,
         host_id: HostId,
         owner_epoch: u64,
-        expected_generation: String,
+        expected_version: u64,
+    },
+    CommitState {
+        actor: ActorKey,
+        host_id: HostId,
+        owner_epoch: u64,
+        expected_version: u64,
+        state_object: String,
+        request_id: String,
     },
 }
 
@@ -34,8 +43,12 @@ pub(crate) enum ControlPlaneCommandReply {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         replacement_token: Option<String>,
     },
-    StateWriteUrl {
-        url: String,
+    StateWriteTicket {
+        ticket: StateWriteTicket,
+    },
+    StateCommitted {
+        state_version: u64,
+        next_write: Option<StateWriteTicket>,
     },
 }
 
@@ -64,8 +77,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn state_capabilities_are_plain_json_messages() -> Result<()> {
-        let encoded = encode_command(ControlPlaneCommand::AuthorizeStateWrite {
+    fn state_commit_commands_are_plain_json_messages() -> Result<()> {
+        let encoded = encode_command(ControlPlaneCommand::CommitState {
             actor: ActorKey {
                 namespace_id: "project-1".into(),
                 actor_type: "counter".into(),
@@ -73,11 +86,16 @@ mod tests {
             },
             host_id: HostId::new("host.v1.project-1.revision-1.host-1"),
             owner_epoch: 3,
-            expected_generation: "100".into(),
+            expected_version: 6,
+            state_object:
+                "snapshots/01/0123456789abcdef0123456789abcdef/project-1/counter/counter-1/7.json"
+                    .into(),
+            request_id: "request-7".into(),
         })?;
         let json = String::from_utf8(encoded.command_json)?;
-        assert!(json.contains("authorize_state_write"));
-        assert!(json.contains("\"expected_generation\":\"100\""));
+        assert!(json.contains("commit_state"));
+        assert!(json.contains("\"expected_version\":6"));
+        assert!(json.contains("\"request_id\":\"request-7\""));
         Ok(())
     }
 }

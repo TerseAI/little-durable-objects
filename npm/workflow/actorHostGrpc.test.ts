@@ -27,6 +27,7 @@ test("direct transport speaks the actor host protobuf contract", async () => {
                     argsJson: Buffer.from("[2]")
                 },
                 ownerEpoch: 3,
+                stateVersion: 7,
                 stateReadUrl: "https://storage.example.com/state"
             })
             callback(null, { completed: { resultJson: Buffer.from("7") }, result: "completed" })
@@ -41,6 +42,7 @@ test("direct transport speaks the actor host protobuf contract", async () => {
                     route: `http://127.0.0.1:${port}`,
                     token: "direct-token",
                     ownerEpoch: 3,
+                    stateVersion: 7,
                     stateReadUrl: "https://storage.example.com/state",
                     expiresAtMs: 4_000_000_000_000
                 },
@@ -85,6 +87,7 @@ interface HostRequest {
         readonly argsJson: Buffer
     }
     readonly ownerEpoch: number
+    readonly stateVersion: number
     readonly stateReadUrl: string
 }
 

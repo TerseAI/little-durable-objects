@@ -185,6 +185,7 @@ async fn resolve_actor_target(
         route: target.route,
         token: target.token,
         owner_epoch: target.owner_epoch,
+        state_version: target.state_version,
         state_read_url: target.state_read_url,
         expires_at_ms: target.expires_at_ms,
     }))
@@ -310,6 +311,7 @@ struct ActorTargetReply {
     route: String,
     token: String,
     owner_epoch: u64,
+    state_version: u64,
     state_read_url: String,
     expires_at_ms: i64,
 }

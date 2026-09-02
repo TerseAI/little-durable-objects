@@ -37,6 +37,7 @@ message HostInvokeActorRequest {
   InvokeActorRequest invocation = 1;
   uint64 owner_epoch = 2;
   string state_read_url = 3;
+  uint64 state_version = 4;
 }
 
 message InvokeActorReply {
