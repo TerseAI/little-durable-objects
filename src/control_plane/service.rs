@@ -581,7 +581,7 @@ impl GrpcHostInvoker {
         &self,
         target: &RoutedActor,
     ) -> std::result::Result<tonic::transport::Channel, HostCallError> {
-        Endpoint::from_shared(target.lease.route.clone())
+        Endpoint::new(target.lease.route.clone())
             .map_err(|error| HostCallError::Unavailable(format!("host route is invalid: {error}")))?
             .connect()
             .await

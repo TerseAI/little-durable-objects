@@ -33,7 +33,7 @@ pub struct ControlPlaneClient {
 
 impl ControlPlaneClient {
     pub async fn connect(endpoint: impl Into<String>, token: impl AsRef<str>) -> Result<Self> {
-        let channel = Endpoint::from_shared(endpoint.into())
+        let channel = Endpoint::new(endpoint.into())
             .context("parse actor control-plane endpoint")?
             .connect_timeout(CONTROL_PLANE_CONNECT_TIMEOUT)
             .timeout(CONTROL_PLANE_REQUEST_TIMEOUT)
