@@ -194,13 +194,19 @@ jobs:
               env:
                   VERSION: ${{ needs.preflight.outputs.version }}
               run: |
+                  set -euo pipefail
                   docker buildx imagetools create \
                     --tag "${IMAGE}:${VERSION}" \
                     --tag "${IMAGE}:latest" \
-                    --metadata-file manifest-metadata.json \
                     "${IMAGE}:${VERSION}-amd64" \
                     "${IMAGE}:${VERSION}-arm64"
-                  echo "digest=$(jq -r '.\"containerimage.descriptor\".digest' manifest-metadata.json)" >> "$GITHUB_OUTPUT"
+                  inspection="$(docker buildx imagetools inspect "${IMAGE}:${VERSION}")"
+                  digest="$(awk '/^Digest:/ { print $2; exit }' <<< "$inspection")"
+                  if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                      echo "::error::Could not resolve the published manifest digest"
+                      exit 1
+                  fi
+                  echo "digest=${digest}" >> "$GITHUB_OUTPUT"
 
             - name: Attest image provenance
               uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
