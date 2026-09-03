@@ -5,11 +5,11 @@ import { canonicalRegionForModal, modalPlacement } from "./regions.js"
 
 test("canonical regions map Modal placement", () => {
     assert.deepEqual(modalPlacement("north-america-east"), {
-        regions: ["us-east"],
+        regions: ["us-east4"],
         cloud: "gcp",
-        observedPlacements: ["gcp:us-east*"]
+        observedPlacements: ["gcp:us-east4*"],
+        privateNetwork: true
     })
-    assert.equal(canonicalRegionForModal("gcp", "us-east-1"), "north-america-east")
     assert.equal(canonicalRegionForModal("CLOUD_PROVIDER_GCP", "us-east4"), "north-america-east")
     assert.equal(canonicalRegionForModal("GCP", "US-EAST4-A"), "north-america-east")
 })

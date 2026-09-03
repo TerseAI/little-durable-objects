@@ -3,7 +3,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use tokio::{net::TcpListener, process::Command};
+use tokio::{
+    net::{TcpListener, lookup_host},
+    process::Command,
+};
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
@@ -35,6 +38,8 @@ pub struct ActorHostConfig {
     pub executor_socket: PathBuf,
     pub host_bind: SocketAddr,
     pub host_route: Option<String>,
+    pub private_hostname: Option<String>,
+    pub route_file: Option<PathBuf>,
     pub jwt_issuer: String,
     pub invocation_jwt_audience: String,
     pub jwt_max_lifetime: Duration,
@@ -128,9 +133,23 @@ impl ActorHostConfig {
             tonic::transport::Endpoint::from_shared(route.clone())
                 .context("DURABLE_OBJECT_HOST_ROUTE must be a valid HTTP or HTTPS URI")?;
         }
+        let private_hostname = get("DURABLE_OBJECT_HOST_PRIVATE_HOSTNAME");
+        if let Some(hostname) = &private_hostname {
+            ensure!(
+                !hostname.is_empty() && hostname.trim() == hostname,
+                "DURABLE_OBJECT_HOST_PRIVATE_HOSTNAME must be non-empty without surrounding whitespace"
+            );
+        }
+        ensure!(
+            host_route.is_none() || private_hostname.is_none(),
+            "DURABLE_OBJECT_HOST_ROUTE and DURABLE_OBJECT_HOST_PRIVATE_HOSTNAME are mutually exclusive"
+        );
+        let route_file = get("DURABLE_OBJECT_HOST_ROUTE_FILE").map(PathBuf::from);
         let host_bind = get("DURABLE_OBJECT_HOST_BIND")
             .unwrap_or_else(|| {
-                if host_route.is_some() {
+                if private_hostname.is_some() {
+                    "[::]:7101"
+                } else if host_route.is_some() {
                     "0.0.0.0:7101"
                 } else {
                     "127.0.0.1:0"
@@ -174,6 +193,8 @@ impl ActorHostConfig {
             executor_socket,
             host_bind,
             host_route,
+            private_hostname,
+            route_file,
             jwt_issuer,
             invocation_jwt_audience,
             jwt_max_lifetime,
@@ -243,17 +264,32 @@ async fn bind_host(config: &ActorHostConfig) -> Result<(TcpListener, String, Hos
     let listener = TcpListener::bind(config.host_bind)
         .await
         .with_context(|| format!("bind actor host at {}", config.host_bind))?;
-    let route = config.host_route.clone().unwrap_or_else(|| {
-        format!(
-            "http://{}",
-            listener.local_addr().expect("bound host address")
-        )
-    });
+    let route = advertised_route(config, listener.local_addr()?).await?;
+    if let Some(path) = &config.route_file {
+        tokio::fs::write(path, &route)
+            .await
+            .with_context(|| format!("write actor host route to {}", path.display()))?;
+    }
     let endpoint = HostEndpoint {
         id: config.host_id.clone(),
         route: route.clone(),
     };
     Ok((listener, route, endpoint))
+}
+
+async fn advertised_route(config: &ActorHostConfig, bound: SocketAddr) -> Result<String> {
+    if let Some(route) = &config.host_route {
+        return Ok(route.clone());
+    }
+    let Some(hostname) = &config.private_hostname else {
+        return Ok(format!("http://{bound}"));
+    };
+    let address = lookup_host((hostname.as_str(), bound.port()))
+        .await
+        .with_context(|| format!("resolve actor host private hostname {hostname}"))?
+        .find(SocketAddr::is_ipv6)
+        .with_context(|| format!("actor host private hostname {hostname} has no IPv6 address"))?;
+    Ok(format!("http://{address}"))
 }
 
 async fn connect_executor(
@@ -379,6 +415,29 @@ mod tests {
             PathBuf::from("/tmp/durable-object-executor.sock")
         );
         assert_eq!(config.host_idle_timeout, Duration::from_secs(300));
+        Ok(())
+    }
+
+    #[test]
+    fn private_network_hosts_bind_ipv6_and_publish_their_route() -> Result<()> {
+        let mut values = values();
+        values.insert(
+            "DURABLE_OBJECT_HOST_PRIVATE_HOSTNAME".into(),
+            "i6pn.modal.local".into(),
+        );
+        values.insert(
+            "DURABLE_OBJECT_HOST_ROUTE_FILE".into(),
+            "/tmp/durable-object-route".into(),
+        );
+
+        let config = ActorHostConfig::from_lookup(|name| values.get(name).cloned())?;
+
+        assert_eq!(config.host_bind, "[::]:7101".parse()?);
+        assert_eq!(config.private_hostname.as_deref(), Some("i6pn.modal.local"));
+        assert_eq!(
+            config.route_file,
+            Some(PathBuf::from("/tmp/durable-object-route"))
+        );
         Ok(())
     }
 

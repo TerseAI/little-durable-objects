@@ -86,9 +86,24 @@ pub struct HostTermination {
     pub resource_ids: Vec<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicHostRouteRequest {
+    pub namespace_id: String,
+    pub code_revision: String,
+    pub canonical_region: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicHostRoute {
+    pub route: String,
+}
+
 #[async_trait]
 pub trait SandboxProvider: Send + Sync {
     async fn ensure_host(&self, request: &EnsureHostRequest) -> Result<ActorHostHandle>;
+    async fn public_host_route(&self, request: &PublicHostRouteRequest) -> Result<PublicHostRoute>;
     async fn warm_image(&self, request: &WarmImageRequest) -> Result<ImageWarmup>;
     async fn terminate_hosts(&self, request: &TerminateHostsRequest) -> Result<HostTermination>;
 }
@@ -145,6 +160,16 @@ impl SandboxProvider for CommandSandboxProvider {
         ensure!(
             !response.host_id.as_str().is_empty() && !response.route.is_empty(),
             "{} sandbox command returned an invalid host",
+            self.provider_name
+        );
+        Ok(response)
+    }
+
+    async fn public_host_route(&self, request: &PublicHostRouteRequest) -> Result<PublicHostRoute> {
+        let response: PublicHostRoute = self.execute("public_host_route", request).await?;
+        ensure!(
+            !response.route.is_empty(),
+            "{} sandbox command returned an invalid public host route",
             self.provider_name
         );
         Ok(response)

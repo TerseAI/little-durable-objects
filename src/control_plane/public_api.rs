@@ -94,6 +94,7 @@ async fn issue_workflow_token(
             &request.execution_id,
             &request.storage_region,
             request.deadline_unix_ms,
+            request.private_routing,
         )
         .map_err(ApiError::bad_request)?;
     Ok(Json(IssueWorkflowTokenReply {
@@ -188,6 +189,8 @@ struct IssueWorkflowTokenRequest {
     execution_id: String,
     deadline_unix_ms: i64,
     storage_region: String,
+    #[serde(default)]
+    private_routing: bool,
 }
 
 #[derive(Serialize)]
@@ -298,11 +301,25 @@ mod tests {
         let request: IssueWorkflowTokenRequest = serde_json::from_value(serde_json::json!({
             "executionId": "execution-1",
             "deadlineUnixMs": 1_800_000_000_000_i64,
-            "storageRegion": "north-america-west"
+            "storageRegion": "north-america-west",
+            "privateRouting": true
         }))
         .unwrap();
 
         assert_eq!(request.storage_region, "north-america-west");
+        assert!(request.private_routing);
+    }
+
+    #[test]
+    fn workflow_token_request_defaults_to_public_routing() {
+        let request: IssueWorkflowTokenRequest = serde_json::from_value(serde_json::json!({
+            "executionId": "execution-1",
+            "deadlineUnixMs": 1_800_000_000_000_i64,
+            "storageRegion": "north-america-west"
+        }))
+        .unwrap();
+
+        assert!(!request.private_routing);
     }
 
     #[test]

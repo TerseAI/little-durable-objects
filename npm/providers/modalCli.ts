@@ -13,6 +13,9 @@ async function main(): Promise<void> {
         case "ensure_host":
             stdout.write(JSON.stringify(await provider.ensureHost(command.request)))
             return
+        case "public_host_route":
+            stdout.write(JSON.stringify(await provider.publicHostRoute(command.request)))
+            return
         case "warm_image":
             stdout.write(JSON.stringify(await provider.warmImage(command.request)))
             return

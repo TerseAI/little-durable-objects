@@ -1,4 +1,4 @@
-import { AlreadyExistsError, ModalClient, NotFoundError } from "modal"
+import { AlreadyExistsError, ModalClient, NotFoundError, Probe } from "modal"
 import type { App, Image, Sandbox } from "modal"
 import { createHash } from "node:crypto"
 import { performance } from "node:perf_hooks"
@@ -6,7 +6,18 @@ import { performance } from "node:perf_hooks"
 import { modalPlacement } from "../regions.js"
 import type { CanonicalRegionCatalog } from "../regions.js"
 
-import type { ActorHostHandle, ActorHostProvisioning, EnsureHostRequest, HostTermination, ImageWarmup, SandboxProvider, TerminateHostsRequest, WarmImageRequest } from "./types.js"
+import type {
+    ActorHostHandle,
+    ActorHostProvisioning,
+    EnsureHostRequest,
+    HostTermination,
+    ImageWarmup,
+    PublicHostRoute,
+    PublicHostRouteRequest,
+    SandboxProvider,
+    TerminateHostsRequest,
+    WarmImageRequest
+} from "./types.js"
 
 const hostPort = 7101
 const hostRouteFile = "/tmp/durable-object-route"
@@ -14,6 +25,7 @@ const readyFile = "/tmp/durable-object-ready"
 const hostStderrFile = "/tmp/durable-object-host.stderr"
 const hostExitedFile = "/tmp/durable-object-host-exited"
 const maximumSandboxLifetimeMs = 24 * 60 * 60 * 1000
+const modalPrivateHostname = "i6pn.modal.local"
 
 interface ModalSandboxProviderOptions {
     readonly appName?: string
@@ -94,6 +106,17 @@ class ModalSandboxProvider implements SandboxProvider {
         return activation
     }
 
+    async publicHostRoute(request: PublicHostRouteRequest): Promise<PublicHostRoute> {
+        validatePublicHostRouteRequest(request, this.options.catalog)
+        const app = await this.modal.apps.fromName(this.appName, { createIfMissing: false })
+        const name = resourceName("host", request.namespaceId, request.codeRevision, request.canonicalRegion)
+        const sandbox = await this.modal.sandboxes.experimentalFromName(app.name ?? this.appName, name)
+        if ((await sandbox.poll()) !== null) throw new Error("Modal durable-object host is not running")
+        const route = (await sandbox.tunnels())[hostPort]?.url
+        if (!route) throw new Error("Modal did not create the durable-object HTTP/2 tunnel")
+        return { route }
+    }
+
     private async ensureHostOnce(request: EnsureHostRequest, name: string): Promise<ActorHostHandle> {
         const startedAt = this.now()
         const phases = emptyProvisioningPhases()
@@ -116,7 +139,7 @@ class ModalSandboxProvider implements SandboxProvider {
             if (!handle) throw new Error("concurrent Modal V2 host could not be reused")
             return handle
         }
-        return this.activate(acquired.value.sandbox, request, startedAt, phases)
+        return this.activate(acquired.value.sandbox, request, placement, startedAt, phases)
     }
 
     private async reuse(sandbox: Sandbox, canonicalRegion: string, startedAt: number, phases: ProvisioningPhases): Promise<ActorHostHandle | undefined> {
@@ -138,20 +161,12 @@ class ModalSandboxProvider implements SandboxProvider {
                 name,
                 timeoutMs: maximumSandboxLifetimeMs,
                 idleTimeoutMs: request.hostIdleTimeoutMs,
-                command: [
-                    "sh",
-                    "-c",
-                    'until test -s "$1"; do sleep 0.05; done; export DURABLE_OBJECT_HOST_ROUTE="$(cat "$1")"; "$2" 2>"$3"; status=$?; printf \'%s\n\' "$status" >"$4"; if ! test -f "$5"; then sleep 60; fi; exit "$status"',
-                    "durable-object-host-bootstrap",
-                    hostRouteFile,
-                    this.binaryPath,
-                    hostStderrFile,
-                    hostExitedFile,
-                    readyFile
-                ],
+                command: hostCommand(this.binaryPath, placement.privateNetwork === true),
                 workdir: request.workingDirectory,
-                env: hostEnvironment(request),
+                env: hostEnvironment(request, placement.privateNetwork === true),
                 h2Ports: [hostPort],
+                i6pn: placement.privateNetwork,
+                readinessProbe: Probe.withExec(["sh", "-c", `test -f ${readyFile}`], { intervalMs: 50 }),
                 regions: [...placement.regions],
                 cloud: placement.cloud
             })
@@ -163,8 +178,8 @@ class ModalSandboxProvider implements SandboxProvider {
         }
     }
 
-    private async activate(sandbox: Sandbox, request: EnsureHostRequest, startedAt: number, phases: ProvisioningPhases): Promise<ActorHostHandle> {
-        const started = await this.start(sandbox, request)
+    private async activate(sandbox: Sandbox, request: EnsureHostRequest, placement: ReturnType<typeof modalPlacement>, startedAt: number, phases: ProvisioningPhases): Promise<ActorHostHandle> {
+        const started = placement.privateNetwork ? await this.startPrivate(sandbox, request) : await this.startPublic(sandbox, request)
         phases.tunnelMs = started.tunnelMs
         phases.readyMs = started.readyMs
         const metadata = await this.timed(() => writeMetadata(sandbox, started.handle))
@@ -194,27 +209,41 @@ class ModalSandboxProvider implements SandboxProvider {
         return handle
     }
 
-    private async start(sandbox: Sandbox, request: EnsureHostRequest): Promise<StartedHost> {
+    private async startPrivate(sandbox: Sandbox, request: EnsureHostRequest): Promise<StartedHost> {
+        const readyStartedAt = this.now()
+        const route = await this.waitForReady(sandbox, true)
+        if (!route) throw new Error("Modal durable-object host did not publish its private route")
+        return {
+            handle: { hostId: request.hostId, route: route.trim(), canonicalRegion: request.canonicalRegion },
+            tunnelMs: 0,
+            readyMs: elapsedMs(readyStartedAt, this.now())
+        }
+    }
+
+    private async startPublic(sandbox: Sandbox, request: EnsureHostRequest): Promise<StartedHost> {
         const tunnelStartedAt = this.now()
         const route = (await sandbox.tunnels())[hostPort]?.url
         if (!route) throw new Error("Modal did not create the durable-object HTTP/2 tunnel")
         await writeFile(sandbox, hostRouteFile, route)
         const tunnelMs = elapsedMs(tunnelStartedAt, this.now())
         const readyStartedAt = this.now()
-        const ready = await sandbox.exec(
-            ["sh", "-c", `for i in $(seq 1 1200); do test -f ${readyFile} && exit 0; if test -f ${hostExitedFile}; then cat ${hostStderrFile} >&2; exit 1; fi; sleep 0.05; done; exit 1`],
-            { stdout: "pipe", stderr: "pipe" }
-        )
-        const [detail, exitCode] = await Promise.all([ready.stderr.readText(), ready.wait()])
-        if (exitCode !== 0) {
-            await sandbox.terminate().catch(() => undefined)
-            const message = detail.trim()
-            throw new Error(`durable-object host did not become ready${message ? `: ${message}` : ""}`)
-        }
+        await this.waitForReady(sandbox, false)
         return {
             handle: { hostId: request.hostId, route, canonicalRegion: request.canonicalRegion },
             tunnelMs,
             readyMs: elapsedMs(readyStartedAt, this.now())
+        }
+    }
+
+    private async waitForReady(sandbox: Sandbox, includeRoute: boolean): Promise<string> {
+        try {
+            await sandbox.waitUntilReady(60_000)
+            return includeRoute ? await sandbox.filesystem.readText(hostRouteFile) : ""
+        } catch (error) {
+            const detail = await sandbox.filesystem.readText(hostStderrFile).catch(() => "")
+            await sandbox.terminate().catch(() => undefined)
+            const message = detail.trim() || (error instanceof Error ? error.message : String(error))
+            throw new Error(`durable-object host did not become ready${message ? `: ${message}` : ""}`)
         }
     }
 
@@ -238,7 +267,7 @@ class ModalSandboxProvider implements SandboxProvider {
     }
 }
 
-function hostEnvironment(request: EnsureHostRequest): Record<string, string> {
+function hostEnvironment(request: EnsureHostRequest, privateNetwork: boolean): Record<string, string> {
     return {
         DURABLE_OBJECT_PROCESS_ROLE: "host",
         DURABLE_OBJECT_HOST_TOKEN: request.hostToken,
@@ -253,11 +282,25 @@ function hostEnvironment(request: EnsureHostRequest): Record<string, string> {
         DURABLE_OBJECT_CODE_REVISION: request.codeRevision,
         DURABLE_OBJECT_EXECUTOR_SOCKET: "/tmp/durable-object-executor.sock",
         DURABLE_OBJECT_HOST_READY_FILE: readyFile,
-        DURABLE_OBJECT_HOST_BIND: `0.0.0.0:${hostPort}`,
+        DURABLE_OBJECT_HOST_BIND: `${privateNetwork ? "[::]" : "0.0.0.0"}:${hostPort}`,
         DURABLE_OBJECT_ACTOR_IDLE_TIMEOUT_MS: String(request.actorIdleTimeoutMs),
         DURABLE_OBJECT_HOST_IDLE_TIMEOUT_MS: String(request.hostIdleTimeoutMs),
-        ...(request.actorEntrypoint ? { DURABLE_OBJECT_ENTRYPOINT: request.actorEntrypoint } : {})
+        ...(request.actorEntrypoint ? { DURABLE_OBJECT_ENTRYPOINT: request.actorEntrypoint } : {}),
+        ...(privateNetwork
+            ? {
+                  DURABLE_OBJECT_HOST_PRIVATE_HOSTNAME: modalPrivateHostname,
+                  DURABLE_OBJECT_HOST_ROUTE_FILE: hostRouteFile
+              }
+            : {})
     }
+}
+
+function hostCommand(binaryPath: string, privateNetwork: boolean): string[] {
+    const bootstrap = privateNetwork
+        ? '"$1" 2>"$2"; status=$?; printf \'%s\n\' "$status" >"$3"; if ! test -f "$4"; then sleep 60; fi; exit "$status"'
+        : 'until test -s "$1"; do sleep 0.05; done; export DURABLE_OBJECT_HOST_ROUTE="$(cat "$1")"; "$2" 2>"$3"; status=$?; printf \'%s\n\' "$status" >"$4"; if ! test -f "$5"; then sleep 60; fi; exit "$status"'
+    const commandArguments = privateNetwork ? [binaryPath, hostStderrFile, hostExitedFile, readyFile] : [hostRouteFile, binaryPath, hostStderrFile, hostExitedFile, readyFile]
+    return ["sh", "-c", bootstrap, "durable-object-host-bootstrap", ...commandArguments]
 }
 
 function validateEnsureRequest(request: EnsureHostRequest): void {
@@ -272,6 +315,11 @@ function validateEnsureRequest(request: EnsureHostRequest): void {
 
 function validateWarmImageRequest(request: WarmImageRequest): void {
     if (!request.namespaceId || !request.codeRevision || !request.imageRef) throw new Error("image warmup request is invalid")
+}
+
+function validatePublicHostRouteRequest(request: PublicHostRouteRequest, catalog?: CanonicalRegionCatalog): void {
+    if (!request.namespaceId || !request.codeRevision) throw new Error("public host route request is invalid")
+    modalPlacement(request.canonicalRegion, catalog)
 }
 
 function validateTerminateHostsRequest(request: TerminateHostsRequest, catalog?: CanonicalRegionCatalog): void {

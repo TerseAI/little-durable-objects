@@ -69,7 +69,7 @@ Container builds can copy the binary from `us-central1-docker.pkg.dev/fluid-anal
    POST /v1/namespaces/{namespaceId}/workflow-tokens
    ```
 
-   The deployment call atomically ensures the namespace and registers its active deployment. When it replaces an existing deployment, the control plane terminates that revision's cached actor hosts in every configured region before returning; actor state and placement remain durable for reactivation on the new revision. Its body is `{ "codeRevision", "imageRef", "workingDirectory", "actorEntrypoint", "warmRegion" }`; `warmRegion` is optional and starts a disposable background sandbox to warm the image cache without delaying or failing registration. The workflow-token body is `{ "executionId", "deadlineUnixMs", "storageRegion" }`.
+   The deployment call atomically ensures the namespace and registers its active deployment. When it replaces an existing deployment, the control plane terminates that revision's cached actor hosts in every configured region before returning; actor state and placement remain durable for reactivation on the new revision. Its body is `{ "codeRevision", "imageRef", "workingDirectory", "actorEntrypoint", "warmRegion" }`; `warmRegion` is optional and starts a disposable background sandbox to warm the image cache without delaying or failing registration. The workflow-token body is `{ "executionId", "deadlineUnixMs", "storageRegion", "privateRouting" }`; `privateRouting` defaults to `false` and should be enabled only for callers in the provider's private network.
 
    `storageRegion` selects the home region only when an actor is first created. Later invocations resolve the actor's existing host region.
 

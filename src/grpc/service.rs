@@ -192,6 +192,7 @@ mod tests {
             session_id: "00000000-0000-4000-8000-000000000001".into(),
             process_role: ActorProcessRole::Host,
             region: "north-america-east".into(),
+            private_routing: false,
             code_revision: Some("revision-1".into()),
             expires_at: i64::MAX,
             invocation: Some(ActorInvocationCapability {

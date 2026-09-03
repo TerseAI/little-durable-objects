@@ -19,8 +19,8 @@ use crate::{
         ObjectPlacement, ObjectPlacementStore, PlacementClaim, StateCommit, StateCommitRequest,
     },
     sandbox::{
-        EnsureHostRequest, HostSandboxRuntimeConfig, HostTermination, ImageWarmup, SandboxProvider,
-        TerminateHostsRequest, WarmImageRequest,
+        EnsureHostRequest, HostSandboxRuntimeConfig, HostTermination, ImageWarmup,
+        PublicHostRouteRequest, SandboxProvider, TerminateHostsRequest, WarmImageRequest,
     },
     storage_urls::{StateWriteTicket, StorageUrlSigner, validate_snapshot_object_name},
 };
@@ -222,8 +222,19 @@ impl ControlPlaneService {
                 &state_read_url,
                 principal.expires_at,
             )?;
+        let route = if principal.private_routing && principal.region == target.placement.home_region
+        {
+            target.lease.route.clone()
+        } else {
+            self.routing
+                .as_ref()
+                .and_then(|routing| routing.provisioner.as_ref())
+                .context("sandbox provider is not configured")?
+                .public_host_route(&target.spec, &target.placement.home_region)
+                .await?
+        };
         Ok(WorkflowActorTarget {
-            route: target.lease.route,
+            route,
             token: issued.token,
             owner_epoch: target.placement.owner_epoch,
             state_version: target.placement.state_version,
@@ -579,6 +590,7 @@ fn select_target_region(
 #[async_trait]
 pub(crate) trait HostProvisioner: Send + Sync {
     async fn ensure_host(&self, spec: &HostLaunchSpec, region: &str) -> Result<HostLease>;
+    async fn public_host_route(&self, spec: &HostLaunchSpec, region: &str) -> Result<String>;
     async fn warm_image(&self, spec: &HostLaunchSpec, region: &str) -> Result<ImageWarmup>;
     async fn terminate_hosts(
         &self,
@@ -663,6 +675,19 @@ impl HostProvisioner for SandboxHostProvisioner {
             "actor host provisioning completed"
         );
         Ok(lease)
+    }
+
+    async fn public_host_route(&self, spec: &HostLaunchSpec, region: &str) -> Result<String> {
+        let response = self
+            .provider
+            .public_host_route(&PublicHostRouteRequest {
+                namespace_id: spec.namespace_id.clone(),
+                code_revision: spec.code_revision.clone(),
+                canonical_region: region.to_owned(),
+            })
+            .await?;
+        validate_host_route(&response.route)?;
+        Ok(response.route)
     }
 
     async fn warm_image(&self, spec: &HostLaunchSpec, region: &str) -> Result<ImageWarmup> {
@@ -906,6 +931,10 @@ mod tests {
             anyhow::bail!("host creation is outside this test")
         }
 
+        async fn public_host_route(&self, _spec: &HostLaunchSpec, _region: &str) -> Result<String> {
+            anyhow::bail!("public host routing is outside this test")
+        }
+
         async fn warm_image(&self, spec: &HostLaunchSpec, region: &str) -> Result<ImageWarmup> {
             self.warmed.send((spec.clone(), region.to_owned()))?;
             Ok(ImageWarmup {
@@ -928,10 +957,45 @@ mod tests {
         retired: tokio::sync::mpsc::UnboundedSender<(HostLaunchSpec, Vec<String>)>,
     }
 
+    struct FakeRouteProvisioner {
+        routes: Mutex<Vec<(HostLaunchSpec, String)>>,
+    }
+
+    #[async_trait]
+    impl HostProvisioner for FakeRouteProvisioner {
+        async fn ensure_host(&self, _spec: &HostLaunchSpec, _region: &str) -> Result<HostLease> {
+            anyhow::bail!("host creation is outside this test")
+        }
+
+        async fn public_host_route(&self, spec: &HostLaunchSpec, region: &str) -> Result<String> {
+            self.routes
+                .lock()
+                .unwrap()
+                .push((spec.clone(), region.to_owned()));
+            Ok("https://actor.example.com/".into())
+        }
+
+        async fn warm_image(&self, _spec: &HostLaunchSpec, _region: &str) -> Result<ImageWarmup> {
+            anyhow::bail!("image warmup is outside this test")
+        }
+
+        async fn terminate_hosts(
+            &self,
+            _spec: &HostLaunchSpec,
+            _regions: &[String],
+        ) -> Result<HostTermination> {
+            anyhow::bail!("host termination is outside this test")
+        }
+    }
+
     #[async_trait]
     impl HostProvisioner for FakeRetiringProvisioner {
         async fn ensure_host(&self, _spec: &HostLaunchSpec, _region: &str) -> Result<HostLease> {
             anyhow::bail!("host creation is outside this test")
+        }
+
+        async fn public_host_route(&self, _spec: &HostLaunchSpec, _region: &str) -> Result<String> {
+            anyhow::bail!("public host routing is outside this test")
         }
 
         async fn warm_image(&self, _spec: &HostLaunchSpec, _region: &str) -> Result<ImageWarmup> {
@@ -1046,7 +1110,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workflow_target_resolves_a_direct_host_capability() -> Result<()> {
+    async fn workflow_target_uses_private_routing_only_for_capable_same_region_callers()
+    -> Result<()> {
         let issuer = test_issuer()?;
         let auth = ActorJwtVerifier::for_scope(
             issuer.verifier_keys_json()?,
@@ -1062,7 +1127,7 @@ mod tests {
                 HostLease {
                     id: host_id.clone(),
                     session_id: "00000000-0000-4000-8000-000000000001".into(),
-                    route: "https://actor.example.com/".into(),
+                    route: "http://[fd00:cafe::1234]:7101/".into(),
                     expires_at_ms: 10_000,
                 },
             )])),
@@ -1086,8 +1151,11 @@ mod tests {
         placements
             .claim(&actor.storage_key(), None, &host_id, "us-east")
             .await?;
+        let provisioner = Arc::new(FakeRouteProvisioner {
+            routes: Mutex::new(Vec::new()),
+        });
         let service = ControlPlaneService::new(leases, placements, Arc::new(FakeStorageUrls), auth)
-            .with_routing(registry, issuer.clone(), None);
+            .with_routing(registry, issuer.clone(), Some(provisioner.clone()));
 
         let target = service
             .resolve_workflow_target(
@@ -1099,6 +1167,7 @@ mod tests {
                     session_id: uuid::Uuid::new_v4().to_string(),
                     process_role: ActorProcessRole::Workflow,
                     region: "us-east".into(),
+                    private_routing: true,
                     code_revision: None,
                     expires_at: unix_seconds()? + 30,
                     invocation: None,
@@ -1107,7 +1176,8 @@ mod tests {
             )
             .await?;
 
-        assert_eq!(target.route, "https://actor.example.com/");
+        assert_eq!(target.route, "http://[fd00:cafe::1234]:7101/");
+        assert!(provisioner.routes.lock().unwrap().is_empty());
         assert_eq!(target.owner_epoch, 1);
         assert_eq!(target.state_version, 0);
         assert!(target.state_read_url.is_empty());
@@ -1125,6 +1195,73 @@ mod tests {
                 .expect("direct invocation capability")
                 .actor,
             actor
+        );
+
+        let local_target = service
+            .resolve_workflow_target(
+                &ActorPrincipal {
+                    scope: ActorScope {
+                        namespace_id: "project-1".into(),
+                    },
+                    host_id: HostId::new("workflow.v1.project-1.execution-local"),
+                    session_id: uuid::Uuid::new_v4().to_string(),
+                    process_role: ActorProcessRole::Workflow,
+                    region: "us-east".into(),
+                    private_routing: false,
+                    code_revision: None,
+                    expires_at: unix_seconds()? + 30,
+                    invocation: None,
+                },
+                &actor,
+            )
+            .await?;
+
+        assert_eq!(local_target.route, "https://actor.example.com/");
+
+        let cross_region_target = service
+            .resolve_workflow_target(
+                &ActorPrincipal {
+                    scope: ActorScope {
+                        namespace_id: "project-1".into(),
+                    },
+                    host_id: HostId::new("workflow.v1.project-1.execution-2"),
+                    session_id: uuid::Uuid::new_v4().to_string(),
+                    process_role: ActorProcessRole::Workflow,
+                    region: "us-west".into(),
+                    private_routing: true,
+                    code_revision: None,
+                    expires_at: unix_seconds()? + 30,
+                    invocation: None,
+                },
+                &actor,
+            )
+            .await?;
+
+        assert_eq!(cross_region_target.route, "https://actor.example.com/");
+        assert_eq!(
+            provisioner.routes.lock().unwrap().as_slice(),
+            &[
+                (
+                    HostLaunchSpec {
+                        namespace_id: "project-1".into(),
+                        code_revision: "revision-1".into(),
+                        image_ref: "image-1".into(),
+                        working_directory: "/workspace".into(),
+                        actor_entrypoint: None,
+                    },
+                    "us-east".into()
+                ),
+                (
+                    HostLaunchSpec {
+                        namespace_id: "project-1".into(),
+                        code_revision: "revision-1".into(),
+                        image_ref: "image-1".into(),
+                        working_directory: "/workspace".into(),
+                        actor_entrypoint: None,
+                    },
+                    "us-east".into()
+                )
+            ]
         );
         Ok(())
     }

@@ -38,6 +38,7 @@ pub(crate) struct ActorPrincipal {
     pub session_id: String,
     pub process_role: ActorProcessRole,
     pub region: String,
+    pub private_routing: bool,
     pub code_revision: Option<String>,
     pub expires_at: i64,
     pub invocation: Option<ActorInvocationCapability>,
@@ -87,6 +88,8 @@ struct ActorJwtClaims {
     process_role: ActorProcessRole,
     #[serde(rename = "storageRegion")]
     region: String,
+    #[serde(default)]
+    private_routing: bool,
     code_revision: Option<String>,
     scope: String,
     iat: i64,
@@ -250,6 +253,7 @@ impl ActorJwtVerifier {
             session_id: claims.session_id,
             process_role: claims.process_role,
             region: claims.region,
+            private_routing: claims.private_routing,
             code_revision: claims.code_revision,
             expires_at: claims.exp,
             invocation: claims.invocation,

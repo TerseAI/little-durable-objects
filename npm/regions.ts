@@ -4,6 +4,7 @@ interface ModalPlacement {
     readonly regions: readonly string[]
     readonly cloud?: string
     readonly observedPlacements: readonly string[]
+    readonly privateNetwork?: boolean
 }
 
 interface RegionDefinition {
@@ -14,16 +15,16 @@ type CanonicalRegionCatalog = Readonly<Record<string, RegionDefinition>>
 
 const recommendedRegionCatalog = {
     "north-america-east": {
-        modal: { regions: ["us-east"], cloud: "gcp", observedPlacements: ["gcp:us-east*"] }
+        modal: { regions: ["us-east4"], cloud: "gcp", observedPlacements: ["gcp:us-east4*"], privateNetwork: true }
     },
     "north-america-central": {
-        modal: { regions: ["us-central"], cloud: "gcp", observedPlacements: ["gcp:us-central*"] }
+        modal: { regions: ["us-central1"], cloud: "gcp", observedPlacements: ["gcp:us-central1*"], privateNetwork: true }
     },
     "north-america-south": {
         modal: { regions: ["us-south"], cloud: "gcp", observedPlacements: ["gcp:us-south*"] }
     },
     "north-america-west": {
-        modal: { regions: ["us-west"], cloud: "gcp", observedPlacements: ["gcp:us-west*"] }
+        modal: { regions: ["us-west1"], cloud: "gcp", observedPlacements: ["gcp:us-west1*"], privateNetwork: true }
     },
     "europe-west": {
         modal: { regions: ["eu-west"], cloud: "gcp", observedPlacements: ["gcp:europe-west*"] }

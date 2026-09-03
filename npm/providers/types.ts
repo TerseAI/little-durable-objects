@@ -61,15 +61,39 @@ interface HostTermination {
     readonly resourceIds: readonly string[]
 }
 
+interface PublicHostRouteRequest {
+    readonly namespaceId: string
+    readonly codeRevision: string
+    readonly canonicalRegion: string
+}
+
+interface PublicHostRoute {
+    readonly route: string
+}
+
 interface SandboxProvider {
     ensureHost(request: EnsureHostRequest): Promise<ActorHostHandle>
+    publicHostRoute(request: PublicHostRouteRequest): Promise<PublicHostRoute>
     warmImage(request: WarmImageRequest): Promise<ImageWarmup>
     terminateHosts(request: TerminateHostsRequest): Promise<HostTermination>
 }
 
 type SandboxProviderCommand =
     | { readonly operation: "ensure_host"; readonly request: EnsureHostRequest }
+    | { readonly operation: "public_host_route"; readonly request: PublicHostRouteRequest }
     | { readonly operation: "warm_image"; readonly request: WarmImageRequest }
     | { readonly operation: "terminate_hosts"; readonly request: TerminateHostsRequest }
 
-export type { ActorHostHandle, ActorHostProvisioning, EnsureHostRequest, HostTermination, ImageWarmup, SandboxProvider, SandboxProviderCommand, TerminateHostsRequest, WarmImageRequest }
+export type {
+    ActorHostHandle,
+    ActorHostProvisioning,
+    EnsureHostRequest,
+    HostTermination,
+    ImageWarmup,
+    PublicHostRoute,
+    PublicHostRouteRequest,
+    SandboxProvider,
+    SandboxProviderCommand,
+    TerminateHostsRequest,
+    WarmImageRequest
+}

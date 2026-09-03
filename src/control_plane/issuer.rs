@@ -110,6 +110,7 @@ impl ActorJwtIssuer {
         execution_id: &str,
         storage_region: &str,
         deadline_unix_ms: i64,
+        private_routing: bool,
     ) -> Result<IssuedActorToken> {
         validate_region(storage_region)?;
         let now_ms = unix_millis()?;
@@ -134,6 +135,7 @@ impl ActorJwtIssuer {
             session_id: uuid::Uuid::new_v4().to_string(),
             process_role: ActorProcessRole::Workflow,
             region: storage_region.to_owned(),
+            private_routing,
             code_revision: None,
             scope: "actor:invoke".into(),
             iat: now_ms / 1000,
@@ -165,6 +167,7 @@ impl ActorJwtIssuer {
             session_id: session_id.to_owned(),
             process_role: ActorProcessRole::Host,
             region: region.to_owned(),
+            private_routing: false,
             code_revision: Some(code_revision.to_owned()),
             scope: "actor:authority actor:invoke".into(),
             iat: now_ms / 1000,
@@ -207,6 +210,7 @@ impl ActorJwtIssuer {
             session_id: session_id.to_owned(),
             process_role: ActorProcessRole::Host,
             region: region.to_owned(),
+            private_routing: false,
             code_revision: Some(code_revision.to_owned()),
             scope: "actor:invoke".into(),
             iat: now,
@@ -250,6 +254,7 @@ struct ActorJwtClaims {
     process_role: ActorProcessRole,
     #[serde(rename = "storageRegion")]
     region: String,
+    private_routing: bool,
     code_revision: Option<String>,
     scope: String,
     iat: i64,
@@ -301,6 +306,7 @@ mod tests {
             "execution-1",
             "north-america-central",
             unix_millis()? + 10_000,
+            true,
         )?;
 
         let principal = verifier.authenticate_authorization(&format!("Bearer {}", issued.token))?;
@@ -308,6 +314,7 @@ mod tests {
         assert_eq!(principal.scope.namespace_id, "project-1");
         assert_eq!(principal.process_role, ActorProcessRole::Workflow);
         assert_eq!(principal.region, "north-america-central");
+        assert!(principal.private_routing);
         let jwks: serde_json::Value = serde_json::from_slice(&issuer.jwks_json()?)?;
         assert_eq!(jwks["keys"][0]["kid"], "test-key");
         assert_eq!(jwks["keys"][0]["crv"], "Ed25519");

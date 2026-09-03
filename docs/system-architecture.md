@@ -18,12 +18,12 @@ trusted backend
 |                              HostProvisioner                              |
 |                                     |                                     |
 | command sandbox provider ---------->+----> Modal Sandbox V2               |
-|   JSON host handle / image warmup         | current filesystem API        |
+|   JSON host handle / lazy public route    | current filesystem API        |
 |                                               |                           |
 | internal gRPC API <-------- host JWT ---------+----> Rust actor host       |
 +---------------------------------------------------------------------------+
           ^                          |                  |
-          | REST + workflow JWT      | direct gRPC      | Unix socket
+          | REST + workflow JWT      | private i6pn gRPC| Unix socket
           | requested initial home   | + target JWT     |
           |                          v                  v
        workflow ---------------------------> Rust host --> Node actor executor
@@ -37,7 +37,7 @@ The trusted backend alone holds the admin token. One PostgreSQL statement ensure
 
 Rust actor hosts serialize each actor's invocations and keep its latest state resident for the host lifetime. The Rust-to-Node actor session enforces its message limit before delivery and maps oversized requests or responses to `resource_exhausted`; an oversized response also evicts the in-memory actor so unpublished state cannot survive the rejected invocation. A state-changing invocation uploads a uniquely named snapshot through a create-only signed URL, then asks the control plane to advance the PostgreSQL state head. That single update is conditional on the active host session, owner epoch, and expected state version. The commit response includes a best-effort write ticket for the next version, removing one control-plane round trip from the normal warm path. If a commit response is lost, the host retains the pending snapshot and retries the same idempotent commit before executing another request. Unique snapshot names avoid GCS's same-object write-rate limit; PostgreSQL remains the source of truth for which snapshot is current.
 
-The sandbox provider translates each canonical home region into Modal's region and cloud constraints. Modal's placement response is authoritative; host activation begins immediately without running a blocking placement probe inside the sandbox.
+The sandbox provider translates each canonical home region into one exact Modal GCP region. Actor hosts and Terse workflow sandboxes enable Modal private IPv6 networking, so same-region invocations connect directly over i6pn. Hosted workflow JWTs explicitly grant private routing; local and older workflow tokens default to public routing so they never receive an unreachable i6pn address. Actor hosts advertise their private address in the lease and start concurrently with Modal's public HTTP/2 endpoint provisioning; activation never waits for the public tunnel. The public endpoint is declared when the actor sandbox is created and resolved lazily only when the caller cannot use the actor's private route.
 
 Both processes emit single-line JSON telemetry. `request_id` correlates direct workflow invocations with `actor_host_invocation` and `actor_state_write` events in Modal. `actor_host_provisioning` separates provider lookup, creation, tunnel, readiness, metadata, and lease-validation latency. Telemetry excludes credentials, signed URLs, arguments, results, and actor state.
 

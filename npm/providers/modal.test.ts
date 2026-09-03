@@ -4,7 +4,7 @@ import assert from "node:assert/strict"
 import { test } from "node:test"
 
 import { ModalSandboxProvider } from "./modal.js"
-import type { EnsureHostRequest, TerminateHostsRequest, WarmImageRequest } from "./types.js"
+import type { EnsureHostRequest, PublicHostRouteRequest, TerminateHostsRequest, WarmImageRequest } from "./types.js"
 
 test("terminates every cached host for a replaced deployment revision", async () => {
     const lookedUp: string[] = []
@@ -76,7 +76,7 @@ test("warms an image in a disposable regional V2 sandbox", async () => {
 
     assert.deepEqual(result, { provider: "modal", resourceId: "sb-v2-warmup", totalMs: 0 })
     assert.deepEqual(createOptions?.command, ["true"])
-    assert.deepEqual(createOptions?.regions, ["us-east"])
+    assert.deepEqual(createOptions?.regions, ["us-east4"])
     assert.equal(createOptions?.cloud, "gcp")
     assert.equal(createOptions?.name, undefined)
     assert.equal(waited, true)
@@ -86,32 +86,23 @@ test("warms an image in a disposable regional V2 sandbox", async () => {
 test("creates a V2 Modal sandbox with the host as its main process and reports provisioning timings", async () => {
     let createOptions: SandboxCreateParams | undefined
     let usedLegacyCreate = false
+    let tunnelLookups = 0
     const files = new Map<string, string>()
-    const executedCommands: string[][] = []
+    let waitedForReadiness = false
     const sandbox = {
         sandboxId: "sb-v2-actor",
-        async exec(command: string[]) {
-            executedCommands.push(command)
-            return {
-                stdout: {
-                    async readText() {
-                        return ""
-                    }
-                },
-                stderr: {
-                    async readText() {
-                        return ""
-                    }
-                },
-                async wait() {
-                    return 0
-                }
-            }
+        async waitUntilReady() {
+            waitedForReadiness = true
         },
         async tunnels() {
-            return { 7101: { url: "https://host.example.com" } }
+            tunnelLookups += 1
+            throw new Error("same-region activation must not wait for a public tunnel")
         },
         filesystem: {
+            async readText(path: string) {
+                assert.equal(path, "/tmp/durable-object-route")
+                return "http://[fd00:cafe::1234]:7101\n"
+            },
             async writeText(contents: string, path: string) {
                 files.set(path, contents)
             }
@@ -156,7 +147,7 @@ test("creates a V2 Modal sandbox with the host as its main process and reports p
 
     assert.deepEqual(handle, {
         hostId: "host.v1.project-1.00000000-0000-4000-8000-000000000001",
-        route: "https://host.example.com",
+        route: "http://[fd00:cafe::1234]:7101",
         canonicalRegion: "north-america-east",
         provisioning: {
             provider: "modal",
@@ -175,45 +166,73 @@ test("creates a V2 Modal sandbox with the host as its main process and reports p
     assert.equal(usedLegacyCreate, false)
     assert.equal(createOptions?.timeoutMs, 86_400_000)
     assert.equal(createOptions?.idleTimeoutMs, 300_000)
-    assert.equal(createOptions?.command?.[5], "/usr/local/bin/little-durable-objects")
-    assert.equal(createOptions?.command?.[8], "/tmp/durable-object-ready")
-    assert.match(createOptions?.command?.[2] ?? "", /if ! test -f "\$5"; then sleep 60; fi/u)
+    assert.deepEqual(createOptions?.regions, ["us-east4"])
+    assert.equal(createOptions?.i6pn, true)
+    assert.deepEqual(createOptions?.h2Ports, [7101])
+    assert.ok(createOptions?.readinessProbe)
+    assert.equal(createOptions?.command?.[4], "/usr/local/bin/little-durable-objects")
+    assert.equal(createOptions?.command?.[7], "/tmp/durable-object-ready")
+    assert.match(createOptions?.command?.[2] ?? "", /if ! test -f "\$4"; then sleep 60; fi/u)
     assert.equal(createOptions?.env?.DURABLE_OBJECT_HOST_TOKEN, "host-jwt")
     assert.equal(createOptions?.env?.DURABLE_OBJECT_ACTOR_IDLE_TIMEOUT_MS, "60000")
     assert.equal(createOptions?.env?.DURABLE_OBJECT_HOST_IDLE_TIMEOUT_MS, "300000")
+    assert.equal(createOptions?.env?.DURABLE_OBJECT_HOST_BIND, "[::]:7101")
+    assert.equal(createOptions?.env?.DURABLE_OBJECT_HOST_PRIVATE_HOSTNAME, "i6pn.modal.local")
+    assert.equal(createOptions?.env?.DURABLE_OBJECT_HOST_ROUTE_FILE, "/tmp/durable-object-route")
     assert.equal(createOptions?.env?.MODAL_TOKEN_ID, undefined)
-    assert.equal(files.get("/tmp/durable-object-route"), "https://host.example.com")
+    assert.equal(files.get("/tmp/durable-object-route"), undefined)
     assert.match(files.get("/tmp/durable-object-host.json") ?? "", /host\.v1\.project-1/u)
-    assert.equal(executedCommands.length, 1)
-    assert.doesNotMatch(executedCommands[0]?.join(" ") ?? "", /MODAL_(?:CLOUD_PROVIDER|REGION)/u)
+    assert.equal(waitedForReadiness, true)
+    assert.equal(tunnelLookups, 0)
+})
+
+test("retrieves the public HTTP/2 route only when requested", async () => {
+    let tunnelLookups = 0
+    const sandbox = {
+        sandboxId: "sb-v2-actor",
+        async poll() {
+            return null
+        },
+        async tunnels() {
+            tunnelLookups += 1
+            return { 7101: { url: "https://host.example.com" } }
+        }
+    }
+    const client = {
+        apps: {
+            async fromName() {
+                return { name: "durable-object-hosts" }
+            }
+        },
+        sandboxes: {
+            async experimentalFromName() {
+                return sandbox
+            }
+        }
+    }
+    const provider = new ModalSandboxProvider({ client: client as unknown as ModalClient })
+
+    const route = await provider.publicHostRoute(publicHostRouteRequest())
+
+    assert.deepEqual(route, { route: "https://host.example.com" })
+    assert.equal(tunnelLookups, 1)
 })
 
 test("surfaces host stderr when the main process exits before readiness", async () => {
     let terminated = false
     const sandbox = {
         sandboxId: "sb-v2-failed",
-        async exec(command: string[]) {
-            const placement = command.join(" ").includes("MODAL_CLOUD_PROVIDER")
-            return {
-                stdout: {
-                    async readText() {
-                        return placement ? "gcp\nus-east-1\n" : ""
-                    }
-                },
-                stderr: {
-                    async readText() {
-                        return placement ? "" : "host could not register its lease\n"
-                    }
-                },
-                async wait() {
-                    return placement ? 0 : 1
-                }
-            }
+        async waitUntilReady() {
+            throw new Error("sandbox stopped")
         },
         async tunnels() {
             return { 7101: { url: "https://host.example.com" } }
         },
         filesystem: {
+            async readText(path: string) {
+                assert.equal(path, "/tmp/durable-object-host.stderr")
+                return "host could not register its lease\n"
+            },
             async writeText() {}
         },
         async terminate() {
@@ -280,5 +299,13 @@ function terminateHostsRequest(): TerminateHostsRequest {
         namespaceId: "project-1",
         codeRevision: "revision-1",
         canonicalRegions: ["north-america-east", "north-america-central", "north-america-west"]
+    }
+}
+
+function publicHostRouteRequest(): PublicHostRouteRequest {
+    return {
+        namespaceId: "project-1",
+        codeRevision: "revision-1",
+        canonicalRegion: "north-america-east"
     }
 }
