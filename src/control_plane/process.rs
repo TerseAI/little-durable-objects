@@ -1,7 +1,6 @@
 use std::{collections::HashMap, env, future::Future, net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, ensure};
-use tonic::transport::Server;
 use tracing::info;
 
 use crate::{
@@ -72,10 +71,19 @@ pub async fn serve_control_plane(
     let bind = config.bind;
     let routes = control_plane_routes(config).await?;
     info!(bind = %bind, "durable-object control plane is ready");
-    Server::builder()
-        .accept_http1(true)
-        .add_routes(routes)
-        .serve_with_shutdown(bind, shutdown)
+    let listener = tokio::net::TcpListener::bind(bind)
+        .await
+        .context("bind durable-object control plane")?;
+    serve_routes(listener, routes, shutdown).await
+}
+
+async fn serve_routes(
+    listener: tokio::net::TcpListener,
+    routes: tonic::service::Routes,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<()> {
+    axum::serve(listener, routes.into_axum_router())
+        .with_graceful_shutdown(shutdown)
         .await
         .context("serve durable-object control plane")
 }
@@ -336,7 +344,35 @@ fn idle_timeout(
 
 #[cfg(test)]
 mod tests {
+    use axum::{Router, extract::WebSocketUpgrade, response::Response, routing::get};
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::sync::oneshot;
+    use tokio_tungstenite::{connect_async, tungstenite::Message};
+
     use super::*;
+
+    #[tokio::test]
+    async fn server_carries_websocket_upgrades() -> Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let routes =
+            tonic::service::Routes::from(Router::new().route("/socket", get(echo_websocket)));
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server = tokio::spawn(serve_routes(listener, routes, async {
+            let _ = shutdown_rx.await;
+        }));
+
+        let (mut socket, _) = connect_async(format!("ws://{address}/socket")).await?;
+        socket.send(Message::Text("hello".into())).await?;
+        assert_eq!(
+            socket.next().await.transpose()?,
+            Some(Message::Text("hello".into()))
+        );
+        socket.close(None).await?;
+        let _ = shutdown_tx.send(());
+        server.await??;
+        Ok(())
+    }
 
     #[test]
     fn parses_the_minimal_storage_configuration() -> Result<()> {
@@ -409,5 +445,13 @@ mod tests {
             .is_err()
         );
         Ok(())
+    }
+
+    async fn echo_websocket(upgrade: WebSocketUpgrade) -> Response {
+        upgrade.on_upgrade(async |mut socket| {
+            if let Some(Ok(message)) = socket.recv().await {
+                let _ = socket.send(message).await;
+            }
+        })
     }
 }
