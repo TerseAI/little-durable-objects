@@ -107,13 +107,17 @@ class ModalSandboxProvider implements SandboxProvider {
     }
 
     async publicHostRoute(request: PublicHostRouteRequest): Promise<PublicHostRoute> {
+        return this.publicRoute(request, hostPort, "HTTP/2")
+    }
+
+    private async publicRoute(request: PublicHostRouteRequest, port: number, protocol: string): Promise<PublicHostRoute> {
         validatePublicHostRouteRequest(request, this.options.catalog)
         const app = await this.modal.apps.fromName(this.appName, { createIfMissing: false })
         const name = resourceName("host", request.namespaceId, request.codeRevision, request.canonicalRegion)
         const sandbox = await this.modal.sandboxes.experimentalFromName(app.name ?? this.appName, name)
         if ((await sandbox.poll()) !== null) throw new Error("Modal durable-object host is not running")
-        const route = (await sandbox.tunnels())[hostPort]?.url
-        if (!route) throw new Error("Modal did not create the durable-object HTTP/2 tunnel")
+        const route = (await sandbox.tunnels())[port]?.url
+        if (!route) throw new Error(`Modal did not create the durable-object ${protocol} tunnel`)
         return { route }
     }
 

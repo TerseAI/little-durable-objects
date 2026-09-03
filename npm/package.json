@@ -1,6 +1,6 @@
 {
     "name": "little-durable-objects",
-    "version": "0.1.9",
+    "version": "0.1.10",
     "description": "Provider-neutral durable objects for sandbox compute",
     "type": "module",
     "license": "MIT",
@@ -75,11 +75,13 @@
         "modal": "^0.10.0",
         "protobufjs": "^7.6.6",
         "tsx": "^4.0.0",
+        "ws": "^8.18.3",
         "zod": "^4.3.6"
     },
     "devDependencies": {
         "@grpc/proto-loader": "^0.8.1",
         "@types/node": "^22.0.0",
+        "@types/ws": "^8.18.1",
         "typescript": "^5.0.0"
     }
 }

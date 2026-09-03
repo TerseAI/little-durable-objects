@@ -7,7 +7,7 @@ use std::fmt;
 
 pub use self::process::{ActorHostConfig, serve_actor_host};
 pub(crate) use self::{
-    actor_host::ActorHost,
+    actor_host::{ActorHost, ActorSocketExecutionResult},
     lease_maintenance::{HostLeaseMaintainer, LeaseRenewalTask},
 };
 

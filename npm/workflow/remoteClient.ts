@@ -1,9 +1,11 @@
+import WebSocket from "ws"
 import { z } from "zod"
 
 import { ActorConfigurationError, ActorInvocationError, ActorProtocolError } from "../shared/errors.js"
 import { currentActorInvocation } from "../shared/invocationContext.js"
+import type { ActorConnection } from "../shared/socket.js"
 import { JsonActorStateSerializer, validateActorComponent } from "../shared/types.js"
-import type { JsonValue } from "../shared/types.js"
+import type { JsonValue, SocketEffect } from "../shared/types.js"
 
 import { GrpcActorHostTransport } from "./actorHostGrpc.js"
 import type { ActorHostTarget, ActorHostTransport, DirectActorInvocation } from "./actorHostGrpc.js"
@@ -12,13 +14,15 @@ const namespaceIdSchema = z.string().regex(/^[A-Za-z0-9._-]+$/u)
 const remoteSettingsSchema = z.object({
     DURABLE_OBJECT_TOKEN: z.string().trim().min(1),
     DURABLE_OBJECT_NAMESPACE_ID: namespaceIdSchema,
-    DURABLE_OBJECT_CONTROL_PLANE_URL: z.string().url()
+    DURABLE_OBJECT_CONTROL_PLANE_URL: z.string().url(),
+    DURABLE_OBJECT_SOCKET_GATEWAY_URL: z.string().url().optional()
 })
 
 const clientOptionsSchema = z.object({
     token: z.string().trim().min(1),
     namespaceId: namespaceIdSchema,
-    controlPlaneUrl: z.string().url()
+    controlPlaneUrl: z.string().url(),
+    socketGatewayUrl: z.string().url().optional()
 })
 
 const errorDocumentSchema = z.object({
@@ -49,6 +53,7 @@ class RemoteActorClient {
     private readonly actorHost: ActorHostTransport
     private readonly now: () => number
     private readonly targets = new Map<string, Promise<ActorHostTarget>>()
+    private readonly connectWebSocket: WebSocketConnector
 
     constructor(options?: DurableObjectsClientOptions, dependencies: RemoteActorClientDependencies = {}) {
         this.environment = dependencies.environment ?? process.env
@@ -56,6 +61,7 @@ class RemoteActorClient {
         this.requestId = dependencies.requestId ?? (() => globalThis.crypto.randomUUID())
         this.actorHost = dependencies.actorHost ?? new GrpcActorHostTransport()
         this.now = dependencies.now ?? Date.now
+        this.connectWebSocket = dependencies.connectWebSocket ?? openWebSocket
         this.settingsValue = options === undefined ? undefined : configuredSettings(options)
     }
 
@@ -69,10 +75,25 @@ class RemoteActorClient {
         return this.direct(target, invocation, true)
     }
 
+    async connect(actorType: string, actorId: string, metadata: unknown): Promise<ActorConnection> {
+        const requestId = validateActorComponent("request ID", this.requestId())
+        if (currentActorInvocation() !== undefined) throw new ActorInvocationError("actor_error", requestId, "actor-to-actor socket connections are not available")
+        const actor = {
+            actorType: validateActorComponent("actor type", actorType),
+            actorId: validateActorComponent("actor ID", actorId)
+        }
+        const attachment = this.serializer.clone(metadata, "socket metadata")
+        if (Buffer.byteLength(JSON.stringify(attachment)) > 64 * 1024) throw new ActorProtocolError("socket metadata must not exceed 64 KiB")
+        return this.connectWebSocket(socketUrl(this.settings.socketGatewayUrl, this.settings.namespaceId, actor.actorType, actor.actorId), this.settings.token, attachment)
+    }
+
     private async direct(target: ActorHostTarget, invocation: DirectActorInvocation, retryReroute: boolean): Promise<unknown> {
         try {
             const reply = await this.actorHost.invoke(target, invocation)
-            if (reply.type === "completed") return reply.result
+            if (reply.type === "completed") {
+                await this.applySocketEffects(invocation, reply.effects)
+                return reply.result
+            }
             if (reply.type === "failed") throw new ActorInvocationError(reply.code, invocation.requestId, reply.message)
             if (!retryReroute) throw new ActorInvocationError("unavailable", invocation.requestId, "actor ownership changed repeatedly before execution")
             this.targets.delete(actorKey(invocation.actorType, invocation.actorId))
@@ -83,6 +104,24 @@ class RemoteActorClient {
             this.targets.delete(actorKey(invocation.actorType, invocation.actorId))
             const message = error instanceof Error ? error.message : String(error)
             throw new ActorInvocationError("outcome_unknown", invocation.requestId, `actor-host gRPC request failed after dispatch: ${message}`)
+        }
+    }
+
+    private async applySocketEffects(invocation: DirectActorInvocation, effects: readonly SocketEffect[]): Promise<void> {
+        if (effects.length === 0) return
+        let response: Response
+        try {
+            response = await this.fetchRequest(socketEffectsUrl(this.settings, invocation.actorType, invocation.actorId), {
+                method: "POST",
+                headers: { "content-type": "application/json", authorization: `Bearer ${this.settings.token}` },
+                body: JSON.stringify({ effects })
+            })
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            throw new ActorInvocationError("outcome_unknown", invocation.requestId, `actor completed but socket effects could not be delivered: ${message}`)
+        }
+        if (!response.ok) {
+            throw new ActorInvocationError("outcome_unknown", invocation.requestId, `actor completed but socket effects returned HTTP ${response.status}`)
         }
     }
 
@@ -149,7 +188,8 @@ class RemoteActorClient {
         this.settingsValue = {
             token: result.data.DURABLE_OBJECT_TOKEN,
             namespaceId: result.data.DURABLE_OBJECT_NAMESPACE_ID,
-            controlPlaneUrl: validateOrigin(result.data.DURABLE_OBJECT_CONTROL_PLANE_URL)
+            controlPlaneUrl: validateOrigin(result.data.DURABLE_OBJECT_CONTROL_PLANE_URL),
+            socketGatewayUrl: validateOrigin(result.data.DURABLE_OBJECT_SOCKET_GATEWAY_URL ?? result.data.DURABLE_OBJECT_CONTROL_PLANE_URL)
         }
         return this.settingsValue
     }
@@ -164,7 +204,12 @@ class RemoteActorClient {
 function configuredSettings(options: DurableObjectsClientOptions): RemoteActorSettings {
     const result = clientOptionsSchema.safeParse(options)
     if (!result.success) throw new ActorConfigurationError(`durable-object client settings are invalid: ${result.error.message}`)
-    return { ...result.data, controlPlaneUrl: validateOrigin(result.data.controlPlaneUrl) }
+    const controlPlaneUrl = validateOrigin(result.data.controlPlaneUrl)
+    return {
+        ...result.data,
+        controlPlaneUrl,
+        socketGatewayUrl: validateOrigin(result.data.socketGatewayUrl ?? controlPlaneUrl)
+    }
 }
 
 function validateOrigin(origin: string): string {
@@ -186,6 +231,50 @@ function targetUrl(settings: RemoteActorSettings, actorType: string, actorId: st
     return `${settings.controlPlaneUrl}/v1/namespaces/${encodeURIComponent(settings.namespaceId)}/actors/${encodeURIComponent(actor)}/${encodeURIComponent(id)}/target`
 }
 
+function socketUrl(route: string, namespaceId: string, actorType: string, actorId: string): string {
+    const url = new URL(route)
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:"
+    url.pathname = `/v1/namespaces/${encodeURIComponent(namespaceId)}/actors/${encodeURIComponent(actorType)}/${encodeURIComponent(actorId)}/websocket`
+    return url.href
+}
+
+function socketEffectsUrl(settings: RemoteActorSettings, actorType: string, actorId: string): string {
+    const actor = validateActorComponent("actor type", actorType)
+    const id = validateActorComponent("actor ID", actorId)
+    return `${settings.socketGatewayUrl}/v1/namespaces/${encodeURIComponent(settings.namespaceId)}/actors/${encodeURIComponent(actor)}/${encodeURIComponent(id)}/socket-effects`
+}
+
+function openWebSocket(url: string, token: string, metadata: JsonValue): Promise<ActorConnection> {
+    const socket = new WebSocket(url, {
+        headers: {
+            authorization: `Bearer ${token}`
+        }
+    })
+    return new Promise((resolve, reject) => {
+        let opened = false
+        socket.addEventListener(
+            "open",
+            () => {
+                try {
+                    socket.send(JSON.stringify({ type: "initialize", metadata }))
+                    opened = true
+                    resolve(socket as ActorConnection)
+                } catch (error) {
+                    socket.close()
+                    reject(error)
+                }
+            },
+            { once: true }
+        )
+        socket.addEventListener("error", () => {
+            if (!opened) reject(new Error("actor WebSocket connection failed"))
+        })
+        socket.addEventListener("close", () => {
+            if (!opened) reject(new Error("actor WebSocket closed before connecting"))
+        })
+    })
+}
+
 function actorKey(actorType: string, actorId: string): string {
     return `${actorType}\u001f${actorId}`
 }
@@ -202,12 +291,14 @@ interface RemoteActorSettings {
     readonly token: string
     readonly namespaceId: string
     readonly controlPlaneUrl: string
+    readonly socketGatewayUrl: string
 }
 
 interface DurableObjectsClientOptions {
     readonly token: string
     readonly namespaceId: string
     readonly controlPlaneUrl: string
+    readonly socketGatewayUrl?: string
 }
 
 interface RemoteActorClientDependencies {
@@ -216,7 +307,10 @@ interface RemoteActorClientDependencies {
     readonly requestId?: () => string
     readonly actorHost?: ActorHostTransport
     readonly now?: () => number
+    readonly connectWebSocket?: WebSocketConnector
 }
+
+type WebSocketConnector = (url: string, token: string, metadata: JsonValue) => Promise<ActorConnection>
 
 export { RemoteActorClient }
 export type { DurableObjectsClientOptions, RemoteActorClientDependencies }

@@ -1,17 +1,19 @@
-use std::{sync::Arc, time::Instant};
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
+use tokio::sync::RwLock;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
 use crate::{
-    actor::ActorKey,
+    actor::{ActorKey, ActorSocketEffect, ActorSocketEvent, ActorSocketInvocation},
     grpc::proto::{
-        ControlPlaneReply, ControlPlaneRequest,
+        ControlPlaneReply, ControlPlaneRequest, HostSocketEventRequest,
         actor_control_plane_service_server::{
             ActorControlPlaneService, ActorControlPlaneServiceServer,
         },
+        actor_host_service_client::ActorHostServiceClient,
     },
     host::{ActorProcessRole, HostId},
     host_leases::{HostLease, HostLeaseStore},
@@ -43,6 +45,9 @@ pub struct ControlPlaneService {
     auth: ActorJwtVerifier,
     host_token_issuer: Option<ActorJwtIssuer>,
     routing: Option<RoutingDependencies>,
+    public_routes: Arc<RwLock<HashMap<(HostId, String), String>>>,
+    socket_events: Option<Arc<dyn super::event_sink::SocketMessageEventSink>>,
+    socket_authenticator: Option<Arc<dyn super::socket_auth::SocketAuthenticator>>,
 }
 
 #[derive(Clone)]
@@ -65,6 +70,9 @@ impl ControlPlaneService {
             auth,
             host_token_issuer: None,
             routing: None,
+            public_routes: Arc::new(RwLock::new(HashMap::new())),
+            socket_events: None,
+            socket_authenticator: None,
         }
     }
 
@@ -82,6 +90,22 @@ impl ControlPlaneService {
         self
     }
 
+    pub(crate) fn with_socket_event_sink(
+        mut self,
+        sink: Option<Arc<dyn super::event_sink::SocketMessageEventSink>>,
+    ) -> Self {
+        self.socket_events = sink;
+        self
+    }
+
+    pub(crate) fn with_socket_authenticator(
+        mut self,
+        authenticator: Option<Arc<dyn super::socket_auth::SocketAuthenticator>>,
+    ) -> Self {
+        self.socket_authenticator = authenticator;
+        self
+    }
+
     pub fn into_internal_service(self) -> ActorControlPlaneServiceServer<Self> {
         ActorControlPlaneServiceServer::new(self)
             .max_decoding_message_size(MAX_CONTROL_PLANE_MESSAGE_BYTES)
@@ -90,6 +114,24 @@ impl ControlPlaneService {
 
     pub(super) fn authenticate_workflow(&self, authorization: &str) -> Result<ActorPrincipal> {
         self.auth.authenticate_authorization(authorization)
+    }
+
+    pub(super) async fn authorize_socket(
+        &self,
+        request: super::socket_auth::SocketAuthorizationRequest,
+    ) -> std::result::Result<
+        super::socket_auth::SocketAuthorization,
+        super::socket_auth::SocketAuthorizationError,
+    > {
+        self.socket_authenticator
+            .as_ref()
+            .ok_or_else(|| {
+                super::socket_auth::SocketAuthorizationError::Unavailable(anyhow::anyhow!(
+                    "socket authorization is not configured"
+                ))
+            })?
+            .authorize(request)
+            .await
     }
 
     pub(super) async fn register_deployment(
@@ -193,6 +235,96 @@ impl ControlPlaneService {
         principal: &ActorPrincipal,
         actor: &ActorKey,
     ) -> Result<WorkflowActorTarget> {
+        self.resolve_workflow_route(principal, actor, WorkflowRoute::Invocation)
+            .await
+    }
+
+    pub(super) async fn dispatch_socket_event(
+        &self,
+        principal: &ActorPrincipal,
+        invocation: ActorSocketInvocation,
+    ) -> Result<Vec<ActorSocketEffect>> {
+        let target = self
+            .resolve_workflow_route(principal, &invocation.actor, WorkflowRoute::ControlPlane)
+            .await?;
+        let mut client = ActorHostServiceClient::connect(target.route.clone())
+            .await
+            .with_context(|| format!("connect to actor host at {}", target.route))?
+            .max_decoding_message_size(crate::actor::MAX_ACTOR_EXECUTOR_MESSAGE_BYTES)
+            .max_encoding_message_size(crate::actor::MAX_ACTOR_EXECUTOR_MESSAGE_BYTES);
+        let mut request = Request::new(HostSocketEventRequest {
+            request_id: invocation.request_id,
+            actor: Some(invocation.actor.into()),
+            event_json: serde_json::to_vec(&invocation.event)?,
+            connections_json: serde_json::to_vec(&invocation.connections)?,
+            owner_epoch: target.owner_epoch,
+            state_read_url: target.state_read_url,
+            state_version: target.state_version,
+        });
+        request
+            .metadata_mut()
+            .insert("authorization", format!("Bearer {}", target.token).parse()?);
+        let reply = client.handle_socket(request).await?.into_inner();
+        match crate::actor::ActorExecutionResult::try_from(reply)? {
+            crate::actor::ActorExecutionResult::Completed { effects, .. } => Ok(effects),
+            crate::actor::ActorExecutionResult::Failed { failure } => {
+                anyhow::bail!("{}: {}", failure.code, failure.message)
+            }
+            crate::actor::ActorExecutionResult::Reroute => {
+                anyhow::bail!("actor ownership changed during socket dispatch")
+            }
+            crate::actor::ActorExecutionResult::HostUnavailable => {
+                anyhow::bail!("actor host is unavailable")
+            }
+        }
+    }
+
+    pub(super) fn deliver_socket_message_event(
+        &self,
+        actor: &ActorKey,
+        trigger_id: Option<String>,
+        event: &ActorSocketEvent,
+    ) {
+        let ActorSocketEvent::Message {
+            connection_id,
+            message,
+        } = event
+        else {
+            return;
+        };
+        if let Some(sink) = self.socket_events.clone() {
+            let event = super::event_sink::SocketMessageEvent::new(
+                actor,
+                trigger_id,
+                connection_id,
+                message,
+            );
+            tokio::spawn(async move {
+                if let Err(error) = sink.deliver(event).await {
+                    warn!(error = %format!("{error:#}"), "actor socket message trigger delivery failed");
+                }
+            });
+        }
+        info!(
+            event = "actor_socket_message_committed",
+            namespace_id = %actor.namespace_id,
+            actor_type = %actor.actor_type,
+            actor_id = %actor.actor_id,
+            connection_id,
+            message_kind = match message {
+                crate::actor::ActorSocketMessage::Text { .. } => "text",
+                crate::actor::ActorSocketMessage::Binary { .. } => "binary",
+            },
+            "actor socket message committed"
+        );
+    }
+
+    async fn resolve_workflow_route(
+        &self,
+        principal: &ActorPrincipal,
+        actor: &ActorKey,
+        route_kind: WorkflowRoute,
+    ) -> Result<WorkflowActorTarget> {
         actor.validate()?;
         ensure!(
             principal.process_role == ActorProcessRole::Workflow && principal.scope.contains(actor),
@@ -222,16 +354,19 @@ impl ControlPlaneService {
                 &state_read_url,
                 principal.expires_at,
             )?;
-        let route = if principal.private_routing && principal.region == target.placement.home_region
-        {
-            target.lease.route.clone()
-        } else {
-            self.routing
-                .as_ref()
-                .and_then(|routing| routing.provisioner.as_ref())
-                .context("sandbox provider is not configured")?
-                .public_host_route(&target.spec, &target.placement.home_region)
-                .await?
+        let route = match route_kind {
+            WorkflowRoute::Invocation
+                if principal.private_routing
+                    && principal.region == target.placement.home_region =>
+            {
+                target.lease.route.clone()
+            }
+            WorkflowRoute::Invocation => {
+                self.provisioner()?
+                    .public_host_route(&target.spec, &target.placement.home_region)
+                    .await?
+            }
+            WorkflowRoute::ControlPlane => self.public_route(&target).await?,
         };
         Ok(WorkflowActorTarget {
             route,
@@ -242,6 +377,32 @@ impl ControlPlaneService {
             expires_at_ms: issued.expires_at_ms,
         })
     }
+
+    fn provisioner(&self) -> Result<&Arc<dyn HostProvisioner>> {
+        self.routing
+            .as_ref()
+            .and_then(|routing| routing.provisioner.as_ref())
+            .context("sandbox provider is not configured")
+    }
+
+    async fn public_route(&self, target: &RoutedActor) -> Result<String> {
+        let key = (target.lease.id.clone(), target.lease.session_id.clone());
+        if let Some(route) = self.public_routes.read().await.get(&key) {
+            return Ok(route.clone());
+        }
+        let route = self
+            .provisioner()?
+            .public_host_route(&target.spec, &target.placement.home_region)
+            .await?;
+        self.public_routes.write().await.insert(key, route.clone());
+        Ok(route)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum WorkflowRoute {
+    Invocation,
+    ControlPlane,
 }
 
 pub(super) struct WorkflowActorTarget {
@@ -860,6 +1021,18 @@ mod tests {
         leases: Mutex<HashMap<HostId, HostLease>>,
     }
 
+    struct FakeSocketEventSink {
+        delivered: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+    }
+
+    #[async_trait]
+    impl super::super::event_sink::SocketMessageEventSink for FakeSocketEventSink {
+        async fn deliver(&self, event: super::super::event_sink::SocketMessageEvent) -> Result<()> {
+            self.delivered.send(serde_json::to_value(event)?)?;
+            Ok(())
+        }
+    }
+
     #[async_trait]
     impl HostLeaseRegistry for FakeLeaseStore {
         async fn register(&self, request: &HostLeaseRequest) -> Result<HostLease> {
@@ -1106,6 +1279,58 @@ mod tests {
             .await?
             .context("warmup task stopped")?;
         assert_eq!(warmed, (spec, "us-east".into()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn accepted_socket_messages_are_delivered_to_the_configured_event_sink() -> Result<()> {
+        let issuer = test_issuer()?;
+        let auth = ActorJwtVerifier::for_scope(
+            issuer.verifier_keys_json()?,
+            "issuer",
+            "invocation",
+            ActorTokenPurpose::Invocation,
+            Duration::from_secs(60),
+        )?;
+        let (delivered_tx, mut delivered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let service = ControlPlaneService::new(
+            Arc::new(FakeLeaseStore {
+                leases: Mutex::new(HashMap::new()),
+            }),
+            Arc::new(LocalObjectPlacementStore::default()),
+            Arc::new(FakeStorageUrls),
+            auth,
+        )
+        .with_socket_event_sink(Some(Arc::new(FakeSocketEventSink {
+            delivered: delivered_tx,
+        })));
+        let actor = ActorKey {
+            namespace_id: "project-1".into(),
+            actor_type: "ChatRoom".into(),
+            actor_id: "room-1".into(),
+        };
+
+        service.deliver_socket_message_event(
+            &actor,
+            Some("trigger-1".into()),
+            &ActorSocketEvent::Message {
+                connection_id: "socket-1".into(),
+                message: crate::actor::ActorSocketMessage::Text {
+                    data: "hello".into(),
+                },
+            },
+        );
+
+        let delivered = tokio::time::timeout(Duration::from_secs(1), delivered_rx.recv())
+            .await?
+            .context("socket event delivery task stopped")?;
+        assert_eq!(delivered["namespaceId"], "project-1");
+        assert_eq!(delivered["actorType"], "ChatRoom");
+        assert_eq!(delivered["actorId"], "room-1");
+        assert_eq!(delivered["triggerId"], "trigger-1");
+        assert_eq!(delivered["connectionId"], "socket-1");
+        assert_eq!(delivered["message"]["type"], "text");
+        assert_eq!(delivered["message"]["data"], "hello");
         Ok(())
     }
 

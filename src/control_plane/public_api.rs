@@ -23,6 +23,10 @@ struct PublicApiState {
 }
 
 pub(super) fn router(invocations: ControlPlaneService, admin: AdminService) -> Router {
+    let sockets = super::websocket::router(
+        invocations.clone(),
+        super::websocket::SocketRegistry::default(),
+    );
     Router::new()
         .route("/.well-known/jwks.json", get(jwks))
         .route(
@@ -39,6 +43,7 @@ pub(super) fn router(invocations: ControlPlaneService, admin: AdminService) -> R
         )
         .layer(DefaultBodyLimit::max(MAX_CONTROL_PLANE_MESSAGE_BYTES))
         .with_state(PublicApiState { invocations, admin })
+        .merge(sockets)
 }
 
 async fn register_deployment(

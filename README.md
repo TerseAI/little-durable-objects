@@ -90,6 +90,57 @@ Container builds can copy the binary from `us-central1-docker.pkg.dev/fluid-anal
    await Counter.get("account-1").increment()
    ```
 
+## WebSockets
+
+Actors can own WebSockets without a context object or an explicit accept step. Define any lifecycle hooks you need and attach JSON-serializable, typed metadata to each connection:
+
+```ts
+import { Actor } from "little-durable-objects"
+import type { ActorSocket } from "little-durable-objects"
+
+interface Session {
+  userId: string
+  connectedAt: number
+}
+
+export class ChatRoom extends Actor {
+  async onConnect(socket: ActorSocket<Session>): Promise<void> {
+    socket.setTags("member")
+    socket.send("ready")
+  }
+
+  async onMessage(socket: ActorSocket<Session>, message: string | Uint8Array): Promise<void> {
+    this.broadcast(message)
+  }
+
+  async onDisconnect(socket: ActorSocket<Session>, code: number, reason: string, wasClean: boolean): Promise<void> {
+    console.log(socket.metadata.userId, code, reason, wasClean)
+  }
+}
+```
+
+Connect from a trusted Node.js workflow with the same configured client:
+
+```ts
+const socket = await ChatRoom.get("lobby").connect({
+  userId: "user-1",
+  connectedAt: Date.now(),
+})
+
+socket.addEventListener("message", event => console.log(event.data))
+socket.send("hello")
+```
+
+`socket.metadata` can be replaced during a lifecycle hook, and `socket.setTags(...)` updates its indexed membership. `this.connections` exposes the actor's current sockets; `this.broadcast(message, { except, tags })` filters them without application-maintained connection maps. `socket.close(...)` works throughout the open lifecycle, while `socket.reject(...)` is available during `onConnect`.
+
+The control-plane gateway owns the network connections, metadata, and tags. After a connection succeeds, the runtime sends it `{ "type": "state", "state": { ... } }` containing the actor's current durable properties; `onConnect` is optional and exists only for custom connection behavior. A socket frame resolves and wakes the actor host, runs the matching lifecycle hook, commits actor state, and then applies its socket effects. The Modal actor sandbox can therefore stop while client sockets remain attached to the gateway. Actor methods invoked by workflows return their socket effects to the caller, which forwards them to the gateway so `this.broadcast(...)` reaches connected clients.
+
+Set `DURABLE_OBJECT_SOCKET_EVENT_URL` and `DURABLE_OBJECT_SOCKET_EVENT_TOKEN` together on the gateway to deliver accepted message events to an authenticated workflow trigger endpoint. Set `DURABLE_OBJECT_SOCKET_AUTH_URL` and `DURABLE_OBJECT_SOCKET_AUTH_TOKEN` together to expose `/v1/socket/{triggerId}/{actorId}` to external clients. Trusted server clients send their trigger key as a Bearer token. Browser clients send `terse-do` and `terse-ticket.<short-lived-ticket>` as WebSocket subprotocols; the gateway negotiates only `terse-do`.
+
+Every authenticated connection can send and receive. Applications model generation status, session history, and presence in actor state, then broadcast later state changes to clients. They may reject or queue messages while busy. The gateway keeps transport connections in process memory, so a gateway restart closes attached clients and they must reconnect.
+
+Current limits are 16 MiB of serialized state per actor, 128 connections per actor, 64 KiB of metadata per connection, 16 MiB per inbound frame/message, 128 tags, and 8 KiB total tag data. Connection metadata must be JSON serializable.
+
 Actors leave memory after 60 seconds idle; empty host sandboxes stop after 5 minutes. Override those defaults with `DURABLE_OBJECT_ACTOR_IDLE_TIMEOUT_MS` and `DURABLE_OBJECT_HOST_IDLE_TIMEOUT_MS` on the control plane.
 
 See the [architecture diagram](docs/system-architecture.md) for the request, credential, placement, and state flow.

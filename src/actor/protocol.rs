@@ -2,7 +2,7 @@ use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::actor_state::ActorStorageKey;
+use crate::{actor::ActorSocketEffect, actor_state::ActorStorageKey};
 
 const MAX_NAMESPACE_ID_BYTES: usize = 96;
 const MAX_ACTOR_TYPE_BYTES: usize = 48;
@@ -26,7 +26,7 @@ impl ActorScope {
 }
 
 /// The namespace-scoped identity of one actor instance.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ActorKey {
     pub namespace_id: String,
     pub actor_type: String,
@@ -89,8 +89,13 @@ impl ActorInvocationFailure {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ActorExecutionResult {
-    Completed { result: Value },
-    Failed { failure: ActorInvocationFailure },
+    Completed {
+        result: Value,
+        effects: Vec<ActorSocketEffect>,
+    },
+    Failed {
+        failure: ActorInvocationFailure,
+    },
     Reroute,
     HostUnavailable,
 }

@@ -2,10 +2,10 @@ import { Client, Metadata, credentials } from "@grpc/grpc-js"
 import protobuf from "protobufjs"
 
 import { ActorProtocolError } from "../shared/errors.js"
-import type { JsonValue } from "../shared/types.js"
+import type { JsonValue, SocketEffect } from "../shared/types.js"
 
 const { Field, OneOf, Type } = protobuf
-const MAX_MESSAGE_BYTES = 16 * 1024 * 1024
+const MAX_MESSAGE_BYTES = 32 * 1024 * 1024
 
 interface ActorHostTarget {
     readonly route: string
@@ -25,7 +25,10 @@ interface DirectActorInvocation {
     readonly args: readonly JsonValue[]
 }
 
-type ActorHostReply = { readonly type: "completed"; readonly result: unknown } | { readonly type: "failed"; readonly code: string; readonly message: string } | { readonly type: "reroute" }
+type ActorHostReply =
+    | { readonly type: "completed"; readonly result: unknown; readonly effects: readonly SocketEffect[] }
+    | { readonly type: "failed"; readonly code: string; readonly message: string }
+    | { readonly type: "reroute" }
 
 interface ActorHostTransport {
     invoke(target: ActorHostTarget, invocation: DirectActorInvocation): Promise<ActorHostReply>
@@ -83,7 +86,11 @@ function unaryRequest(client: Client, request: HostInvokeActorRequest, metadata:
 function decodeReply(reply: InvokeActorReply): ActorHostReply {
     if (reply.completed) {
         try {
-            return { type: "completed", result: JSON.parse(Buffer.from(reply.completed.resultJson).toString("utf8")) as unknown }
+            return {
+                type: "completed",
+                result: JSON.parse(Buffer.from(reply.completed.resultJson).toString("utf8")) as unknown,
+                effects: JSON.parse(Buffer.from(reply.completed.socketEffectsJson).toString("utf8")) as SocketEffect[]
+            }
         } catch (error) {
             throw new ActorProtocolError("actor host result was not valid JSON", { cause: error })
         }
@@ -117,7 +124,7 @@ const hostRequestType = new Type("HostInvokeActorRequest")
     .add(new Field("stateReadUrl", 3, "string"))
     .add(new Field("stateVersion", 4, "uint64"))
     .add(invocationType)
-const completedType = new Type("ActorCompleted").add(new Field("resultJson", 1, "bytes"))
+const completedType = new Type("ActorCompleted").add(new Field("resultJson", 1, "bytes")).add(new Field("socketEffectsJson", 2, "bytes"))
 const failedType = new Type("ActorFailed").add(new Field("code", 1, "string")).add(new Field("message", 2, "string"))
 const rerouteType = new Type("Reroute")
 const replyType = new Type("InvokeActorReply")
@@ -154,7 +161,7 @@ interface HostInvokeActorRequest {
 }
 
 interface InvokeActorReply {
-    readonly completed?: { readonly resultJson: Uint8Array }
+    readonly completed?: { readonly resultJson: Uint8Array; readonly socketEffectsJson: Uint8Array }
     readonly failed?: { readonly code: string; readonly message: string }
     readonly reroute?: Record<string, never>
 }

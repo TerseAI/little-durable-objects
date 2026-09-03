@@ -4,7 +4,7 @@ use tonic::{Request, Response, Status};
 use tracing::{error, warn};
 
 use super::proto::{
-    HostInvokeActorRequest, InvokeActorReply,
+    HostInvokeActorRequest, HostSocketEventRequest, InvokeActorReply,
     actor_host_service_server::{ActorHostService, ActorHostServiceServer},
 };
 use crate::{
@@ -47,6 +47,50 @@ impl ActorHostService for ActorHostGrpcService {
         let invocation = self.authorize_invocation(request).await?;
         self.invoke_detached(invocation).await
     }
+
+    async fn handle_socket(
+        &self,
+        request: Request<HostSocketEventRequest>,
+    ) -> Result<Response<InvokeActorReply>, Status> {
+        let principal = self.invocation_auth.authenticate(&request).await?;
+        let request = request.into_inner();
+        let owner_epoch = request.owner_epoch;
+        let state_version = request.state_version;
+        let state_read_url = request.state_read_url.clone();
+        let invocation: crate::actor::ActorSocketInvocation = request
+            .try_into()
+            .map_err(|error| Status::invalid_argument(format!("{error:#}")))?;
+        validate_host_request(
+            &principal,
+            &self.host_id,
+            &invocation.actor,
+            owner_epoch,
+            state_version,
+            &state_read_url,
+        )?;
+        let result = self
+            .host
+            .handle_socket_event(invocation, owner_epoch, state_version, state_read_url)
+            .await
+            .map_err(|error| {
+                Status::unavailable(format!("actor socket event failed: {error:#}"))
+            })?;
+        let result = match result {
+            crate::host::ActorSocketExecutionResult::Handled { effects } => {
+                ActorExecutionResult::Completed {
+                    result: serde_json::Value::Null,
+                    effects,
+                }
+            }
+            crate::host::ActorSocketExecutionResult::Failed { failure } => {
+                ActorExecutionResult::Failed { failure }
+            }
+            crate::host::ActorSocketExecutionResult::HostUnavailable => {
+                ActorExecutionResult::HostUnavailable
+            }
+        };
+        Ok(Response::new(InvokeActorReply::from(result)))
+    }
 }
 
 impl ActorHostGrpcService {
@@ -61,19 +105,7 @@ impl ActorHostGrpcService {
             .ok_or_else(|| Status::invalid_argument("actor invocation is required"))?
             .try_into()
             .map_err(|error| Status::invalid_argument(format!("{error:#}")))?;
-        if !principal.scope.contains(&invocation.actor) {
-            return Err(Status::permission_denied(
-                "actor invocation crossed namespace scope",
-            ));
-        }
-        if request.owner_epoch == 0
-            || (request.state_version == 0) != request.state_read_url.is_empty()
-        {
-            return Err(Status::invalid_argument(
-                "actor ownership capability is incomplete",
-            ));
-        }
-        validate_invocation_principal(
+        validate_host_request(
             &principal,
             &self.host_id,
             &invocation.actor,
@@ -134,7 +166,7 @@ impl ActorHostGrpcService {
     }
 }
 
-fn validate_invocation_principal(
+fn validate_host_request(
     principal: &ActorPrincipal,
     host_id: &HostId,
     actor: &crate::actor::ActorKey,
@@ -142,6 +174,16 @@ fn validate_invocation_principal(
     state_version: u64,
     state_read_url: &str,
 ) -> Result<(), Status> {
+    if !principal.scope.contains(actor) {
+        return Err(Status::permission_denied(
+            "actor invocation crossed namespace scope",
+        ));
+    }
+    if owner_epoch == 0 || (state_version == 0) != state_read_url.is_empty() {
+        return Err(Status::invalid_argument(
+            "actor ownership capability is incomplete",
+        ));
+    }
     if principal.process_role != ActorProcessRole::Host || principal.host_id != *host_id {
         return Err(Status::permission_denied(
             "actor invocation credential is not for this host",
@@ -205,7 +247,7 @@ mod tests {
         };
 
         assert!(
-            validate_invocation_principal(
+            validate_host_request(
                 &principal,
                 &host_id,
                 &actor,
@@ -216,7 +258,7 @@ mod tests {
             .is_ok()
         );
         assert!(
-            validate_invocation_principal(
+            validate_host_request(
                 &principal,
                 &host_id,
                 &actor,
@@ -227,7 +269,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            validate_invocation_principal(
+            validate_host_request(
                 &principal,
                 &host_id,
                 &actor,

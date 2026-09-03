@@ -2,7 +2,7 @@ import { Worker } from "node:worker_threads"
 
 import { findActorDefinition } from "../../shared/actor.js"
 import { errorMessage, failedReply } from "../../shared/types.js"
-import type { ActorExecutorCommand, ActorExecutorReply, ActorWorkerData, ActorWorkerRequest, EvictCommand, InvokeCommand } from "../../shared/types.js"
+import type { ActorExecutorCommand, ActorExecutorReply, ActorWorkerData, ActorWorkerRequest, EvictCommand, InvokeCommand, WebSocketEventCommand } from "../../shared/types.js"
 
 const DEFAULT_ACTOR_IDLE_TIMEOUT_MS = 60_000
 const MAX_RESIDENT_ACTORS = 32
@@ -23,7 +23,8 @@ class ActorWorkerSupervisor {
     async handle(command: ActorExecutorCommand): Promise<ActorExecutorReply> {
         switch (command.type) {
             case "invoke":
-                return this.invoke(command)
+            case "websocket_event":
+                return this.execute(command)
             case "evict":
                 return this.evict(command)
             default:
@@ -31,7 +32,7 @@ class ActorWorkerSupervisor {
         }
     }
 
-    private invoke(command: InvokeCommand): Promise<ActorExecutorReply> {
+    private execute(command: InvokeCommand | WebSocketEventCommand): Promise<ActorExecutorReply> {
         const definition = findActorDefinition(command.actor.actor_type)
         if (definition === undefined) {
             return Promise.resolve(failedReply("actor_type_not_found", `actor type ${command.actor.actor_type} is not loaded in this customer process`))
@@ -50,7 +51,7 @@ class ActorWorkerSupervisor {
             })
             this.actors.set(key, actor)
         }
-        return actor.invoke(command)
+        return actor.execute(command)
     }
 
     private evict(command: EvictCommand): ActorExecutorReply {
@@ -95,13 +96,13 @@ class ResidentActorWorker {
         this.onIdle = options.onIdle
     }
 
-    async invoke(command: InvokeCommand): Promise<ActorExecutorReply> {
+    async execute(command: InvokeCommand | WebSocketEventCommand): Promise<ActorExecutorReply> {
         if (this.idleTimer !== undefined) clearTimeout(this.idleTimer)
         this.idleTimer = undefined
         this.worker ??= new ActorWorker({ actorType: this.actorType, moduleUrl: this.moduleUrl })
         let reply: ActorExecutorReply
         try {
-            reply = await this.worker.invoke(command)
+            reply = await this.worker.execute(command)
         } catch (error) {
             reply = failedReply(error instanceof ActorWorkerTerminatedError ? "actor_worker_terminated" : "actor_worker_failed", errorMessage(error))
         } finally {
@@ -142,14 +143,14 @@ class ActorWorker {
         this.worker.unref()
     }
 
-    async invoke(command: InvokeCommand): Promise<ActorExecutorReply> {
+    async execute(command: InvokeCommand | WebSocketEventCommand): Promise<ActorExecutorReply> {
         if (this.terminalError !== undefined) throw this.terminalError
         this.worker.ref()
         try {
             return await new Promise<ActorExecutorReply>((resolve, reject) => {
                 this.replyResolve = resolve
                 this.replyReject = reject
-                this.post({ type: "invoke", command })
+                this.post({ type: "execute", command })
             })
         } finally {
             if (this.replyResolve === undefined) this.worker.unref()
@@ -193,7 +194,7 @@ class ActorWorkerTerminatedError extends Error {
     }
 }
 
-function actorKey(command: Pick<InvokeCommand | EvictCommand, "actor">): string {
+function actorKey(command: Pick<InvokeCommand | WebSocketEventCommand | EvictCommand, "actor">): string {
     const actor = command.actor
     return `${actor.namespace_id}\u001f${actor.actor_type}\u001f${actor.actor_id}`
 }

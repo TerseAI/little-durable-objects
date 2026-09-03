@@ -55,6 +55,30 @@ pub(crate) struct ActorInvocationCapability {
 }
 
 impl ActorPrincipal {
+    pub(crate) fn for_external_socket(
+        actor: &crate::actor::ActorKey,
+        region: String,
+        expires_at: i64,
+    ) -> Self {
+        Self {
+            scope: ActorScope {
+                namespace_id: actor.namespace_id.clone(),
+            },
+            host_id: HostId::new(format!(
+                "workflow.v1.{}.socket.{}",
+                actor.namespace_id,
+                uuid::Uuid::new_v4()
+            )),
+            session_id: uuid::Uuid::new_v4().to_string(),
+            process_role: ActorProcessRole::Workflow,
+            region,
+            private_routing: false,
+            code_revision: None,
+            expires_at,
+            invocation: None,
+        }
+    }
+
     pub(crate) fn validate_host_id(&self, host_id: &str) -> Result<()> {
         ensure!(
             host_id == self.host_id.as_str(),

@@ -33,6 +33,8 @@ pub struct ControlPlaneProcessConfig {
     pub admin_token: String,
     pub storage: ControlPlaneStorageConfig,
     pub sandbox_provider: Option<SandboxProviderConfig>,
+    pub socket_event_sink: Option<SocketEventSinkConfig>,
+    pub socket_authenticator: Option<SocketAuthenticatorConfig>,
 }
 
 pub struct ControlPlaneStorageConfig {
@@ -45,6 +47,16 @@ pub struct SandboxProviderConfig {
     pub command: String,
     pub environment: HashMap<String, String>,
     pub runtime: HostSandboxRuntimeConfig,
+}
+
+pub struct SocketEventSinkConfig {
+    pub url: String,
+    pub token: String,
+}
+
+pub struct SocketAuthenticatorConfig {
+    pub url: String,
+    pub token: String,
 }
 
 impl ControlPlaneProcessConfig {
@@ -94,11 +106,20 @@ async fn control_plane_routes(config: ControlPlaneProcessConfig) -> Result<tonic
         config.storage.standard_buckets,
     )?);
     let provisioner = sandbox_provisioner(config.sandbox_provider, &issuer, &leases)?;
-    let service = ControlPlaneService::new(leases, placements, storage_urls, auth).with_routing(
-        registry.clone(),
-        issuer.clone(),
-        provisioner,
-    );
+    let socket_events = config
+        .socket_event_sink
+        .map(|sink| super::event_sink::HttpSocketMessageEventSink::new(sink.url, sink.token))
+        .transpose()?
+        .map(|sink| Arc::new(sink) as Arc<dyn super::event_sink::SocketMessageEventSink>);
+    let socket_authenticator = config
+        .socket_authenticator
+        .map(|auth| super::socket_auth::HttpSocketAuthenticator::new(auth.url, auth.token))
+        .transpose()?
+        .map(|auth| Arc::new(auth) as Arc<dyn super::socket_auth::SocketAuthenticator>);
+    let service = ControlPlaneService::new(leases, placements, storage_urls, auth)
+        .with_routing(registry.clone(), issuer.clone(), provisioner)
+        .with_socket_event_sink(socket_events)
+        .with_socket_authenticator(socket_authenticator);
     let admin = super::admin::AdminService::new(config.admin_token, registry, issuer)?;
     let public_api = super::public_api::router(service.clone(), admin);
     let internal_api = service.into_internal_service();
@@ -169,6 +190,8 @@ impl ControlPlaneProcessConfig {
         };
         let sandbox_provider =
             sandbox_provider_config(&mut get, &jwt_issuer, &invocation_audience)?;
+        let socket_event_sink = socket_event_sink_config(&mut get)?;
+        let socket_authenticator = socket_authenticator_config(&mut get)?;
         Ok(Self {
             bind,
             jwt_signing_key,
@@ -180,7 +203,43 @@ impl ControlPlaneProcessConfig {
             admin_token,
             storage,
             sandbox_provider,
+            socket_event_sink,
+            socket_authenticator,
         })
+    }
+}
+
+fn socket_authenticator_config(
+    get: &mut impl FnMut(&str) -> Option<String>,
+) -> Result<Option<SocketAuthenticatorConfig>> {
+    let url = get("DURABLE_OBJECT_SOCKET_AUTH_URL");
+    let token = get("DURABLE_OBJECT_SOCKET_AUTH_TOKEN");
+    match (url, token) {
+        (None, None) => Ok(None),
+        (Some(url), Some(token)) => Ok(Some(SocketAuthenticatorConfig {
+            url: validated_http_url(&url, "DURABLE_OBJECT_SOCKET_AUTH_URL")?,
+            token,
+        })),
+        _ => anyhow::bail!(
+            "DURABLE_OBJECT_SOCKET_AUTH_URL and DURABLE_OBJECT_SOCKET_AUTH_TOKEN must be configured together"
+        ),
+    }
+}
+
+fn socket_event_sink_config(
+    get: &mut impl FnMut(&str) -> Option<String>,
+) -> Result<Option<SocketEventSinkConfig>> {
+    let url = get("DURABLE_OBJECT_SOCKET_EVENT_URL");
+    let token = get("DURABLE_OBJECT_SOCKET_EVENT_TOKEN");
+    match (url, token) {
+        (None, None) => Ok(None),
+        (Some(url), Some(token)) => Ok(Some(SocketEventSinkConfig {
+            url: validated_http_url(&url, "DURABLE_OBJECT_SOCKET_EVENT_URL")?,
+            token,
+        })),
+        _ => anyhow::bail!(
+            "DURABLE_OBJECT_SOCKET_EVENT_URL and DURABLE_OBJECT_SOCKET_EVENT_TOKEN must be configured together"
+        ),
     }
 }
 
@@ -299,6 +358,55 @@ mod tests {
         assert_eq!(
             config.storage.standard_buckets["us-east"],
             "actor-state-test"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parses_socket_event_sink_only_when_url_and_token_are_present() -> Result<()> {
+        let mut complete = HashMap::from([
+            (
+                "DURABLE_OBJECT_SOCKET_EVENT_URL",
+                "https://api.example.com/events",
+            ),
+            ("DURABLE_OBJECT_SOCKET_EVENT_TOKEN", "event-token"),
+        ]);
+        let sink =
+            socket_event_sink_config(&mut |name| complete.get(name).map(|value| (*value).into()))?
+                .context("socket event sink was not configured")?;
+        assert_eq!(sink.url, "https://api.example.com/events");
+        assert_eq!(sink.token, "event-token");
+
+        complete.remove("DURABLE_OBJECT_SOCKET_EVENT_TOKEN");
+        assert!(
+            socket_event_sink_config(&mut |name| complete.get(name).map(|value| (*value).into()))
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parses_socket_authenticator_only_when_url_and_token_are_present() -> Result<()> {
+        let mut complete = HashMap::from([
+            (
+                "DURABLE_OBJECT_SOCKET_AUTH_URL",
+                "https://api.example.com/authorize",
+            ),
+            ("DURABLE_OBJECT_SOCKET_AUTH_TOKEN", "auth-token"),
+        ]);
+        let auth = socket_authenticator_config(&mut |name| {
+            complete.get(name).map(|value| (*value).into())
+        })?
+        .context("socket authenticator was not configured")?;
+        assert_eq!(auth.url, "https://api.example.com/authorize");
+        assert_eq!(auth.token, "auth-token");
+
+        complete.remove("DURABLE_OBJECT_SOCKET_AUTH_TOKEN");
+        assert!(
+            socket_authenticator_config(&mut |name| complete
+                .get(name)
+                .map(|value| (*value).into()))
+            .is_err()
         );
         Ok(())
     }

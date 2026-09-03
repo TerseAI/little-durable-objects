@@ -32,10 +32,10 @@ test("the actor session carries only owned execution commands", async () => {
 
         assert.deepEqual(await readMessage(iterator), {
             type: "attach",
-            protocol: 11,
+            protocol: 12,
             actor_types: ["SessionCounter"]
         })
-        customerSocket.write(`${JSON.stringify({ type: "attached", protocol: 11 })}\n`)
+        customerSocket.write(`${JSON.stringify({ type: "attached", protocol: 12 })}\n`)
         await startup
 
         customerSocket.write(
@@ -71,7 +71,7 @@ test("the actor session carries only owned execution commands", async () => {
                     request_id: "request-2",
                     actor: actorIdentity(),
                     method: "sizedResponse",
-                    args: [16 * 1024 * 1024],
+                    args: [32 * 1024 * 1024],
                     state: { count: 4 }
                 }
             })}\n`
@@ -79,7 +79,7 @@ test("the actor session carries only owned execution commands", async () => {
         assert.deepEqual(await readMessage(iterator), {
             type: "reply",
             message_id: 2,
-            reply: { type: "failed", code: "resource_exhausted", message: "actor session response exceeds 16777216 bytes" }
+            reply: { type: "failed", code: "resource_exhausted", message: "actor session response exceeds 33554432 bytes" }
         })
 
         customerSocket.write(

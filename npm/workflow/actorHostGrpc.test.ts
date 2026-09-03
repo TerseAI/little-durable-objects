@@ -30,7 +30,7 @@ test("direct transport speaks the actor host protobuf contract", async () => {
                 stateVersion: 7,
                 stateReadUrl: "https://storage.example.com/state"
             })
-            callback(null, { completed: { resultJson: Buffer.from("7") }, result: "completed" })
+            callback(null, { completed: { resultJson: Buffer.from("7"), socketEffectsJson: Buffer.from("[]") }, result: "completed" })
         }
     })
     const port = await listen(server)
@@ -55,7 +55,7 @@ test("direct transport speaks the actor host protobuf contract", async () => {
                     args: [2]
                 }
             ),
-            { type: "completed", result: 7 }
+            { type: "completed", result: 7, effects: [] }
         )
     } finally {
         server.forceShutdown()
@@ -91,4 +91,4 @@ interface HostRequest {
     readonly stateReadUrl: string
 }
 
-type HostReply = { readonly completed: { readonly resultJson: Buffer }; readonly result: "completed" }
+type HostReply = { readonly completed: { readonly resultJson: Buffer; readonly socketEffectsJson: Buffer }; readonly result: "completed" }

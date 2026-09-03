@@ -30,6 +30,32 @@ export class Counter extends Actor {
 await Counter.get("account-1").increment()
 ```
 
+Actors can also own hibernatable WebSockets through lifecycle hooks:
+
+```ts
+import { Actor } from "little-durable-objects"
+import type { ActorSocket } from "little-durable-objects"
+
+interface Session {
+  userId: string
+}
+
+export class ChatRoom extends Actor {
+  async onMessage(socket: ActorSocket<Session>, message: string | Uint8Array): Promise<void> {
+    this.broadcast(message)
+  }
+
+  async onDisconnect(socket: ActorSocket<Session>): Promise<void> {
+    console.log(`${socket.metadata.userId} left`)
+  }
+}
+
+const socket = await ChatRoom.get("lobby").connect({ userId: "user-1" })
+socket.send("hello")
+```
+
+The control-plane gateway retains live sockets, metadata, and tags. Every successful connection automatically receives `{ "type": "state", "state": { ... } }` with the actor's current durable properties, so `onConnect` is only needed for custom behavior. Each lifecycle event wakes the actor host as needed, and ordinary workflow actor methods forward returned socket effects to the gateway. `this.connections`, `this.broadcast(...)`, `socket.setTags(...)`, `socket.close(...)`, and connect-time `socket.reject(...)` cover connection membership and the full lifecycle without a context object.
+
 Calling `configureDurableObjects` is optional when these environment variables are already present:
 
 ```text

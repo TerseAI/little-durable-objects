@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks"
 
 import { ActorProtocolError } from "../shared/errors.js"
+import type { ActorConnection } from "../shared/socket.js"
 import { JsonActorStateSerializer, validateActorComponent } from "../shared/types.js"
 import type { JsonValue } from "../shared/types.js"
 
@@ -9,6 +10,7 @@ import type { DurableObjectsClientOptions } from "./remoteClient.js"
 
 interface ActorClientTransport {
     invoke(actorType: string, actorId: string, method: string, args: readonly unknown[]): Promise<unknown>
+    connect(actorType: string, actorId: string, metadata: unknown): Promise<ActorConnection>
 }
 
 const scopedClients = new AsyncLocalStorage<ActorClientTransport>()
@@ -43,10 +45,12 @@ class TestActorClient implements ActorClientTransport {
     private readonly serializer = new JsonActorStateSerializer()
     private readonly requestId: () => string
     private readonly invokeTest: ActorTestInvoker
+    private readonly connectTest: ActorTestConnector
 
     constructor(options: ActorTestClientOptions) {
         this.requestId = options.requestId ?? (() => globalThis.crypto.randomUUID())
         this.invokeTest = options.invoke
+        this.connectTest = options.connect ?? (() => Promise.reject(new ActorProtocolError("socket connections are not configured for this test")))
     }
 
     async invoke(actorType: string, actorId: string, method: string, args: readonly unknown[]): Promise<unknown> {
@@ -62,6 +66,16 @@ class TestActorClient implements ActorClientTransport {
         }
         return this.invokeTest(request)
     }
+
+    async connect(actorType: string, actorId: string, metadata: unknown): Promise<ActorConnection> {
+        const request: ActorConnectionRequest = {
+            requestId: validateActorComponent("request ID", this.requestId()),
+            actorType: validateActorComponent("actor type", actorType),
+            actorId: validateActorComponent("actor ID", actorId),
+            metadata: this.serializer.clone(metadata, "socket metadata")
+        }
+        return this.connectTest(request)
+    }
 }
 
 interface ActorInvocationRequest {
@@ -75,9 +89,18 @@ interface ActorInvocationRequest {
 interface ActorTestClientOptions {
     readonly requestId?: () => string
     readonly invoke: ActorTestInvoker
+    readonly connect?: ActorTestConnector
 }
 
 type ActorTestInvoker = (request: ActorInvocationRequest) => Promise<unknown>
+type ActorTestConnector = (request: ActorConnectionRequest) => Promise<ActorConnection>
+
+interface ActorConnectionRequest {
+    readonly requestId: string
+    readonly actorType: string
+    readonly actorId: string
+    readonly metadata: JsonValue
+}
 
 export { actorClient, configureDurableObjects, runWithActorClientForTests }
-export type { ActorInvocationRequest, ActorTestClientOptions, DurableObjectsClientOptions }
+export type { ActorConnectionRequest, ActorInvocationRequest, ActorTestClientOptions, DurableObjectsClientOptions }

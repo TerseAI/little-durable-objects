@@ -25,8 +25,8 @@ use tracing::{debug, info};
 
 use super::{ActorInvocationFailure, ActorKey};
 
-const ACTOR_EXECUTOR_PROTOCOL_VERSION: u32 = 11;
-pub(crate) const MAX_ACTOR_EXECUTOR_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+const ACTOR_EXECUTOR_PROTOCOL_VERSION: u32 = 12;
+pub(crate) const MAX_ACTOR_EXECUTOR_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Serialize)]
 pub struct ActorMethodInvocation {
@@ -35,6 +35,7 @@ pub struct ActorMethodInvocation {
     pub method: String,
     pub args: Vec<Value>,
     pub state: Option<Value>,
+    pub connections: Vec<ActorSocketConnection>,
 }
 
 #[derive(Debug, Serialize)]
@@ -42,9 +43,95 @@ pub struct ActorMethodEviction {
     pub actor: ActorKey,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ActorSocketConnection {
+    pub id: String,
+    pub metadata: Value,
+    pub tags: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ActorSocketMessage {
+    Text { data: String },
+    Binary { data: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ActorSocketEvent {
+    Connect {
+        connection: ActorSocketConnection,
+    },
+    Message {
+        connection_id: String,
+        message: ActorSocketMessage,
+    },
+    Disconnect {
+        connection: ActorSocketConnection,
+        code: u16,
+        reason: String,
+        was_clean: bool,
+    },
+}
+
+#[derive(Debug, Serialize)]
+pub struct ActorSocketInvocation {
+    pub request_id: String,
+    pub actor: ActorKey,
+    pub event: ActorSocketEvent,
+    pub connections: Vec<ActorSocketConnection>,
+    pub state: Option<Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ActorSocketEffect {
+    Send {
+        connection_id: String,
+        message: ActorSocketMessage,
+    },
+    Broadcast {
+        message: ActorSocketMessage,
+        except_connection_ids: Vec<String>,
+        tags: Vec<String>,
+    },
+    Close {
+        connection_id: String,
+        code: u16,
+        reason: String,
+    },
+    Reject {
+        connection_id: String,
+        code: u16,
+        reason: String,
+    },
+    SetMetadata {
+        connection_id: String,
+        metadata: Value,
+    },
+    SetTags {
+        connection_id: String,
+        tags: Vec<String>,
+    },
+}
+
 #[derive(Debug, PartialEq)]
 pub enum ActorMethodOutcome {
-    Completed { result: Value, state: Value },
+    Completed {
+        result: Value,
+        state: Value,
+        effects: Vec<ActorSocketEffect>,
+    },
+    Failed(ActorInvocationFailure),
+}
+
+#[derive(Debug, PartialEq)]
+pub enum ActorSocketOutcome {
+    Handled {
+        state: Value,
+        effects: Vec<ActorSocketEffect>,
+    },
     Failed(ActorInvocationFailure),
 }
 
@@ -53,6 +140,16 @@ pub trait ActorExecutor: Send + Sync {
     fn supports(&self, actor_type: &str) -> bool;
 
     async fn invoke(&self, invocation: ActorMethodInvocation) -> Result<ActorMethodOutcome>;
+
+    async fn handle_socket(
+        &self,
+        _invocation: ActorSocketInvocation,
+    ) -> Result<ActorSocketOutcome> {
+        Ok(ActorSocketOutcome::Failed(ActorInvocationFailure {
+            code: "socket_not_supported".into(),
+            message: "actor executor does not support sockets".into(),
+        }))
+    }
 
     async fn evict(&self, _eviction: ActorMethodEviction) -> Result<()> {
         Ok(())
@@ -192,9 +289,15 @@ impl ActorExecutor for JsActorExecutor {
 
     async fn invoke(&self, invocation: ActorMethodInvocation) -> Result<ActorMethodOutcome> {
         match self.exchange(ExecutorCommand::Invoke(invocation)).await? {
-            ExecutorReply::Invoked { result, state } => {
-                Ok(ActorMethodOutcome::Completed { result, state })
-            }
+            ExecutorReply::Invoked {
+                result,
+                state,
+                effects,
+            } => Ok(ActorMethodOutcome::Completed {
+                result,
+                state,
+                effects,
+            }),
             ExecutorReply::Failed { code, message } => {
                 Ok(ActorMethodOutcome::Failed(ActorInvocationFailure {
                     code,
@@ -203,6 +306,29 @@ impl ActorExecutor for JsActorExecutor {
             }
             ExecutorReply::Evicted => {
                 anyhow::bail!("actor executor returned eviction reply to invocation")
+            }
+            ExecutorReply::WebsocketHandled { .. } => {
+                anyhow::bail!("actor executor returned socket reply to invocation")
+            }
+        }
+    }
+
+    async fn handle_socket(&self, invocation: ActorSocketInvocation) -> Result<ActorSocketOutcome> {
+        match self
+            .exchange(ExecutorCommand::WebsocketEvent(invocation))
+            .await?
+        {
+            ExecutorReply::WebsocketHandled { state, effects } => {
+                Ok(ActorSocketOutcome::Handled { state, effects })
+            }
+            ExecutorReply::Failed { code, message } => {
+                Ok(ActorSocketOutcome::Failed(ActorInvocationFailure {
+                    code,
+                    message,
+                }))
+            }
+            ExecutorReply::Invoked { .. } | ExecutorReply::Evicted => {
+                anyhow::bail!("actor executor returned the wrong reply to socket event")
             }
         }
     }
@@ -215,6 +341,9 @@ impl ActorExecutor for JsActorExecutor {
             }
             ExecutorReply::Invoked { .. } => {
                 anyhow::bail!("actor executor returned the wrong reply to eviction")
+            }
+            ExecutorReply::WebsocketHandled { .. } => {
+                anyhow::bail!("actor executor returned socket reply to eviction")
             }
         }
     }
@@ -419,14 +548,27 @@ enum ActorExecutorClientMessage {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ExecutorCommand {
     Invoke(ActorMethodInvocation),
+    WebsocketEvent(ActorSocketInvocation),
     Evict(ActorMethodEviction),
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ExecutorReply {
-    Invoked { result: Value, state: Value },
-    Failed { code: String, message: String },
+    Invoked {
+        result: Value,
+        state: Value,
+        #[serde(default)]
+        effects: Vec<ActorSocketEffect>,
+    },
+    WebsocketHandled {
+        state: Value,
+        effects: Vec<ActorSocketEffect>,
+    },
+    Failed {
+        code: String,
+        message: String,
+    },
     Evicted,
 }
 
@@ -464,6 +606,7 @@ mod tests {
                 method: "increment".into(),
                 args: vec![json!(2)],
                 state: None,
+                connections: Vec::new(),
             })
             .await?;
         assert_eq!(
@@ -471,6 +614,42 @@ mod tests {
             ActorMethodOutcome::Completed {
                 result: json!(2),
                 state: json!({ "count": 2 }),
+                effects: Vec::new(),
+            }
+        );
+        let socket_outcome = executor
+            .handle_socket(ActorSocketInvocation {
+                request_id: "socket-request-1".into(),
+                actor: ActorKey {
+                    namespace_id: "namespace-1".into(),
+                    actor_type: "counter".into(),
+                    actor_id: "counter-1".into(),
+                },
+                event: ActorSocketEvent::Connect {
+                    connection: ActorSocketConnection {
+                        id: "socket-1".into(),
+                        metadata: json!({ "userId": "user-1" }),
+                        tags: Vec::new(),
+                    },
+                },
+                connections: vec![ActorSocketConnection {
+                    id: "socket-1".into(),
+                    metadata: json!({ "userId": "user-1" }),
+                    tags: Vec::new(),
+                }],
+                state: Some(json!({ "count": 2 })),
+            })
+            .await?;
+        assert_eq!(
+            socket_outcome,
+            ActorSocketOutcome::Handled {
+                state: json!({ "count": 3 }),
+                effects: vec![ActorSocketEffect::Send {
+                    connection_id: "socket-1".into(),
+                    message: ActorSocketMessage::Text {
+                        data: "ready".into()
+                    },
+                }],
             }
         );
         shutdown.cancel();
@@ -502,6 +681,7 @@ mod tests {
                 method: "accept".into(),
                 args: vec![json!("x".repeat(MAX_ACTOR_EXECUTOR_MESSAGE_BYTES))],
                 state: None,
+                connections: Vec::new(),
             })
             .await?;
 
@@ -520,10 +700,10 @@ mod tests {
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
         writer
-            .write_all(b"{\"type\":\"attach\",\"protocol\":11,\"actor_types\":[\"counter\"]}\n")
+            .write_all(b"{\"type\":\"attach\",\"protocol\":12,\"actor_types\":[\"counter\"]}\n")
             .await?;
         ensure!(
-            read_json_line(&mut reader).await? == json!({ "type": "attached", "protocol": 11 })
+            read_json_line(&mut reader).await? == json!({ "type": "attached", "protocol": 12 })
         );
 
         let invocation = read_json_line(&mut reader).await?;
@@ -546,6 +726,30 @@ mod tests {
         )
         .await?;
 
+        let socket_event = read_json_line(&mut reader).await?;
+        let socket_event_id = socket_event["message_id"]
+            .as_u64()
+            .context("socket event message ID")?;
+        ensure!(socket_event["command"]["type"] == "websocket_event");
+        ensure!(socket_event["command"]["event"]["type"] == "connect");
+        write_json_line(
+            &mut writer,
+            &json!({
+                "type": "reply",
+                "message_id": socket_event_id,
+                "reply": {
+                    "type": "websocket_handled",
+                    "state": { "count": 3 },
+                    "effects": [{
+                        "type": "send",
+                        "connection_id": "socket-1",
+                        "message": { "type": "text", "data": "ready" }
+                    }]
+                }
+            }),
+        )
+        .await?;
+
         let mut trailing = String::new();
         ensure!(
             reader.read_line(&mut trailing).await? == 0,
@@ -559,10 +763,10 @@ mod tests {
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
         writer
-            .write_all(b"{\"type\":\"attach\",\"protocol\":11,\"actor_types\":[\"counter\"]}\n")
+            .write_all(b"{\"type\":\"attach\",\"protocol\":12,\"actor_types\":[\"counter\"]}\n")
             .await?;
         ensure!(
-            read_json_line(&mut reader).await? == json!({ "type": "attached", "protocol": 11 })
+            read_json_line(&mut reader).await? == json!({ "type": "attached", "protocol": 12 })
         );
         let mut trailing = String::new();
         ensure!(

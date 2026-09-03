@@ -4,6 +4,7 @@ package durable_object.v1;
 
 service ActorHostService {
   rpc Invoke(HostInvokeActorRequest) returns (InvokeActorReply);
+  rpc HandleSocket(HostSocketEventRequest) returns (InvokeActorReply);
 }
 
 service ActorControlPlaneService {
@@ -40,6 +41,16 @@ message HostInvokeActorRequest {
   uint64 state_version = 4;
 }
 
+message HostSocketEventRequest {
+  string request_id = 1;
+  ActorKey actor = 2;
+  bytes event_json = 3;
+  bytes connections_json = 4;
+  uint64 owner_epoch = 5;
+  string state_read_url = 6;
+  uint64 state_version = 7;
+}
+
 message InvokeActorReply {
   oneof result {
     ActorCompleted completed = 1;
@@ -50,6 +61,7 @@ message InvokeActorReply {
 
 message ActorCompleted {
   bytes result_json = 1;
+  bytes socket_effects_json = 2;
 }
 
 message ActorFailed {

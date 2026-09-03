@@ -75,13 +75,15 @@ where
     executor_connection.mark_ready().await?;
     let stop = CancellationToken::new();
     let server_stop = stop.clone();
-    let mut server = Box::pin(
+    let mut grpc_server = Box::pin(
         Server::builder()
             .add_service(service)
             .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
                 server_stop.cancelled().await
             }),
     );
+    let mut server =
+        Box::pin(async move { grpc_server.as_mut().await.context("serve actor host gRPC") });
     let mut executor_task = Box::pin(executor_connection.run(stop.clone()));
     tokio::pin!(shutdown);
 
@@ -310,14 +312,14 @@ async fn wait_for_host_stop<ServerFuture, ExecutorFuture, ShutdownFuture>(
     idle_timeout: Duration,
 ) -> Result<()>
 where
-    ServerFuture: Future<Output = std::result::Result<(), tonic::transport::Error>> + ?Sized,
+    ServerFuture: Future<Output = Result<()>> + ?Sized,
     ExecutorFuture: Future<Output = Result<()>> + ?Sized,
     ShutdownFuture: Future<Output = ()> + ?Sized,
 {
     let mut idle_deadline = tokio::time::Instant::now() + idle_timeout;
     loop {
         tokio::select! {
-            result = server.as_mut() => break result.context("serve actor host gRPC"),
+            result = server.as_mut() => break result.context("serve actor host network endpoints"),
             result = executor.as_mut() => break result.context("run JavaScript actor executor"),
             result = javascript.wait() => break Err(anyhow::anyhow!("JavaScript actor executor exited with {}", result?)),
             () = shutdown.as_mut() => break Ok(()),

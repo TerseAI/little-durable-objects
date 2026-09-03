@@ -12,7 +12,7 @@ import { ActorWorkerSupervisor } from "./worker/supervisor.js"
 const DEFAULT_ACTOR_STARTUP_TIMEOUT_MS = 10_000
 const DEFAULT_ACTOR_IDLE_TIMEOUT_MS = 60_000
 const MAX_IDLE_TIMEOUT_MS = 86_400_000
-const MAX_MESSAGE_BYTES = 16 * 1024 * 1024
+const MAX_MESSAGE_BYTES = 32 * 1024 * 1024
 
 const actorSessionSettingsSchema = z.object({
     DURABLE_OBJECT_EXECUTOR_SOCKET: z.string().trim().min(1),
@@ -90,7 +90,7 @@ class ActorSessionConnection {
         if (actorTypes.length === 0) throw new ActorSessionError("the actor entrypoint does not export any actor classes")
         const socket = await connectSocket(socketPath)
         const connection = new ActorSessionConnection(socket, commandHandler)
-        connection.send({ type: "attach", protocol: 11, actor_types: actorTypes })
+        connection.send({ type: "attach", protocol: 12, actor_types: actorTypes })
         await connection.waitUntilAttached(timeoutMs)
         return connection
     }
@@ -182,7 +182,7 @@ class ActorSessionConnection {
             this.send(message)
             return
         }
-        if (command.type === "invoke") await this.commandHandler({ type: "evict", actor: command.actor })
+        if (command.type !== "evict") await this.commandHandler({ type: "evict", actor: command.actor })
         this.send({
             type: "reply",
             message_id: messageId,

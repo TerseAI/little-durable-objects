@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 
 use super::proto;
-use crate::actor::{ActorExecutionResult, ActorInvocation, ActorKey};
+use crate::actor::{
+    ActorExecutionResult, ActorInvocation, ActorKey, ActorSocketEvent, ActorSocketInvocation,
+};
 
 impl TryFrom<proto::InvokeActorRequest> for ActorInvocation {
     type Error = anyhow::Error;
@@ -57,10 +59,12 @@ impl From<ActorExecutionResult> for proto::InvokeActorReply {
         use proto::invoke_actor_reply::Result;
 
         let result = match reply {
-            ActorExecutionResult::Completed { result } => {
+            ActorExecutionResult::Completed { result, effects } => {
                 Result::Completed(proto::ActorCompleted {
                     result_json: serde_json::to_vec(&result)
                         .expect("validated JSON actor result must serialize"),
+                    socket_effects_json: serde_json::to_vec(&effects)
+                        .expect("validated socket effects must serialize"),
                 })
             }
             ActorExecutionResult::Failed { failure } => Result::Failed(proto::ActorFailed {
@@ -89,6 +93,8 @@ impl TryFrom<proto::InvokeActorReply> for ActorExecutionResult {
             WireResult::Completed(completed) => Ok(Self::Completed {
                 result: serde_json::from_slice(&completed.result_json)
                     .context("actor result is not valid JSON")?,
+                effects: serde_json::from_slice(&completed.socket_effects_json)
+                    .context("actor socket effects are not valid JSON")?,
             }),
             WireResult::Failed(failed) => Ok(Self::Failed {
                 failure: crate::actor::ActorInvocationFailure {
@@ -98,5 +104,23 @@ impl TryFrom<proto::InvokeActorReply> for ActorExecutionResult {
             }),
             WireResult::Reroute(_) => Ok(Self::Reroute),
         }
+    }
+}
+
+impl TryFrom<proto::HostSocketEventRequest> for ActorSocketInvocation {
+    type Error = anyhow::Error;
+
+    fn try_from(request: proto::HostSocketEventRequest) -> Result<Self> {
+        let actor: ActorKey = request.actor.context("actor key is required")?.into();
+        actor.validate()?;
+        Ok(Self {
+            request_id: request.request_id,
+            actor,
+            event: serde_json::from_slice::<ActorSocketEvent>(&request.event_json)
+                .context("actor socket event is not valid JSON")?,
+            connections: serde_json::from_slice(&request.connections_json)
+                .context("actor socket connections are not valid JSON")?,
+            state: None,
+        })
     }
 }

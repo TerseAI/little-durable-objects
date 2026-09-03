@@ -21,6 +21,7 @@ test("keeps an actor resident until Rust explicitly evicts it", async () => {
     try {
         await exerciseResidency(entrypoint)
         await exerciseIdleRecycling(entrypoint)
+        await exerciseSocketHibernation(entrypoint)
     } finally {
         await rm(consumerRoot, { recursive: true, force: true })
     }
@@ -63,6 +64,48 @@ async function exerciseResidency(entrypoint: string): Promise<void> {
             state: { count: 2 }
         }),
         { type: "invoked", result: 2, state: { count: 2 } }
+    )
+}
+
+async function exerciseSocketHibernation(entrypoint: string): Promise<void> {
+    const runtime = new ActorWorkerSupervisor({ actorEntrypointUrl: entrypoint, actorIdleTimeoutMs: 10 })
+    const connection = { id: "socket-1", metadata: { userId: "user-1" }, tags: [] }
+    assert.deepEqual(
+        await runtime.handle({
+            type: "websocket_event",
+            request_id: "socket-request-1",
+            actor: actorIdentity,
+            event: { type: "connect", connection },
+            connections: [connection],
+            state: null
+        }),
+        {
+            type: "websocket_handled",
+            state: { count: 1 },
+            effects: [
+                {
+                    type: "send",
+                    connection_id: "socket-1",
+                    message: { type: "text", data: '{"type":"state","state":{"count":1}}' }
+                }
+            ]
+        }
+    )
+    await new Promise(resolve => setTimeout(resolve, 30))
+    assert.deepEqual(
+        await runtime.handle({
+            type: "websocket_event",
+            request_id: "socket-request-2",
+            actor: actorIdentity,
+            event: { type: "message", connection_id: "socket-1", message: { type: "text", data: "hello" } },
+            connections: [connection],
+            state: { count: 1 }
+        }),
+        {
+            type: "websocket_handled",
+            state: { count: 2 },
+            effects: [{ type: "send", connection_id: "socket-1", message: { type: "text", data: "user-1:hello" } }]
+        }
     )
 }
 
@@ -113,6 +156,15 @@ export class SessionCounter extends Actor {
 
     async getCount(): Promise<number> {
         return this.count
+    }
+
+    async onConnect(): Promise<void> {
+        this.count += 1
+    }
+
+    async onMessage(socket: { metadata: { userId: string }, send(message: string): void }, message: string): Promise<void> {
+        this.count += 1
+        socket.send(\`${"${socket.metadata.userId}"}:${"${message}"}\`)
     }
 }
 `

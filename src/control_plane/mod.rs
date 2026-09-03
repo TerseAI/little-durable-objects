@@ -1,11 +1,14 @@
 mod admin;
 mod auth;
 mod client;
+mod event_sink;
 mod issuer;
 mod process;
 mod protocol;
 mod public_api;
 mod service;
+mod socket_auth;
+mod websocket;
 
 use std::time::Duration;
 

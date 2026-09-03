@@ -1,6 +1,8 @@
 import { actorClient } from "../workflow/client.js"
 
 import { ActorDefinitionError } from "./errors.js"
+import { actorConnections, broadcastActor } from "./socket.js"
+import type { ActorBroadcastOptions, ActorConnection, ActorSocket, ActorSocketMessage } from "./socket.js"
 import { validateActorComponent } from "./types.js"
 
 const actorMetadata = new WeakMap<object, ActorMetadata>()
@@ -17,6 +19,14 @@ abstract class Actor {
 
     protected get id(): string {
         return metadataFor(this).actorId
+    }
+
+    protected get connections(): readonly ActorSocket[] {
+        return actorConnections(this)
+    }
+
+    protected broadcast(message: ActorSocketMessage, options?: ActorBroadcastOptions): void {
+        broadcastActor(this, message, options)
     }
 }
 
@@ -63,6 +73,16 @@ function referenceClass(definition: ActorDefinition): ActorReferenceClass {
         }
     }
 
+    Object.defineProperty(ActorReference.prototype, "connect", {
+        configurable: false,
+        enumerable: false,
+        writable: false,
+        value: function connectActor(this: Actor, metadata: unknown): Promise<ActorConnection> {
+            const actor = metadataFor(this)
+            return actorClient().connect(definition.actorType, actor.actorId, metadata)
+        }
+    })
+
     definition.methods.forEach(method => {
         Object.defineProperty(ActorReference.prototype, method, {
             configurable: false,
@@ -93,10 +113,14 @@ function discoverMethods(actorClass: ActorClass, actorType: string): string[] {
         if (typeof descriptor.value !== "function") return []
         validateActorComponent("actor method", name)
         if (name === "then") throw new ActorDefinitionError(`actor class ${actorType} cannot define method then`)
+        if (name === "connect") throw new ActorDefinitionError(`actor class ${actorType} cannot define reserved method connect`)
         if (!(descriptor.value instanceof asyncFunction)) throw new ActorDefinitionError(`actor method ${actorType}.${name} must be async`)
+        if (lifecycleMethods.has(name)) return []
         return [name]
     })
 }
+
+const lifecycleMethods = new Set(["onConnect", "onMessage", "onDisconnect"])
 
 function validateActorClass(actorClass: ActorClass, actorType: string): void {
     if (Object.getPrototypeOf(actorClass.prototype) !== Actor.prototype) throw new ActorDefinitionError(`actor class ${actorType} must extend Actor directly`)
@@ -129,8 +153,12 @@ type InvalidActorMethod<Instance extends Actor> = {
 }[keyof Instance]
 type ValidActorClass<TActorClass extends ActorClass> = TActorClass extends PubliclyConstructibleActorClass ? never : InvalidActorMethod<TActorClass["prototype"]> extends never ? TActorClass : never
 type ActorReference<Instance extends Actor> = {
-    [Key in keyof Instance as Instance[Key] extends AsyncMethod ? Key : never]: Instance[Key]
+    [Key in keyof Instance as Instance[Key] extends AsyncMethod ? (Key extends SocketLifecycleMethod ? never : Key) : never]: Instance[Key]
+} & {
+    connect(metadata: SocketMetadata<Instance>): Promise<ActorConnection>
 }
+type SocketLifecycleMethod = "onConnect" | "onMessage" | "onDisconnect"
+type SocketMetadata<Instance> = Instance extends { onConnect(socket: ActorSocket<infer Metadata>): Promise<unknown> } ? Metadata : unknown
 
 export { Actor, bindActorIdentity, findActorDefinition, registerActorClass }
 export type { ActorClass, ActorDefinition, ActorReference }

@@ -21,6 +21,36 @@ const invokeCommandSchema = z.object({
     actor: actorIdentitySchema,
     method: actorComponentSchema,
     args: z.array(jsonValueSchema),
+    state: jsonValueSchema.nullable(),
+    connections: z.array(z.lazy(() => socketConnectionSchema)).optional()
+})
+
+const socketConnectionSchema = z.object({
+    id: actorComponentSchema,
+    metadata: jsonValueSchema,
+    tags: z.array(z.string().min(1).max(256))
+})
+
+const socketMessageSchema = z.discriminatedUnion("type", [z.object({ type: z.literal("text"), data: z.string() }), z.object({ type: z.literal("binary"), data: z.string() })])
+
+const socketEventSchema = z.discriminatedUnion("type", [
+    z.object({ type: z.literal("connect"), connection: socketConnectionSchema }),
+    z.object({ type: z.literal("message"), connection_id: actorComponentSchema, message: socketMessageSchema }),
+    z.object({
+        type: z.literal("disconnect"),
+        connection: socketConnectionSchema,
+        code: z.number().int().min(0).max(65535),
+        reason: z.string(),
+        was_clean: z.boolean()
+    })
+])
+
+const websocketEventCommandSchema = z.object({
+    type: z.literal("websocket_event"),
+    request_id: actorComponentSchema,
+    actor: actorIdentitySchema,
+    event: socketEventSchema,
+    connections: z.array(socketConnectionSchema),
     state: jsonValueSchema.nullable()
 })
 
@@ -29,10 +59,10 @@ const evictCommandSchema = z.object({
     actor: actorIdentitySchema
 })
 
-const executorCommandSchema = z.discriminatedUnion("type", [invokeCommandSchema, evictCommandSchema])
+const executorCommandSchema = z.discriminatedUnion("type", [invokeCommandSchema, websocketEventCommandSchema, evictCommandSchema])
 
 const actorSessionServerMessageSchema = z.discriminatedUnion("type", [
-    z.object({ type: z.literal("attached"), protocol: z.literal(11) }),
+    z.object({ type: z.literal("attached"), protocol: z.literal(12) }),
     z.object({
         type: z.literal("command"),
         message_id: z.number().int().nonnegative(),
@@ -125,12 +155,12 @@ type InvokeCommand = z.infer<typeof invokeCommandSchema>
 type EvictCommand = z.infer<typeof evictCommandSchema>
 type ActorExecutorCommand = z.infer<typeof executorCommandSchema>
 type ActorSessionServerMessage = z.infer<typeof actorSessionServerMessageSchema>
-type ActorExecutorReply = InvokedReply | FailedReply | EvictedReply
+type ActorExecutorReply = InvokedReply | WebSocketHandledReply | FailedReply | EvictedReply
 type ActorSessionClientMessage = AttachMessage | ReplyMessage
 
 interface AttachMessage {
     readonly type: "attach"
-    readonly protocol: 11
+    readonly protocol: 12
     readonly actor_types: readonly string[]
 }
 
@@ -144,6 +174,13 @@ interface InvokedReply {
     readonly type: "invoked"
     readonly result: JsonValue
     readonly state: JsonObject
+    readonly effects?: readonly SocketEffect[]
+}
+
+interface WebSocketHandledReply {
+    readonly type: "websocket_handled"
+    readonly state: JsonObject
+    readonly effects: readonly SocketEffect[]
 }
 
 interface FailedReply {
@@ -161,7 +198,18 @@ interface ActorWorkerData {
     readonly moduleUrl: string
 }
 
-type ActorWorkerRequest = { readonly type: "invoke"; readonly command: InvokeCommand }
+type ActorWorkerRequest = { readonly type: "execute"; readonly command: InvokeCommand | WebSocketEventCommand }
+
+type SocketConnection = z.infer<typeof socketConnectionSchema>
+type SocketMessage = z.infer<typeof socketMessageSchema>
+type SocketEvent = z.infer<typeof socketEventSchema>
+type WebSocketEventCommand = z.infer<typeof websocketEventCommandSchema>
+type SocketEffect =
+    | { readonly type: "send"; readonly connection_id: string; readonly message: SocketMessage }
+    | { readonly type: "broadcast"; readonly message: SocketMessage; readonly except_connection_ids: readonly string[]; readonly tags: readonly string[] }
+    | { readonly type: "close" | "reject"; readonly connection_id: string; readonly code: number; readonly reason: string }
+    | { readonly type: "set_metadata"; readonly connection_id: string; readonly metadata: JsonValue }
+    | { readonly type: "set_tags"; readonly connection_id: string; readonly tags: readonly string[] }
 
 export { JsonActorStateSerializer, errorMessage, failedReply, parseActorSessionServerMessage, validateActorComponent }
 export type {
@@ -175,5 +223,10 @@ export type {
     InvokeCommand,
     JsonObject,
     JsonPrimitive,
-    JsonValue
+    JsonValue,
+    SocketConnection,
+    SocketEffect,
+    SocketEvent,
+    SocketMessage,
+    WebSocketEventCommand
 }
