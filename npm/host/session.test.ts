@@ -67,6 +67,46 @@ test("the actor session carries only owned execution commands", async () => {
                 type: "command",
                 message_id: 2,
                 command: {
+                    type: "invoke",
+                    request_id: "request-2",
+                    actor: actorIdentity(),
+                    method: "sizedResponse",
+                    args: [16 * 1024 * 1024],
+                    state: { count: 4 }
+                }
+            })}\n`
+        )
+        assert.deepEqual(await readMessage(iterator), {
+            type: "reply",
+            message_id: 2,
+            reply: { type: "failed", code: "resource_exhausted", message: "actor session response exceeds 16777216 bytes" }
+        })
+
+        customerSocket.write(
+            `${JSON.stringify({
+                type: "command",
+                message_id: 3,
+                command: {
+                    type: "invoke",
+                    request_id: "request-3",
+                    actor: actorIdentity(),
+                    method: "increment",
+                    args: [1],
+                    state: { count: 4 }
+                }
+            })}\n`
+        )
+        assert.deepEqual(await readMessage(iterator), {
+            type: "reply",
+            message_id: 3,
+            reply: { type: "invoked", result: 5, state: { count: 5 } }
+        })
+
+        customerSocket.write(
+            `${JSON.stringify({
+                type: "command",
+                message_id: 4,
+                command: {
                     type: "evict",
                     actor: actorIdentity()
                 }
@@ -74,7 +114,7 @@ test("the actor session carries only owned execution commands", async () => {
         )
         assert.deepEqual(await readMessage(iterator), {
             type: "reply",
-            message_id: 2,
+            message_id: 4,
             reply: { type: "evicted" }
         })
 

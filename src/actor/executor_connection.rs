@@ -1,5 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
+    error::Error,
+    fmt::{Display, Formatter},
     os::unix::fs::FileTypeExt,
     path::{Path, PathBuf},
     sync::{
@@ -244,6 +246,12 @@ impl JsActorExecutor {
             .await;
         if let Err(error) = write_result {
             self.remove_pending(message_id)?;
+            if let Some(limit) = error.downcast_ref::<ActorExecutorMessageTooLarge>() {
+                return Ok(ExecutorReply::Failed {
+                    code: "resource_exhausted".into(),
+                    message: limit.to_string(),
+                });
+            }
             return Err(error.context("send command to customer actor executor"));
         }
 
@@ -334,13 +342,26 @@ async fn write_server_message(
 ) -> Result<()> {
     let mut bytes = serde_json::to_vec(message)?;
     bytes.push(b'\n');
-    ensure!(
-        bytes.len() <= MAX_ACTOR_EXECUTOR_MESSAGE_BYTES,
-        "actor executor command exceeds {MAX_ACTOR_EXECUTOR_MESSAGE_BYTES} bytes"
-    );
+    if bytes.len() > MAX_ACTOR_EXECUTOR_MESSAGE_BYTES {
+        return Err(ActorExecutorMessageTooLarge.into());
+    }
     writer.write_all(&bytes).await?;
     Ok(())
 }
+
+#[derive(Debug)]
+struct ActorExecutorMessageTooLarge;
+
+impl Display for ActorExecutorMessageTooLarge {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "actor executor command exceeds {MAX_ACTOR_EXECUTOR_MESSAGE_BYTES} bytes"
+        )
+    }
+}
+
+impl Error for ActorExecutorMessageTooLarge {}
 
 async fn prepare_socket_path(path: &Path) -> Result<()> {
     match tokio::fs::symlink_metadata(path).await {
@@ -458,6 +479,42 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn oversized_commands_are_reported_as_resource_exhausted() -> Result<()> {
+        let root = TempDir::new_in("/tmp")?;
+        let socket = root.path().join("actor-executor.sock");
+        let host = ActorExecutorListener::bind(&socket).await?;
+        let customer = tokio::spawn(run_attached_customer(socket.clone()));
+        let connection = host.accept().await?;
+        let executor = connection.executor();
+        connection.mark_ready().await?;
+
+        let shutdown = CancellationToken::new();
+        let connection_task = tokio::spawn(connection.run(shutdown.clone()));
+        let outcome = executor
+            .invoke(ActorMethodInvocation {
+                request_id: "request-1".into(),
+                actor: ActorKey {
+                    namespace_id: "namespace-1".into(),
+                    actor_type: "counter".into(),
+                    actor_id: "counter-1".into(),
+                },
+                method: "accept".into(),
+                args: vec![json!("x".repeat(MAX_ACTOR_EXECUTOR_MESSAGE_BYTES))],
+                state: None,
+            })
+            .await?;
+
+        assert!(matches!(
+            outcome,
+            ActorMethodOutcome::Failed(ref failure) if failure.code == "resource_exhausted"
+        ));
+        shutdown.cancel();
+        connection_task.await??;
+        customer.await??;
+        Ok(())
+    }
+
     async fn run_incrementing_customer(socket: PathBuf) -> Result<()> {
         let stream = UnixStream::connect(socket).await?;
         let (reader, mut writer) = stream.into_split();
@@ -493,6 +550,24 @@ mod tests {
         ensure!(
             reader.read_line(&mut trailing).await? == 0,
             "expected Rust host to close the actor executor"
+        );
+        Ok(())
+    }
+
+    async fn run_attached_customer(socket: PathBuf) -> Result<()> {
+        let stream = UnixStream::connect(socket).await?;
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+        writer
+            .write_all(b"{\"type\":\"attach\",\"protocol\":11,\"actor_types\":[\"counter\"]}\n")
+            .await?;
+        ensure!(
+            read_json_line(&mut reader).await? == json!({ "type": "attached", "protocol": 11 })
+        );
+        let mut trailing = String::new();
+        ensure!(
+            reader.read_line(&mut trailing).await? == 0,
+            "oversized command reached the customer actor executor"
         );
         Ok(())
     }

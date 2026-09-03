@@ -313,7 +313,11 @@ impl ActorHost {
             Ok(ActorMethodOutcome::Completed { result, state }) => Ok((result, state)),
             Ok(ActorMethodOutcome::Failed(failure)) => {
                 self.evict(&invocation.actor).await;
-                Err(failed("actor_error", failure.message))
+                let code = match failure.code.as_str() {
+                    "resource_exhausted" => "resource_exhausted",
+                    _ => "actor_error",
+                };
+                Err(failed(code, failure.message))
             }
             Err(error) => {
                 self.evict(&invocation.actor).await;
@@ -669,6 +673,8 @@ mod tests {
         invocations: AtomicU64,
     }
 
+    struct ExhaustedExecutor;
+
     #[async_trait]
     impl ActorExecutor for IncrementingExecutor {
         fn supports(&self, actor_type: &str) -> bool {
@@ -688,6 +694,20 @@ mod tests {
                 result: json!(count),
                 state: json!({ "count": count }),
             })
+        }
+    }
+
+    #[async_trait]
+    impl ActorExecutor for ExhaustedExecutor {
+        fn supports(&self, _actor_type: &str) -> bool {
+            true
+        }
+
+        async fn invoke(&self, _invocation: ActorMethodInvocation) -> Result<ActorMethodOutcome> {
+            Ok(ActorMethodOutcome::Failed(ActorInvocationFailure {
+                code: "resource_exhausted".into(),
+                message: "actor session message is too large".into(),
+            }))
         }
     }
 
@@ -824,6 +844,26 @@ mod tests {
         assert_eq!(executor.invocations.load(Ordering::Relaxed), 1);
         assert_eq!(state.writes.lock().unwrap().len(), 1);
         assert_eq!(*authority.commits.lock().unwrap(), [0, 0]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preserves_executor_resource_exhaustion() -> Result<()> {
+        let host = ActorHost::new(
+            HostEndpoint {
+                id: super::super::HostId::new("host-1"),
+                route: "http://host.invalid/".into(),
+            },
+            "project-1".into(),
+            Arc::new(ExhaustedExecutor),
+            Arc::new(FakeAuthority::default()),
+            Arc::new(FakeStateTransport::default()),
+        );
+
+        assert!(matches!(
+            invoke(&host, "request-1").await?,
+            ActorExecutionResult::Failed { ref failure } if failure.code == "resource_exhausted"
+        ));
         Ok(())
     }
 

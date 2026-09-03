@@ -236,6 +236,7 @@ impl ActorJwtVerifier {
         );
 
         let now = unix_seconds()?;
+        ensure!(claims.exp > now, "actor token has expired");
         let skew_seconds = i64::try_from(CLOCK_SKEW.as_secs()).unwrap_or(i64::MAX);
         ensure!(
             claims.iat <= now.saturating_add(skew_seconds),
@@ -419,6 +420,33 @@ mod tests {
 
         assert!(invocation.verify(&token).is_ok());
         assert!(control_plane.verify(&token).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_an_expired_token_during_clock_skew_leeway() -> Result<()> {
+        let (verifier, key_pair) = verifier_and_key_pair()?;
+        let now = unix_seconds()?;
+        let expired = token(
+            &key_pair,
+            json!({ "alg": "EdDSA", "kid": "test-key", "typ": "JWT" }),
+            json!({
+                "iss": "durable-object-control-plane",
+                "aud": "durable-object-authority",
+                "sub": "host.v1.namespace-1.00000000-0000-4000-8000-000000000001",
+                "namespaceId": "namespace-1",
+                "processId": "host.v1.namespace-1.00000000-0000-4000-8000-000000000001",
+                "sessionId": "00000000-0000-4000-8000-000000000002",
+                "processRole": "host",
+                "storageRegion": "us-east",
+                "scope": "actor:authority",
+                "iat": now - 60,
+                "nbf": now - 60,
+                "exp": now - 1
+            }),
+        )?;
+
+        assert!(verifier.verify(&expired).is_err());
         Ok(())
     }
 

@@ -2,17 +2,16 @@ use std::{sync::Arc, time::Instant};
 
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
-use tonic::{Request, Response, Status, metadata::MetadataValue, transport::Endpoint};
+use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
 use crate::{
-    actor::{ActorExecutionResult, ActorInvocation, ActorInvocationFailure, ActorKey},
+    actor::ActorKey,
     grpc::proto::{
-        ControlPlaneReply, ControlPlaneRequest, HostInvokeActorRequest, InvokeActorReply,
+        ControlPlaneReply, ControlPlaneRequest,
         actor_control_plane_service_server::{
             ActorControlPlaneService, ActorControlPlaneServiceServer,
         },
-        actor_host_service_client::ActorHostServiceClient,
     },
     host::{ActorProcessRole, HostId},
     host_leases::{HostLease, HostLeaseStore},
@@ -35,7 +34,6 @@ use super::{
 };
 
 const HOST_TOKEN_RENEWAL_WINDOW_SECONDS: i64 = 10 * 60;
-const MAX_ROUTE_ATTEMPTS: usize = 3;
 
 #[derive(Clone)]
 pub struct ControlPlaneService {
@@ -51,7 +49,6 @@ pub struct ControlPlaneService {
 struct RoutingDependencies {
     registry: Arc<dyn AdminRegistry>,
     provisioner: Option<Arc<dyn HostProvisioner>>,
-    invoker: Arc<dyn HostInvoker>,
 }
 
 impl ControlPlaneService {
@@ -77,15 +74,10 @@ impl ControlPlaneService {
         issuer: ActorJwtIssuer,
         provisioner: Option<Arc<dyn HostProvisioner>>,
     ) -> Self {
-        let invoker = Arc::new(GrpcHostInvoker::new(
-            self.storage_urls.clone(),
-            issuer.clone(),
-        ));
         self.host_token_issuer = Some(issuer);
         self.routing = Some(RoutingDependencies {
             registry,
             provisioner,
-            invoker,
         });
         self
     }
@@ -196,30 +188,6 @@ impl ControlPlaneService {
         }
     }
 
-    pub(super) async fn invoke_workflow(
-        &self,
-        principal: ActorPrincipal,
-        invocation: ActorInvocation,
-    ) -> ActorExecutionResult {
-        if let Err(failure) = validate_workflow_invocation(&principal, &invocation) {
-            return failure;
-        }
-        for attempt in 1..=MAX_ROUTE_ATTEMPTS {
-            match self
-                .invoke_once(&invocation, &principal.region, attempt)
-                .await
-            {
-                Ok(ActorExecutionResult::Reroute) => continue,
-                Ok(result) => return result,
-                Err(failure) => return failure,
-            }
-        }
-        failed(
-            "unavailable",
-            "actor ownership changed repeatedly before execution",
-        )
-    }
-
     pub(super) async fn resolve_workflow_target(
         &self,
         principal: &ActorPrincipal,
@@ -291,17 +259,6 @@ impl ActorControlPlaneService for ControlPlaneService {
     }
 }
 
-#[cfg(test)]
-impl ControlPlaneService {
-    fn with_host_invoker(mut self, invoker: Arc<dyn HostInvoker>) -> Self {
-        self.routing
-            .as_mut()
-            .expect("routing must be configured before its host invoker")
-            .invoker = invoker;
-        self
-    }
-}
-
 impl ControlPlaneService {
     async fn execute_command(
         &self,
@@ -348,102 +305,6 @@ impl ControlPlaneService {
                 .await
             }
         }
-    }
-
-    async fn invoke_once(
-        &self,
-        invocation: &ActorInvocation,
-        storage_region: &str,
-        attempt: usize,
-    ) -> std::result::Result<ActorExecutionResult, ActorExecutionResult> {
-        let started_at = Instant::now();
-        let route_started_at = Instant::now();
-        let target = match self.route_actor(&invocation.actor, storage_region).await {
-            Ok(target) => target,
-            Err(error) => {
-                warn!(
-                    event = "actor_invocation",
-                    request_id = %invocation.request_id,
-                    namespace_id = %invocation.actor.namespace_id,
-                    actor_type = %invocation.actor.actor_type,
-                    actor_id = %invocation.actor.actor_id,
-                    method = %invocation.method,
-                    storage_region,
-                    attempt,
-                    route_ms = elapsed_ms(route_started_at),
-                    total_ms = elapsed_ms(started_at),
-                    outcome = "route_failed",
-                    error = %format!("{error:#}"),
-                    "actor invocation routing failed"
-                );
-                return Err(failed(
-                    "unavailable",
-                    format!("actor host is unavailable: {error:#}"),
-                ));
-            }
-        };
-        let route_ms = elapsed_ms(route_started_at);
-        let routing = self
-            .routing
-            .as_ref()
-            .expect("route_actor requires routing dependencies");
-        let host_rpc_started_at = Instant::now();
-        let reply = match routing
-            .invoker
-            .invoke(invocation.clone(), &invocation.actor, &target)
-            .await
-        {
-            Ok(reply) => reply,
-            Err(error) => {
-                warn!(
-                    event = "actor_invocation",
-                    request_id = %invocation.request_id,
-                    namespace_id = %invocation.actor.namespace_id,
-                    actor_type = %invocation.actor.actor_type,
-                    actor_id = %invocation.actor.actor_id,
-                    method = %invocation.method,
-                    storage_region,
-                    home_region = %target.placement.home_region,
-                    host_id = %target.lease.id,
-                    host_reused = target.host_reused,
-                    attempt,
-                    route_ms,
-                    host_rpc_ms = elapsed_ms(host_rpc_started_at),
-                    total_ms = elapsed_ms(started_at),
-                    outcome = host_call_error_label(&error),
-                    error = %host_call_error_message(&error),
-                    "actor host invocation failed"
-                );
-                return Err(host_call_failure(error));
-            }
-        };
-        let host_rpc_ms = elapsed_ms(host_rpc_started_at);
-        let result = ActorExecutionResult::try_from(reply).map_err(|error| {
-            failed(
-                "outcome_unknown",
-                format!("actor host returned an invalid reply: {error:#}"),
-            )
-        })?;
-        info!(
-            event = "actor_invocation",
-            request_id = %invocation.request_id,
-            namespace_id = %invocation.actor.namespace_id,
-            actor_type = %invocation.actor.actor_type,
-            actor_id = %invocation.actor.actor_id,
-            method = %invocation.method,
-            storage_region,
-            home_region = %target.placement.home_region,
-            host_id = %target.lease.id,
-            host_reused = target.host_reused,
-            attempt,
-            route_ms,
-            host_rpc_ms,
-            total_ms = elapsed_ms(started_at),
-            outcome = actor_execution_outcome(&result),
-            failure_code = actor_execution_failure_code(&result).unwrap_or(""),
-            "actor invocation completed"
-        );
-        Ok(result)
     }
 
     async fn register_lease(
@@ -617,7 +478,6 @@ impl ControlPlaneService {
                         placement,
                         lease,
                         spec,
-                        host_reused: false,
                     });
                 }
                 PlacementClaim::Acquired(_) | PlacementClaim::Current(_) => continue,
@@ -687,7 +547,6 @@ impl ControlPlaneService {
             placement: placement.clone(),
             lease: status.lease.context("active lease is missing")?,
             spec: spec.clone(),
-            host_reused: true,
         }))
     }
 
@@ -891,213 +750,14 @@ impl SandboxHostProvisioner {
     }
 }
 
-#[async_trait]
-trait HostInvoker: Send + Sync {
-    async fn invoke(
-        &self,
-        invocation: ActorInvocation,
-        actor: &ActorKey,
-        target: &RoutedActor,
-    ) -> std::result::Result<InvokeActorReply, HostCallError>;
-}
-
-struct GrpcHostInvoker {
-    storage_urls: Arc<dyn StorageUrlSigner>,
-    issuer: ActorJwtIssuer,
-}
-
-impl GrpcHostInvoker {
-    fn new(storage_urls: Arc<dyn StorageUrlSigner>, issuer: ActorJwtIssuer) -> Self {
-        Self {
-            storage_urls,
-            issuer,
-        }
-    }
-}
-
-#[async_trait]
-impl HostInvoker for GrpcHostInvoker {
-    async fn invoke(
-        &self,
-        invocation: ActorInvocation,
-        actor: &ActorKey,
-        target: &RoutedActor,
-    ) -> std::result::Result<InvokeActorReply, HostCallError> {
-        let started_at = Instant::now();
-        let request_id = invocation.request_id.clone();
-        let state_read_url_started_at = Instant::now();
-        let read_url = self.read_url(actor, target).await?;
-        let state_read_url_ms = elapsed_ms(state_read_url_started_at);
-        let request_started_at = Instant::now();
-        let request = Self::request(invocation, target, read_url, self.token(actor, target)?)?;
-        let request_setup_ms = elapsed_ms(request_started_at);
-        let connect_started_at = Instant::now();
-        let channel = self.connect(target).await?;
-        let connect_ms = elapsed_ms(connect_started_at);
-        let rpc_started_at = Instant::now();
-        let response = ActorHostServiceClient::new(channel).invoke(request).await;
-        let rpc_ms = elapsed_ms(rpc_started_at);
-        info!(
-            event = "actor_host_rpc",
-            request_id,
-            namespace_id = %actor.namespace_id,
-            actor_type = %actor.actor_type,
-            actor_id = %actor.actor_id,
-            home_region = %target.placement.home_region,
-            host_id = %target.lease.id,
-            state_read_url_ms,
-            request_setup_ms,
-            connect_ms,
-            rpc_ms,
-            total_ms = elapsed_ms(started_at),
-            outcome = if response.is_ok() { "rpc_ok" } else { "rpc_error" },
-            "actor host RPC completed"
-        );
-        response.map(|reply| reply.into_inner()).map_err(|error| {
-            HostCallError::OutcomeUnknown(format!("actor host RPC failed after dispatch: {error}"))
-        })
-    }
-}
-
-impl GrpcHostInvoker {
-    async fn read_url(
-        &self,
-        _actor: &ActorKey,
-        target: &RoutedActor,
-    ) -> std::result::Result<String, HostCallError> {
-        let Some(object_name) = &target.placement.state_object else {
-            return Ok(String::new());
-        };
-        self.storage_urls
-            .read_url(&target.placement.home_region, object_name)
-            .await
-            .map_err(|error| {
-                HostCallError::Unavailable(format!("could not authorize state read: {error:#}"))
-            })
-    }
-
-    fn token(
-        &self,
-        actor: &ActorKey,
-        target: &RoutedActor,
-    ) -> std::result::Result<String, HostCallError> {
-        self.issuer
-            .issue_host(
-                &actor.namespace_id,
-                &target.lease.id,
-                &target.lease.session_id,
-                &target.spec.code_revision,
-                &target.placement.home_region,
-            )
-            .map(|issued| issued.token)
-            .map_err(|error| {
-                HostCallError::Unavailable(format!("could not issue host credential: {error:#}"))
-            })
-    }
-
-    async fn connect(
-        &self,
-        target: &RoutedActor,
-    ) -> std::result::Result<tonic::transport::Channel, HostCallError> {
-        Endpoint::new(target.lease.route.clone())
-            .map_err(|error| HostCallError::Unavailable(format!("host route is invalid: {error}")))?
-            .connect()
-            .await
-            .map_err(|error| {
-                HostCallError::Unavailable(format!("could not connect to actor host: {error}"))
-            })
-    }
-
-    fn request(
-        invocation: ActorInvocation,
-        target: &RoutedActor,
-        read_url: String,
-        token: String,
-    ) -> std::result::Result<Request<HostInvokeActorRequest>, HostCallError> {
-        let mut request = Request::new(HostInvokeActorRequest {
-            invocation: Some(invocation.into()),
-            owner_epoch: target.placement.owner_epoch,
-            state_read_url: read_url,
-            state_version: target.placement.state_version,
-        });
-        request.metadata_mut().insert(
-            "authorization",
-            format!("Bearer {token}")
-                .parse::<MetadataValue<_>>()
-                .map_err(|error| {
-                    HostCallError::Unavailable(format!(
-                        "host credential is invalid metadata: {error}"
-                    ))
-                })?,
-        );
-        Ok(request)
-    }
-}
-
 struct RoutedActor {
     placement: ObjectPlacement,
     lease: HostLease,
     spec: HostLaunchSpec,
-    host_reused: bool,
-}
-
-enum HostCallError {
-    Unavailable(String),
-    OutcomeUnknown(String),
-}
-
-fn actor_execution_outcome(result: &ActorExecutionResult) -> &'static str {
-    match result {
-        ActorExecutionResult::Completed { .. } => "completed",
-        ActorExecutionResult::Failed { .. } => "failed",
-        ActorExecutionResult::Reroute => "reroute",
-        ActorExecutionResult::HostUnavailable => "host_unavailable",
-    }
-}
-
-fn actor_execution_failure_code(result: &ActorExecutionResult) -> Option<&str> {
-    match result {
-        ActorExecutionResult::Failed { failure } => Some(&failure.code),
-        _ => None,
-    }
-}
-
-fn host_call_error_label(error: &HostCallError) -> &'static str {
-    match error {
-        HostCallError::Unavailable(_) => "host_unavailable",
-        HostCallError::OutcomeUnknown(_) => "outcome_unknown",
-    }
-}
-
-fn host_call_error_message(error: &HostCallError) -> &str {
-    match error {
-        HostCallError::Unavailable(message) | HostCallError::OutcomeUnknown(message) => message,
-    }
 }
 
 fn elapsed_ms(started_at: Instant) -> f64 {
     started_at.elapsed().as_secs_f64() * 1_000.0
-}
-
-fn validate_workflow_invocation(
-    principal: &ActorPrincipal,
-    invocation: &ActorInvocation,
-) -> std::result::Result<(), ActorExecutionResult> {
-    invocation.validate().map_err(|error| {
-        failed(
-            "state_error",
-            format!("invalid actor invocation: {error:#}"),
-        )
-    })?;
-    if principal.process_role != ActorProcessRole::Workflow
-        || !principal.scope.contains(&invocation.actor)
-    {
-        return Err(failed(
-            "unauthenticated",
-            "workflow token cannot invoke this actor",
-        ));
-    }
-    Ok(())
 }
 
 fn validate_state_owner(
@@ -1118,25 +778,9 @@ fn validate_state_owner(
     Ok(())
 }
 
-fn host_call_failure(error: HostCallError) -> ActorExecutionResult {
-    match error {
-        HostCallError::Unavailable(message) => failed("unavailable", message),
-        HostCallError::OutcomeUnknown(message) => failed("outcome_unknown", message),
-    }
-}
-
 fn host_matches_revision(host: &HostId, namespace: &str, revision: &str) -> bool {
     host.as_str()
         .starts_with(&format!("host.v1.{namespace}.{revision}."))
-}
-
-fn failed(code: impl Into<String>, message: impl Into<String>) -> ActorExecutionResult {
-    ActorExecutionResult::Failed {
-        failure: ActorInvocationFailure {
-            code: code.into(),
-            message: message.into(),
-        },
-    }
 }
 
 fn validate_host_route(route: &str) -> Result<()> {
@@ -1176,10 +820,6 @@ fn internal(error: impl std::fmt::Display) -> Status {
 mod tests {
     use std::{collections::HashMap, sync::Mutex, time::Duration};
 
-    use aws_lc_rs::{rand::SystemRandom, signature::Ed25519KeyPair};
-    use base64::{Engine, engine::general_purpose::STANDARD};
-    use serde_json::json;
-
     use super::super::{ActorTokenPurpose, admin::LocalAdminRegistry};
     use super::*;
     use crate::{
@@ -1188,6 +828,8 @@ mod tests {
         host_leases::{HostLeaseRegistry, HostLeaseRequest, HostLeaseStatus},
         placement::LocalObjectPlacementStore,
     };
+    use aws_lc_rs::{rand::SystemRandom, signature::Ed25519KeyPair};
+    use base64::{Engine, engine::general_purpose::STANDARD};
 
     struct FakeLeaseStore {
         leases: Mutex<HashMap<HostId, HostLease>>,
@@ -1251,23 +893,6 @@ mod tests {
 
         fn regions(&self) -> Vec<String> {
             vec!["us-east".into()]
-        }
-    }
-
-    struct FakeHostInvoker;
-
-    #[async_trait]
-    impl HostInvoker for FakeHostInvoker {
-        async fn invoke(
-            &self,
-            _invocation: ActorInvocation,
-            _actor: &ActorKey,
-            _target: &RoutedActor,
-        ) -> std::result::Result<InvokeActorReply, HostCallError> {
-            Ok(ActorExecutionResult::Completed {
-                result: json!({ "count": 1 }),
-            }
-            .into())
         }
     }
 
@@ -1417,83 +1042,6 @@ mod tests {
             .await?
             .context("warmup task stopped")?;
         assert_eq!(warmed, (spec, "us-east".into()));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn workflow_routing_uses_the_injected_host_invoker() -> Result<()> {
-        let issuer = test_issuer()?;
-        let auth = ActorJwtVerifier::for_scope(
-            issuer.verifier_keys_json()?,
-            "issuer",
-            "invocation",
-            ActorTokenPurpose::Invocation,
-            Duration::from_secs(60),
-        )?;
-        let host_id = HostId::new("host.v1.project-1.revision-1.host-1");
-        let leases = Arc::new(FakeLeaseStore {
-            leases: Mutex::new(HashMap::from([(
-                host_id.clone(),
-                HostLease {
-                    id: host_id.clone(),
-                    session_id: "session-1".into(),
-                    route: "http://host.invalid/".into(),
-                    expires_at_ms: 10_000,
-                },
-            )])),
-        });
-        let placements = Arc::new(LocalObjectPlacementStore::default());
-        let registry = Arc::new(LocalAdminRegistry::default());
-        let actor = ActorKey {
-            namespace_id: "project-1".into(),
-            actor_type: "Counter".into(),
-            actor_id: "counter-1".into(),
-        };
-        registry
-            .ensure_namespace_and_register_deployment(&HostLaunchSpec {
-                namespace_id: "project-1".into(),
-                code_revision: "revision-1".into(),
-                image_ref: "image-1".into(),
-                working_directory: "/workspace".into(),
-                actor_entrypoint: None,
-            })
-            .await?;
-        placements
-            .claim(&actor.storage_key(), None, &host_id, "us-east")
-            .await?;
-        let service = ControlPlaneService::new(leases, placements, Arc::new(FakeStorageUrls), auth)
-            .with_routing(registry, issuer, None)
-            .with_host_invoker(Arc::new(FakeHostInvoker));
-
-        let result = service
-            .invoke_workflow(
-                ActorPrincipal {
-                    scope: ActorScope {
-                        namespace_id: "project-1".into(),
-                    },
-                    host_id: HostId::new("workflow.v1.project-1.execution-1"),
-                    session_id: uuid::Uuid::new_v4().to_string(),
-                    process_role: ActorProcessRole::Workflow,
-                    region: "auto".into(),
-                    code_revision: None,
-                    expires_at: i64::MAX,
-                    invocation: None,
-                },
-                ActorInvocation {
-                    request_id: "request-1".into(),
-                    actor,
-                    method: "increment".into(),
-                    args: Vec::new(),
-                },
-            )
-            .await;
-
-        assert_eq!(
-            result,
-            ActorExecutionResult::Completed {
-                result: json!({ "count": 1 })
-            }
-        );
         Ok(())
     }
 

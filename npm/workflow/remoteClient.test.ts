@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { createServer } from "node:http"
-import type { IncomingMessage, Server, ServerResponse } from "node:http"
+import type { Server, ServerResponse } from "node:http"
 import { test } from "node:test"
 
 import { ActorInvocationError } from "../shared/errors.js"
@@ -85,24 +85,17 @@ test("does not retry a control-plane transport failure", async () => {
     }
 })
 
-test("falls back to proxied invocation with an older control plane", async () => {
+test("requires the direct actor target endpoint", async () => {
     const calls: string[] = []
-    const server = createServer(async (request, response) => {
+    const server = createServer((request, response) => {
         calls.push(request.url ?? "")
-        if (request.url?.endsWith("/target")) {
-            json(response, 404, { error: { code: "not_found", message: "not found" } })
-            return
-        }
-        const body = JSON.parse(await readBody(request)) as Record<string, unknown>
-        assert.equal(body.method, "increment")
-        assert.deepEqual(body.args, [2])
-        json(response, 200, { result: 7 })
+        json(response, 404, { error: { code: "not_found", message: "not found" } })
     })
     const port = await listen(server)
     const client = new RemoteActorClient({ token: "workflow-token", namespaceId: "project-1", controlPlaneUrl: `http://127.0.0.1:${port}` })
     try {
-        assert.equal(await client.invoke("Counter", "counter-1", "increment", [2]), 7)
-        assert.deepEqual(calls, ["/v1/namespaces/project-1/actors/Counter/counter-1/target", "/v1/namespaces/project-1/actors/Counter/counter-1/invocations"])
+        await assert.rejects(client.invoke("Counter", "counter-1", "increment", [2]), error => error instanceof ActorInvocationError && error.code === "not_found")
+        assert.deepEqual(calls, ["/v1/namespaces/project-1/actors/Counter/counter-1/target"])
     } finally {
         await close(server)
     }
@@ -129,18 +122,6 @@ test("preserves a structured actor failure from HTTP", async () => {
         await close(server)
     }
 })
-
-function readBody(request: IncomingMessage): Promise<string> {
-    return new Promise((resolve, reject) => {
-        let body = ""
-        request.setEncoding("utf8")
-        request.on("data", chunk => {
-            body += chunk
-        })
-        request.once("end", () => resolve(body))
-        request.once("error", reject)
-    })
-}
 
 function json(response: ServerResponse, status: number, body: unknown): void {
     response.writeHead(status, { "content-type": "application/json" })

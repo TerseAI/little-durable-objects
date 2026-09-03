@@ -48,7 +48,7 @@ class RemoteActorClient {
     private readonly requestId: () => string
     private readonly actorHost: ActorHostTransport
     private readonly now: () => number
-    private readonly targets = new Map<string, Promise<ActorHostTarget | undefined>>()
+    private readonly targets = new Map<string, Promise<ActorHostTarget>>()
 
     constructor(options?: DurableObjectsClientOptions, dependencies: RemoteActorClientDependencies = {}) {
         this.environment = dependencies.environment ?? process.env
@@ -66,7 +66,6 @@ class RemoteActorClient {
         }
         const invocation = this.invocation(requestId, actorType, actorId, method, args)
         const target = await this.target(invocation)
-        if (!target) return this.proxied(invocation)
         return this.direct(target, invocation, true)
     }
 
@@ -78,7 +77,6 @@ class RemoteActorClient {
             if (!retryReroute) throw new ActorInvocationError("unavailable", invocation.requestId, "actor ownership changed repeatedly before execution")
             this.targets.delete(actorKey(invocation.actorType, invocation.actorId))
             const rerouted = await this.target(invocation)
-            if (!rerouted) return this.proxied(invocation)
             return this.direct(rerouted, invocation, false)
         } catch (error) {
             if (error instanceof ActorInvocationError || error instanceof ActorProtocolError) throw error
@@ -88,15 +86,11 @@ class RemoteActorClient {
         }
     }
 
-    private async target(invocation: DirectActorInvocation): Promise<ActorHostTarget | undefined> {
+    private async target(invocation: DirectActorInvocation): Promise<ActorHostTarget> {
         const key = actorKey(invocation.actorType, invocation.actorId)
         const current = this.targets.get(key)
         if (current) {
             const target = await current
-            if (!target) {
-                this.targets.delete(key)
-                return undefined
-            }
             if (target.expiresAtMs > this.now() + TARGET_EXPIRATION_SAFETY_MS) return target
             this.targets.delete(key)
         }
@@ -108,7 +102,7 @@ class RemoteActorClient {
         return resolving
     }
 
-    private async resolveTarget(invocation: DirectActorInvocation): Promise<ActorHostTarget | undefined> {
+    private async resolveTarget(invocation: DirectActorInvocation): Promise<ActorHostTarget> {
         let response: Response
         try {
             response = await this.fetchRequest(targetUrl(this.settings, invocation.actorType, invocation.actorId), {
@@ -119,36 +113,11 @@ class RemoteActorClient {
             const message = error instanceof Error ? error.message : String(error)
             throw new ActorInvocationError("outcome_unknown", invocation.requestId, `control-plane HTTP request failed before dispatch: ${message}`)
         }
-        if (response.status === 404 || response.status === 405) return undefined
         const document = await responseDocument(response)
         if (!response.ok) this.throwResponseFailure(response, document, invocation.requestId)
         const target = actorHostTargetSchema.safeParse(document)
         if (!target.success) throw new ActorProtocolError("control-plane response did not contain a valid actor host target")
         return target.data
-    }
-
-    private async proxied(invocation: DirectActorInvocation): Promise<unknown> {
-        let response: Response
-        try {
-            response = await this.fetchRequest(invocationUrl(this.settings, invocation.actorType, invocation.actorId), {
-                method: "POST",
-                headers: {
-                    accept: "application/json",
-                    authorization: `Bearer ${this.settings.token}`,
-                    "content-type": "application/json"
-                },
-                body: JSON.stringify({ requestId: invocation.requestId, method: invocation.method, args: invocation.args })
-            })
-        } catch (error) {
-            const message = error instanceof Error ? error.message : String(error)
-            throw new ActorInvocationError("outcome_unknown", invocation.requestId, `control-plane HTTP request failed after dispatch: ${message}`)
-        }
-        const document = await responseDocument(response)
-        if (response.ok) {
-            if (isObject(document) && Object.hasOwn(document, "result")) return document.result
-            throw new ActorProtocolError("control-plane response did not contain an actor result")
-        }
-        this.throwResponseFailure(response, document, invocation.requestId)
     }
 
     private throwResponseFailure(response: Response, document: unknown, requestId: string): never {
@@ -211,12 +180,6 @@ function validateOrigin(origin: string): string {
     return url.origin
 }
 
-function invocationUrl(settings: RemoteActorSettings, actorType: string, actorId: string): string {
-    const actor = validateActorComponent("actor type", actorType)
-    const id = validateActorComponent("actor ID", actorId)
-    return `${settings.controlPlaneUrl}/v1/namespaces/${encodeURIComponent(settings.namespaceId)}/actors/${encodeURIComponent(actor)}/${encodeURIComponent(id)}/invocations`
-}
-
 function targetUrl(settings: RemoteActorSettings, actorType: string, actorId: string): string {
     const actor = validateActorComponent("actor type", actorType)
     const id = validateActorComponent("actor ID", actorId)
@@ -233,10 +196,6 @@ async function responseDocument(response: Response): Promise<unknown> {
     } catch (error) {
         throw new ActorProtocolError(`control-plane HTTP ${response.status} response was not valid JSON`, { cause: error })
     }
-}
-
-function isObject(value: unknown): value is Record<string, unknown> {
-    return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
 interface RemoteActorSettings {

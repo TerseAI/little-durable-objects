@@ -8,6 +8,11 @@ class SessionCounter extends Actor {
         return this.count
     }
 
+    async sizedResponse(bytes: number): Promise<string> {
+        this.count += 1
+        return "x".repeat(bytes)
+    }
+
     async announceThenSpin(): Promise<never> {
         await SessionCounter.get("worker-start-observer").increment(0)
         return this.spinForever()

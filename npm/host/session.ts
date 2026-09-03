@@ -3,7 +3,7 @@ import { type Socket, createConnection } from "node:net"
 import { z } from "zod"
 
 import { ActorConfigurationError, ActorProtocolError, ActorSessionError } from "../shared/errors.js"
-import { parseActorSessionServerMessage } from "../shared/types.js"
+import { failedReply, parseActorSessionServerMessage } from "../shared/types.js"
 import type { ActorExecutorCommand, ActorExecutorReply, ActorSessionClientMessage } from "../shared/types.js"
 
 import { loadActorEntrypoint, resolveActorEntrypoint } from "./actorModule.js"
@@ -166,11 +166,7 @@ class ActorSessionConnection {
                     this.attachedReject = undefined
                     break
                 case "command":
-                    this.send({
-                        type: "reply",
-                        message_id: message.message_id,
-                        reply: await this.commandHandler(message.command)
-                    })
+                    await this.reply(message.message_id, message.command, await this.commandHandler(message.command))
                     break
                 default:
                     throw message satisfies never
@@ -178,6 +174,20 @@ class ActorSessionConnection {
         } catch (error) {
             this.fail(sessionError(error))
         }
+    }
+
+    private async reply(messageId: number, command: ActorExecutorCommand, reply: ActorExecutorReply): Promise<void> {
+        const message = { type: "reply" as const, message_id: messageId, reply }
+        if (Buffer.byteLength(`${JSON.stringify(message)}\n`) <= MAX_MESSAGE_BYTES) {
+            this.send(message)
+            return
+        }
+        if (command.type === "invoke") await this.commandHandler({ type: "evict", actor: command.actor })
+        this.send({
+            type: "reply",
+            message_id: messageId,
+            reply: failedReply("resource_exhausted", `actor session response exceeds ${MAX_MESSAGE_BYTES} bytes`)
+        })
     }
 
     private send(message: ActorSessionClientMessage): void {

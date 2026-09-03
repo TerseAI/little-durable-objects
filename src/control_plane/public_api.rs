@@ -8,10 +8,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{
-    actor::{ActorExecutionResult, ActorInvocation, ActorInvocationFailure, ActorKey},
-    host::ActorProcessRole,
-};
+use crate::{actor::ActorKey, host::ActorProcessRole};
 
 use super::{
     MAX_CONTROL_PLANE_MESSAGE_BYTES,
@@ -35,10 +32,6 @@ pub(super) fn router(invocations: ControlPlaneService, admin: AdminService) -> R
         .route(
             "/v1/namespaces/{namespace_id}/workflow-tokens",
             post(issue_workflow_token),
-        )
-        .route(
-            "/v1/namespaces/{namespace_id}/actors/{actor_type}/{actor_id}/invocations",
-            post(invoke_actor),
         )
         .route(
             "/v1/namespaces/{namespace_id}/actors/{actor_type}/{actor_id}/target",
@@ -115,55 +108,6 @@ async fn jwks(State(state): State<PublicApiState>) -> Result<Json<Value>, ApiErr
     Ok(Json(document))
 }
 
-async fn invoke_actor(
-    State(state): State<PublicApiState>,
-    Path((namespace_id, actor_type, actor_id)): Path<(String, String, String)>,
-    headers: HeaderMap,
-    Json(request): Json<InvokeActorRequest>,
-) -> Response {
-    let request_id = request.request_id.clone();
-    match invoke_actor_inner(
-        state.invocations,
-        headers,
-        ActorInvocation {
-            request_id: request.request_id,
-            actor: ActorKey {
-                namespace_id,
-                actor_type,
-                actor_id,
-            },
-            method: request.method,
-            args: request.args,
-        },
-    )
-    .await
-    {
-        Ok(result) => invocation_response(&request_id, result),
-        Err(error) => error.with_request_id(request_id).into_response(),
-    }
-}
-
-async fn invoke_actor_inner(
-    service: ControlPlaneService,
-    headers: HeaderMap,
-    invocation: ActorInvocation,
-) -> Result<ActorExecutionResult, ApiError> {
-    invocation.validate().map_err(ApiError::bad_request)?;
-    let principal = authorized_workflow(&service, &headers, &invocation.actor)?;
-
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
-        let _ = reply_tx.send(service.invoke_workflow(principal, invocation).await);
-    });
-    match reply_rx.await {
-        Ok(result) => Ok(result),
-        Err(_) => Ok(failed(
-            "outcome_unknown",
-            "actor invocation task stopped without a reply",
-        )),
-    }
-}
-
 async fn resolve_actor_target(
     State(state): State<PublicApiState>,
     Path((namespace_id, actor_type, actor_id)): Path<(String, String, String)>,
@@ -226,44 +170,6 @@ fn authorization(headers: &HeaderMap) -> Result<&str, ApiError> {
         .map_err(|_| ApiError::unauthorized("bearer credential is invalid"))
 }
 
-fn invocation_response(request_id: &str, result: ActorExecutionResult) -> Response {
-    match result {
-        ActorExecutionResult::Completed { result } => {
-            (StatusCode::OK, Json(InvocationReply { result })).into_response()
-        }
-        ActorExecutionResult::Failed { failure } => {
-            actor_failure(request_id, failure).into_response()
-        }
-        ActorExecutionResult::HostUnavailable => ApiError::unavailable("actor host is draining")
-            .with_request_id(request_id)
-            .into_response(),
-        ActorExecutionResult::Reroute => ApiError::internal("control plane exhausted routing")
-            .with_request_id(request_id)
-            .into_response(),
-    }
-}
-
-fn actor_failure(request_id: &str, failure: ActorInvocationFailure) -> ApiError {
-    let status = match failure.code.as_str() {
-        "unauthenticated" => StatusCode::FORBIDDEN,
-        "resource_exhausted" => StatusCode::TOO_MANY_REQUESTS,
-        "unavailable" => StatusCode::SERVICE_UNAVAILABLE,
-        "outcome_unknown" => StatusCode::BAD_GATEWAY,
-        "actor_error" => StatusCode::UNPROCESSABLE_ENTITY,
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
-    };
-    ApiError::new(status, failure.code, failure.message).with_request_id(request_id)
-}
-
-fn failed(code: impl Into<String>, message: impl Into<String>) -> ActorExecutionResult {
-    ActorExecutionResult::Failed {
-        failure: ActorInvocationFailure {
-            code: code.into(),
-            message: message.into(),
-        },
-    }
-}
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RegisterDeploymentRequest {
@@ -282,14 +188,6 @@ struct IssueWorkflowTokenRequest {
     execution_id: String,
     deadline_unix_ms: i64,
     storage_region: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct InvokeActorRequest {
-    request_id: String,
-    method: String,
-    args: Vec<Value>,
 }
 
 #[derive(Serialize)]
@@ -316,16 +214,10 @@ struct ActorTargetReply {
     expires_at_ms: i64,
 }
 
-#[derive(Serialize)]
-struct InvocationReply {
-    result: Value,
-}
-
 struct ApiError {
     status: StatusCode,
     code: String,
     message: String,
-    request_id: Option<String>,
 }
 
 impl ApiError {
@@ -361,17 +253,11 @@ impl ApiError {
         )
     }
 
-    fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
-        self.request_id = Some(request_id.into());
-        self
-    }
-
     fn new(status: StatusCode, code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             status,
             code: code.into(),
             message: message.into(),
-            request_id: None,
         }
     }
 }
@@ -384,7 +270,6 @@ impl IntoResponse for ApiError {
                 error: ErrorBody {
                     code: self.code,
                     message: self.message,
-                    request_id: self.request_id,
                 },
             }),
         )
@@ -402,8 +287,6 @@ struct ErrorDocument {
 struct ErrorBody {
     code: String,
     message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    request_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -433,20 +316,5 @@ mod tests {
         .unwrap();
 
         assert_eq!(request.warm_region.as_deref(), Some("north-america-west"));
-    }
-
-    #[test]
-    fn maps_distributed_outcomes_to_http_statuses() {
-        assert_eq!(
-            actor_failure(
-                "request-1",
-                ActorInvocationFailure {
-                    code: "outcome_unknown".into(),
-                    message: "unknown".into(),
-                },
-            )
-            .status,
-            StatusCode::BAD_GATEWAY
-        );
     }
 }
