@@ -43,7 +43,21 @@ The Rust-to-Node actor session allows a 32 MiB internal envelope so a 16 MiB act
 
 The sandbox provider translates each canonical home region into one exact Modal GCP region. Actor hosts and Terse workflow sandboxes enable Modal private IPv6 networking, so same-region method invocations connect directly over i6pn. Hosted workflow JWTs explicitly grant private routing; local and older workflow tokens default to public routing so they never receive an unreachable i6pn address. Actor hosts advertise their private gRPC address in the lease and start concurrently with Modal's public HTTP/2 endpoint provisioning; activation never waits for the public route. The public route is resolved lazily and cached by host session for control-plane-dispatched socket lifecycle events.
 
-Both processes emit single-line JSON telemetry. `request_id` correlates direct workflow invocations with `actor_host_invocation` and `actor_state_write` events in Modal. `actor_host_provisioning` separates provider lookup, creation, tunnel, readiness, metadata, and lease-validation latency. Telemetry excludes credentials, signed URLs, arguments, results, and actor state.
+The workflow client, control plane, provider adapter, and actor host emit one completion event per timed operation:
+
+```text
+actor_client_invocation
+    |
+    +---- request_id ----> actor_target_resolution
+    |                          |
+    |                          +---- cold path ----> actor_host_provisioning
+    |                                                   |
+    |                                                   +----> actor_host_startup
+    |
+    +---- request_id ----> actor_host_invocation ----> actor_state_write
+```
+
+Each event uses a process-local monotonic origin and flat `*_at_ms` milestones, with `started_at_ms` equal to zero and `completed_at_ms` marking the observed boundary. Missing milestones identify paths that did not occur: a warm target omits host provisioning, a cached actor state omits download and decode, and an unchanged invocation omits state publication. The provider event separates Rust child-process startup and I/O, Node and Modal SDK loading, resource lookup, sandbox scheduling, readiness observation, route retrieval, metadata persistence, and lease validation. Modal's dashboard remains authoritative for the provider-owned interval between sandbox scheduling and readiness. Events are emitted for successful and failed client, target, startup, invocation, and state-write operations; a provider command failure retains the control-plane completion boundary even when the failed child cannot return its inner milestones. Telemetry excludes credentials, signed URLs, arguments, results, and actor state.
 
 Release images use native builders for each supported architecture:
 

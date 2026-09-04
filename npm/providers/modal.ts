@@ -37,7 +37,7 @@ interface ModalSandboxProviderOptions {
 
 type SandboxAcquisition = { readonly sandbox: Sandbox; readonly reused: boolean }
 type ProvisioningPhases = {
-    -readonly [Key in keyof Omit<ActorHostProvisioning, "provider" | "resourceId" | "reused" | "totalMs">]: ActorHostProvisioning[Key]
+    -readonly [Key in keyof Omit<ActorHostProvisioning, "provider" | "resourceId" | "reused" | "completedAtMs">]: ActorHostProvisioning[Key]
 }
 
 class ModalSandboxProvider implements SandboxProvider {
@@ -123,37 +123,35 @@ class ModalSandboxProvider implements SandboxProvider {
 
     private async ensureHostOnce(request: EnsureHostRequest, name: string): Promise<ActorHostHandle> {
         const startedAt = this.now()
-        const phases = emptyProvisioningPhases()
+        const phases: ProvisioningPhases = { startedAtMs: 0 }
         validateEnsureRequest(request)
         const placement = modalPlacement(request.canonicalRegion, this.options.catalog)
-        const resources = await this.timed(() => Promise.all([this.modal.apps.fromName(this.appName, { createIfMissing: true }), this.modal.images.fromId(request.imageRef)]))
-        phases.resourceLookupMs = resources.durationMs
-        const [app, image] = resources.value
-        const existing = await this.timed(() => this.existing(app, name))
-        phases.existingLookupMs = existing.durationMs
-        if (existing.value) {
-            const handle = await this.reuse(existing.value, request.canonicalRegion, startedAt, phases)
+        const [app, image] = await Promise.all([this.modal.apps.fromName(this.appName, { createIfMissing: true }), this.modal.images.fromId(request.imageRef)])
+        this.mark(phases, "resourcesResolvedAtMs", startedAt)
+        const existing = await this.existing(app, name)
+        this.mark(phases, "existingHostCheckedAtMs", startedAt)
+        if (existing) {
+            const handle = await this.reuse(existing, request.canonicalRegion, startedAt, phases)
             if (handle) return handle
         }
 
-        const acquired = await this.timed(() => this.createSandbox(request, name, app, image, placement))
-        phases.createMs = acquired.durationMs
-        if (acquired.value.reused) {
-            const handle = await this.reuse(acquired.value.sandbox, request.canonicalRegion, startedAt, phases)
+        const acquired = await this.createSandbox(request, name, app, image, placement)
+        this.mark(phases, "sandboxScheduledAtMs", startedAt)
+        if (acquired.reused) {
+            const handle = await this.reuse(acquired.sandbox, request.canonicalRegion, startedAt, phases)
             if (!handle) throw new Error("concurrent Modal V2 host could not be reused")
             return handle
         }
-        return this.activate(acquired.value.sandbox, request, placement, startedAt, phases)
+        return this.activate(acquired.sandbox, request, placement, startedAt, phases)
     }
 
     private async reuse(sandbox: Sandbox, canonicalRegion: string, startedAt: number, phases: ProvisioningPhases): Promise<ActorHostHandle | undefined> {
-        const readyStartedAt = this.now()
         try {
             const handle = await this.readHandle(sandbox, canonicalRegion)
-            phases.readyMs += elapsedMs(readyStartedAt, this.now())
+            this.mark(phases, "hostReadyObservedAtMs", startedAt)
+            this.mark(phases, "routeReadAtMs", startedAt)
             return this.withProvisioning(handle, sandbox, true, startedAt, phases)
         } catch {
-            phases.readyMs += elapsedMs(readyStartedAt, this.now())
             await sandbox.terminate()
             return undefined
         }
@@ -183,11 +181,9 @@ class ModalSandboxProvider implements SandboxProvider {
     }
 
     private async activate(sandbox: Sandbox, request: EnsureHostRequest, placement: ReturnType<typeof modalPlacement>, startedAt: number, phases: ProvisioningPhases): Promise<ActorHostHandle> {
-        const started = placement.privateNetwork ? await this.startPrivate(sandbox, request) : await this.startPublic(sandbox, request)
-        phases.tunnelMs = started.tunnelMs
-        phases.readyMs = started.readyMs
-        const metadata = await this.timed(() => writeMetadata(sandbox, started.handle))
-        phases.metadataMs = metadata.durationMs
+        const started = placement.privateNetwork ? await this.startPrivate(sandbox, request, startedAt, phases) : await this.startPublic(sandbox, request, startedAt, phases)
+        await writeMetadata(sandbox, started.handle)
+        this.mark(phases, "metadataWrittenAtMs", startedAt)
         return this.withProvisioning(started.handle, sandbox, false, startedAt, phases)
     }
 
@@ -213,36 +209,28 @@ class ModalSandboxProvider implements SandboxProvider {
         return handle
     }
 
-    private async startPrivate(sandbox: Sandbox, request: EnsureHostRequest): Promise<StartedHost> {
-        const readyStartedAt = this.now()
-        const route = await this.waitForReady(sandbox, true)
+    private async startPrivate(sandbox: Sandbox, request: EnsureHostRequest, startedAt: number, phases: ProvisioningPhases): Promise<StartedHost> {
+        await this.waitForReady(sandbox)
+        this.mark(phases, "hostReadyObservedAtMs", startedAt)
+        const route = await sandbox.filesystem.readText(hostRouteFile)
+        this.mark(phases, "routeReadAtMs", startedAt)
         if (!route) throw new Error("Modal durable-object host did not publish its private route")
-        return {
-            handle: { hostId: request.hostId, route: route.trim(), canonicalRegion: request.canonicalRegion },
-            tunnelMs: 0,
-            readyMs: elapsedMs(readyStartedAt, this.now())
-        }
+        return { handle: { hostId: request.hostId, route: route.trim(), canonicalRegion: request.canonicalRegion } }
     }
 
-    private async startPublic(sandbox: Sandbox, request: EnsureHostRequest): Promise<StartedHost> {
-        const tunnelStartedAt = this.now()
+    private async startPublic(sandbox: Sandbox, request: EnsureHostRequest, startedAt: number, phases: ProvisioningPhases): Promise<StartedHost> {
         const route = (await sandbox.tunnels())[hostPort]?.url
         if (!route) throw new Error("Modal did not create the durable-object HTTP/2 tunnel")
         await writeFile(sandbox, hostRouteFile, route)
-        const tunnelMs = elapsedMs(tunnelStartedAt, this.now())
-        const readyStartedAt = this.now()
-        await this.waitForReady(sandbox, false)
-        return {
-            handle: { hostId: request.hostId, route, canonicalRegion: request.canonicalRegion },
-            tunnelMs,
-            readyMs: elapsedMs(readyStartedAt, this.now())
-        }
+        this.mark(phases, "routeReadAtMs", startedAt)
+        await this.waitForReady(sandbox)
+        this.mark(phases, "hostReadyObservedAtMs", startedAt)
+        return { handle: { hostId: request.hostId, route, canonicalRegion: request.canonicalRegion } }
     }
 
-    private async waitForReady(sandbox: Sandbox, includeRoute: boolean): Promise<string> {
+    private async waitForReady(sandbox: Sandbox): Promise<void> {
         try {
             await sandbox.waitUntilReady(60_000)
-            return includeRoute ? await sandbox.filesystem.readText(hostRouteFile) : ""
         } catch (error) {
             const detail = await sandbox.filesystem.readText(hostStderrFile).catch(() => "")
             await sandbox.terminate().catch(() => undefined)
@@ -259,15 +247,13 @@ class ModalSandboxProvider implements SandboxProvider {
                 resourceId: sandbox.sandboxId,
                 reused,
                 ...phases,
-                totalMs: elapsedMs(startedAt, this.now())
+                completedAtMs: elapsedMs(startedAt, this.now())
             }
         }
     }
 
-    private async timed<T>(operation: () => Promise<T>): Promise<Timed<T>> {
-        const startedAt = this.now()
-        const value = await operation()
-        return { value, durationMs: elapsedMs(startedAt, this.now()) }
+    private mark(phases: ProvisioningPhases, name: keyof ProvisioningPhases, startedAt: number): void {
+        phases[name] = elapsedMs(startedAt, this.now())
     }
 }
 
@@ -344,31 +330,12 @@ async function writeFile(sandbox: Sandbox, path: string, contents: string): Prom
     await sandbox.filesystem.writeText(contents, path)
 }
 
-function emptyProvisioningPhases(): ProvisioningPhases {
-    return {
-        resourceLookupMs: 0,
-        existingLookupMs: 0,
-        createMs: 0,
-        placementMs: 0,
-        tunnelMs: 0,
-        readyMs: 0,
-        metadataMs: 0
-    }
-}
-
 function elapsedMs(startedAt: number, finishedAt: number): number {
     return Math.max(0, Math.round(finishedAt - startedAt))
 }
 
 interface StartedHost {
     readonly handle: ActorHostHandle
-    readonly tunnelMs: number
-    readonly readyMs: number
-}
-
-interface Timed<T> {
-    readonly value: T
-    readonly durationMs: number
 }
 
 export { ModalSandboxProvider }

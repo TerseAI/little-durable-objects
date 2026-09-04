@@ -22,7 +22,8 @@ use crate::{
     },
     sandbox::{
         EnsureHostRequest, HostSandboxRuntimeConfig, HostTermination, ImageWarmup,
-        PublicHostRouteRequest, SandboxProvider, TerminateHostsRequest, WarmImageRequest,
+        ProviderCommandFailure, PublicHostRouteRequest, SandboxProvider, TerminateHostsRequest,
+        WarmImageRequest,
     },
     storage_urls::{StateWriteTicket, StorageUrlSigner, validate_snapshot_object_name},
 };
@@ -230,12 +231,23 @@ impl ControlPlaneService {
         }
     }
 
+    #[cfg(test)]
     pub(super) async fn resolve_workflow_target(
         &self,
         principal: &ActorPrincipal,
         actor: &ActorKey,
     ) -> Result<WorkflowActorTarget> {
-        self.resolve_workflow_route(principal, actor, WorkflowRoute::Invocation)
+        self.resolve_workflow_route(principal, actor, WorkflowRoute::Invocation, None)
+            .await
+    }
+
+    pub(super) async fn resolve_workflow_target_timed(
+        &self,
+        principal: &ActorPrincipal,
+        actor: &ActorKey,
+        timings: &mut TargetResolutionTimings,
+    ) -> Result<WorkflowActorTarget> {
+        self.resolve_workflow_route(principal, actor, WorkflowRoute::Invocation, Some(timings))
             .await
     }
 
@@ -245,7 +257,12 @@ impl ControlPlaneService {
         invocation: ActorSocketInvocation,
     ) -> Result<Vec<ActorSocketEffect>> {
         let target = self
-            .resolve_workflow_route(principal, &invocation.actor, WorkflowRoute::ControlPlane)
+            .resolve_workflow_route(
+                principal,
+                &invocation.actor,
+                WorkflowRoute::ControlPlane,
+                None,
+            )
             .await?;
         let mut client = ActorHostServiceClient::connect(target.route.clone())
             .await
@@ -324,13 +341,16 @@ impl ControlPlaneService {
         principal: &ActorPrincipal,
         actor: &ActorKey,
         route_kind: WorkflowRoute,
+        mut timings: Option<&mut TargetResolutionTimings>,
     ) -> Result<WorkflowActorTarget> {
         actor.validate()?;
         ensure!(
             principal.process_role == ActorProcessRole::Workflow && principal.scope.contains(actor),
             "workflow token cannot resolve this actor"
         );
-        let target = self.route_actor(actor, &principal.region).await?;
+        let target = self
+            .route_actor(actor, &principal.region, timings.as_deref_mut())
+            .await?;
         let state_read_url = match &target.placement.state_object {
             Some(object_name) => {
                 self.storage_urls
@@ -339,6 +359,9 @@ impl ControlPlaneService {
             }
             None => String::new(),
         };
+        if let Some(timings) = timings.as_deref_mut() {
+            timings.state_url_signed_at_ms = Some(timings.elapsed_ms());
+        }
         let issued = self
             .host_token_issuer
             .as_ref()
@@ -354,6 +377,9 @@ impl ControlPlaneService {
                 &state_read_url,
                 principal.expires_at,
             )?;
+        if let Some(timings) = timings.as_deref_mut() {
+            timings.invocation_token_issued_at_ms = Some(timings.elapsed_ms());
+        }
         let route = match route_kind {
             WorkflowRoute::Invocation
                 if principal.private_routing
@@ -368,6 +394,9 @@ impl ControlPlaneService {
             }
             WorkflowRoute::ControlPlane => self.public_route(&target).await?,
         };
+        if let Some(timings) = timings {
+            timings.route_selected_at_ms = Some(timings.elapsed_ms());
+        }
         Ok(WorkflowActorTarget {
             route,
             token: issued.token,
@@ -412,6 +441,42 @@ pub(super) struct WorkflowActorTarget {
     pub state_version: u64,
     pub state_read_url: String,
     pub expires_at_ms: i64,
+}
+
+pub(super) struct TargetResolutionTimings {
+    started_at: Instant,
+    pub request_validated_at_ms: Option<f64>,
+    pub workflow_authenticated_at_ms: Option<f64>,
+    pub deployment_loaded_at_ms: Option<f64>,
+    pub placement_loaded_at_ms: Option<f64>,
+    pub lease_checked_at_ms: Option<f64>,
+    pub host_ensured_at_ms: Option<f64>,
+    pub placement_claimed_at_ms: Option<f64>,
+    pub state_url_signed_at_ms: Option<f64>,
+    pub invocation_token_issued_at_ms: Option<f64>,
+    pub route_selected_at_ms: Option<f64>,
+}
+
+impl TargetResolutionTimings {
+    pub fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            request_validated_at_ms: None,
+            workflow_authenticated_at_ms: None,
+            deployment_loaded_at_ms: None,
+            placement_loaded_at_ms: None,
+            lease_checked_at_ms: None,
+            host_ensured_at_ms: None,
+            placement_claimed_at_ms: None,
+            state_url_signed_at_ms: None,
+            invocation_token_issued_at_ms: None,
+            route_selected_at_ms: None,
+        }
+    }
+
+    pub fn elapsed_ms(&self) -> f64 {
+        elapsed_ms(self.started_at)
+    }
 }
 
 #[tonic::async_trait]
@@ -617,7 +682,12 @@ impl ControlPlaneService {
             .await
     }
 
-    async fn route_actor(&self, actor: &ActorKey, storage_region: &str) -> Result<RoutedActor> {
+    async fn route_actor(
+        &self,
+        actor: &ActorKey,
+        storage_region: &str,
+        mut timings: Option<&mut TargetResolutionTimings>,
+    ) -> Result<RoutedActor> {
         let routing = self
             .routing
             .as_ref()
@@ -627,9 +697,22 @@ impl ControlPlaneService {
             .launch_spec(&actor.namespace_id)
             .await?
             .context("project has no registered actor code")?;
+        if let Some(timings) = timings.as_deref_mut() {
+            timings.deployment_loaded_at_ms = Some(timings.elapsed_ms());
+        }
         loop {
             let current = self.placements.get(&actor.storage_key()).await?;
-            if let Some(target) = self.active_target(&current, &spec).await? {
+            if let Some(timings) = timings.as_deref_mut() {
+                timings.placement_loaded_at_ms = Some(timings.elapsed_ms());
+            }
+            let lease_checked = current.as_ref().is_some_and(|placement| {
+                host_matches_revision(&placement.owner, &spec.namespace_id, &spec.code_revision)
+            });
+            let active = self.active_target(&current, &spec).await?;
+            if lease_checked && let Some(timings) = timings.as_deref_mut() {
+                timings.lease_checked_at_ms = Some(timings.elapsed_ms());
+            }
+            if let Some(target) = active {
                 return Ok(target);
             }
             let region = self.target_region(current.as_ref(), storage_region)?;
@@ -638,6 +721,9 @@ impl ControlPlaneService {
                 .as_ref()
                 .context("sandbox provider is not configured")?;
             let lease = provisioner.ensure_host(&spec, &region).await?;
+            if let Some(timings) = timings.as_deref_mut() {
+                timings.host_ensured_at_ms = Some(timings.elapsed_ms());
+            }
             match self
                 .placements
                 .claim(&actor.storage_key(), current.as_ref(), &lease.id, &region)
@@ -646,6 +732,9 @@ impl ControlPlaneService {
                 PlacementClaim::Acquired(placement) | PlacementClaim::Current(placement)
                     if placement.owner == lease.id =>
                 {
+                    if let Some(timings) = timings.as_deref_mut() {
+                        timings.placement_claimed_at_ms = Some(timings.elapsed_ms());
+                    }
                     return Ok(RoutedActor {
                         placement,
                         lease,
@@ -788,18 +877,22 @@ impl HostProvisioner for SandboxHostProvisioner {
     async fn ensure_host(&self, spec: &HostLaunchSpec, region: &str) -> Result<HostLease> {
         let started_at = Instant::now();
         let request = self.request(spec, region)?;
-        let provider_started_at = Instant::now();
         let handle = match self.provider.ensure_host(&request).await {
             Ok(handle) => handle,
             Err(error) => {
+                let command = error.downcast_ref::<ProviderCommandFailure>();
                 warn!(
                     event = "actor_host_provisioning",
                     namespace_id = %spec.namespace_id,
                     code_revision = %spec.code_revision,
                     region,
                     host_id = %request.host_id,
-                    provider_command_ms = elapsed_ms(provider_started_at),
-                    total_ms = elapsed_ms(started_at),
+                    started_at_ms = 0,
+                    provider_process_spawned_at_ms = command.and_then(ProviderCommandFailure::spawned_at_ms),
+                    provider_request_written_at_ms = command.and_then(ProviderCommandFailure::request_written_at_ms),
+                    provider_process_completed_at_ms = command.and_then(ProviderCommandFailure::process_completed_at_ms),
+                    provider_response_decoded_at_ms = command.and_then(ProviderCommandFailure::response_decoded_at_ms),
+                    completed_at_ms = elapsed_ms(started_at),
                     outcome = "provider_failed",
                     error = %format!("{error:#}"),
                     "actor host provisioning failed"
@@ -807,11 +900,9 @@ impl HostProvisioner for SandboxHostProvisioner {
                 return Err(error);
             }
         };
-        let provider_command_ms = elapsed_ms(provider_started_at);
         let provisioning = handle.provisioning.clone();
-        let lease_started_at = Instant::now();
         let lease = self.active_lease(handle, region).await?;
-        let lease_validation_ms = elapsed_ms(lease_started_at);
+        let lease_validated_at_ms = elapsed_ms(started_at);
         info!(
             event = "actor_host_provisioning",
             namespace_id = %spec.namespace_id,
@@ -821,17 +912,23 @@ impl HostProvisioner for SandboxHostProvisioner {
             provider = provisioning.as_ref().map(|value| value.provider.as_str()).unwrap_or("unknown"),
             provider_resource_id = provisioning.as_ref().map(|value| value.resource_id.as_str()).unwrap_or(""),
             provider_reused = provisioning.as_ref().is_some_and(|value| value.reused),
-            provider_resource_lookup_ms = provisioning.as_ref().map_or(0, |value| value.resource_lookup_ms),
-            provider_existing_lookup_ms = provisioning.as_ref().map_or(0, |value| value.existing_lookup_ms),
-            provider_create_ms = provisioning.as_ref().map_or(0, |value| value.create_ms),
-            provider_placement_ms = provisioning.as_ref().map_or(0, |value| value.placement_ms),
-            provider_tunnel_ms = provisioning.as_ref().map_or(0, |value| value.tunnel_ms),
-            provider_ready_ms = provisioning.as_ref().map_or(0, |value| value.ready_ms),
-            provider_metadata_ms = provisioning.as_ref().map_or(0, |value| value.metadata_ms),
-            provider_total_ms = provisioning.as_ref().map_or(0, |value| value.total_ms),
-            provider_command_ms,
-            lease_validation_ms,
-            total_ms = elapsed_ms(started_at),
+            started_at_ms = 0,
+            provider_process_spawned_at_ms = provisioning.as_ref().and_then(|value| value.command_spawned_at_ms),
+            provider_request_written_at_ms = provisioning.as_ref().and_then(|value| value.request_written_at_ms),
+            provider_process_completed_at_ms = provisioning.as_ref().and_then(|value| value.process_completed_at_ms),
+            provider_response_decoded_at_ms = provisioning.as_ref().and_then(|value| value.response_decoded_at_ms),
+            modal_provider_started_at_ms = provisioning.as_ref().map(|value| value.started_at_ms),
+            modal_input_parsed_at_ms = provisioning.as_ref().and_then(|value| value.input_parsed_at_ms),
+            modal_sdk_loaded_at_ms = provisioning.as_ref().and_then(|value| value.sdk_loaded_at_ms),
+            modal_resources_resolved_at_ms = provisioning.as_ref().and_then(|value| value.resources_resolved_at_ms),
+            modal_existing_host_checked_at_ms = provisioning.as_ref().and_then(|value| value.existing_host_checked_at_ms),
+            modal_sandbox_scheduled_at_ms = provisioning.as_ref().and_then(|value| value.sandbox_scheduled_at_ms),
+            modal_host_ready_observed_at_ms = provisioning.as_ref().and_then(|value| value.host_ready_observed_at_ms),
+            modal_route_read_at_ms = provisioning.as_ref().and_then(|value| value.route_read_at_ms),
+            modal_metadata_written_at_ms = provisioning.as_ref().and_then(|value| value.metadata_written_at_ms),
+            modal_provider_completed_at_ms = provisioning.as_ref().map(|value| value.completed_at_ms),
+            lease_validated_at_ms,
+            completed_at_ms = elapsed_ms(started_at),
             outcome = "ready",
             "actor host provisioning completed"
         );

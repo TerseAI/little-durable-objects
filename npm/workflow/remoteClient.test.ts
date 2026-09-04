@@ -11,11 +11,13 @@ import { RemoteActorClient } from "./remoteClient.js"
 test("remote actor client resolves once and invokes the actor host directly", async () => {
     let resolutions = 0
     const hostInvocations: unknown[] = []
+    const telemetry: unknown[] = []
     const server = createServer(async (request, response) => {
         resolutions += 1
         assert.equal(request.method, "POST")
         assert.equal(request.url, "/v1/namespaces/project-1/actors/Counter/counter-1/target")
         assert.equal(request.headers.authorization, "Bearer workflow-token")
+        assert.equal(request.headers["x-request-id"], "00000000-0000-4000-8000-000000000000")
         json(response, 200, {
             route: "https://actor.example.com",
             token: "direct-token",
@@ -39,7 +41,9 @@ test("remote actor client resolves once and invokes the actor host directly", as
                     hostInvocations.push({ target, invocation })
                     return { type: "completed", result: 7, effects: [] }
                 }
-            }
+            },
+            monotonicNow: tickingClock(),
+            telemetry: event => telemetry.push(event)
         }
     )
     try {
@@ -47,6 +51,40 @@ test("remote actor client resolves once and invokes the actor host directly", as
         assert.equal(await client.invoke("Counter", "counter-1", "increment", [3]), 7)
         assert.equal(resolutions, 1)
         assert.equal(hostInvocations.length, 2)
+        assert.deepEqual(telemetry, [
+            {
+                event: "actor_client_invocation",
+                request_id: "00000000-0000-4000-8000-000000000000",
+                namespace_id: "project-1",
+                actor_type: "Counter",
+                actor_id: "counter-1",
+                method: "increment",
+                started_at_ms: 0,
+                invocation_built_at_ms: 1,
+                target_cache_checked_at_ms: 2,
+                target_resolved_at_ms: 3,
+                host_rpc_completed_at_ms: 4,
+                socket_effects_completed_at_ms: 5,
+                completed_at_ms: 6,
+                outcome: "completed"
+            },
+            {
+                event: "actor_client_invocation",
+                request_id: "00000000-0000-4000-8000-000000000000",
+                namespace_id: "project-1",
+                actor_type: "Counter",
+                actor_id: "counter-1",
+                method: "increment",
+                started_at_ms: 0,
+                invocation_built_at_ms: 1,
+                target_cache_checked_at_ms: 2,
+                target_resolved_at_ms: 3,
+                host_rpc_completed_at_ms: 4,
+                socket_effects_completed_at_ms: 5,
+                completed_at_ms: 6,
+                outcome: "completed"
+            }
+        ])
         assert.deepEqual(hostInvocations[0], {
             target: {
                 route: "https://actor.example.com",
@@ -235,4 +273,9 @@ function fakeConnection(): ActorConnection {
         addEventListener: () => undefined,
         removeEventListener: () => undefined
     }
+}
+
+function tickingClock(): () => number {
+    let current = 0
+    return () => current++
 }

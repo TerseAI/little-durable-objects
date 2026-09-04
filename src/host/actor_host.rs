@@ -150,8 +150,7 @@ impl ActorHost {
         state_version: u64,
         state_read_url: String,
     ) -> Result<ActorExecutionResult> {
-        let started_at = Instant::now();
-        let mut timings = InvocationTimings::default();
+        let mut timings = InvocationTimings::new();
         let outcome = self
             .invoke_actor_once(
                 &invocation,
@@ -161,7 +160,7 @@ impl ActorHost {
                 &mut timings,
             )
             .await;
-        self.log_invocation(&invocation, started_at, &timings, &outcome);
+        self.log_invocation(&invocation, &timings, &outcome);
         outcome
     }
 
@@ -172,17 +171,41 @@ impl ActorHost {
         state_version: u64,
         state_read_url: String,
     ) -> Result<ActorSocketExecutionResult> {
-        let disconnecting = matches!(
-            &invocation.event,
-            crate::actor::ActorSocketEvent::Disconnect { .. }
-        );
         let persistence = ActorInvocation {
             request_id: invocation.request_id.clone(),
             actor: invocation.actor.clone(),
             method: socket_event_name(&invocation.event).into(),
             args: Vec::new(),
         };
-        if let Some(result) = self.validate_operation(&persistence, disconnecting)? {
+        let mut timings = InvocationTimings::new();
+        let outcome = self
+            .handle_socket_event_once(
+                invocation,
+                owner_epoch,
+                state_version,
+                &state_read_url,
+                &persistence,
+                &mut timings,
+            )
+            .await;
+        self.log_socket_invocation(&persistence, &timings, &outcome);
+        outcome
+    }
+
+    async fn handle_socket_event_once(
+        &self,
+        invocation: ActorSocketInvocation,
+        owner_epoch: u64,
+        state_version: u64,
+        state_read_url: &str,
+        persistence: &ActorInvocation,
+        timings: &mut InvocationTimings,
+    ) -> Result<ActorSocketExecutionResult> {
+        let disconnecting = matches!(
+            &invocation.event,
+            crate::actor::ActorSocketEvent::Disconnect { .. }
+        );
+        if let Some(result) = self.validate_operation(persistence, disconnecting)? {
             return Ok(ActorSocketExecutionResult::from_actor_result(result));
         }
         let _activity = ActivityGuard::begin(self);
@@ -193,15 +216,16 @@ impl ActorHost {
                 return Ok(ActorSocketExecutionResult::HostUnavailable);
             }
         };
+        timings.queue_admitted_at_ms = Some(timings.elapsed_ms());
         if !disconnecting && !self.accepting.load(Ordering::SeqCst) {
             return Ok(ActorSocketExecutionResult::HostUnavailable);
         }
 
         let mut cached = self
-            .take_or_load_state(&object, owner_epoch, state_version, &state_read_url)
+            .take_or_load_state(&object, owner_epoch, state_version, state_read_url, timings)
             .await?;
         if self
-            .finish_pending_commit(&persistence, &mut cached)
+            .finish_pending_commit(persistence, &mut cached)
             .await
             .is_err()
         {
@@ -210,12 +234,14 @@ impl ActorHost {
                 failure: ActorInvocationFailure::outcome_unknown_after_execution(),
             });
         }
+        timings.pending_commit_resolved_at_ms = Some(timings.elapsed_ms());
         let outcome = self
             .execute_socket_event(ActorSocketInvocation {
                 state: cached.state().cloned(),
                 ..invocation
             })
             .await;
+        timings.actor_execution_completed_at_ms = Some(timings.elapsed_ms());
         let (next_state, effects) = match outcome {
             Ok(outcome) => outcome,
             Err(result) => {
@@ -229,13 +255,14 @@ impl ActorHost {
         }
         let published = self
             .publish_result(
-                &persistence,
+                persistence,
                 owner_epoch,
                 &mut cached,
                 Value::Null,
                 next_state,
             )
             .await;
+        timings.state_publication_completed_at_ms = Some(timings.elapsed_ms());
         if published.is_err() {
             self.evict(&persistence.actor).await;
         }
@@ -264,21 +291,18 @@ impl ActorHost {
         }
         let _activity = ActivityGuard::begin(self);
         let object = invocation.actor.storage_key();
-        let queue_started_at = Instant::now();
         let _execution = match self.executions.admit(&object).await? {
             ActorExecutionAdmission::Acquired(guard) => guard,
             ActorExecutionAdmission::Full => return Ok(ActorExecutionResult::HostUnavailable),
         };
-        timings.queue_ms = elapsed_ms(queue_started_at);
+        timings.queue_admitted_at_ms = Some(timings.elapsed_ms());
         if !self.accepting.load(Ordering::SeqCst) {
             return Ok(ActorExecutionResult::HostUnavailable);
         }
 
-        let state_load_started_at = Instant::now();
         let mut cached = self
-            .take_or_load_state(&object, owner_epoch, state_version, state_read_url)
+            .take_or_load_state(&object, owner_epoch, state_version, state_read_url, timings)
             .await?;
-        timings.state_load_ms = elapsed_ms(state_load_started_at);
         if let Err(error) = self.finish_pending_commit(invocation, &mut cached).await {
             self.store_cached_state(object, cached)?;
             warn!(
@@ -290,6 +314,7 @@ impl ActorHost {
                 failure: ActorInvocationFailure::outcome_unknown_after_execution(),
             });
         }
+        timings.pending_commit_resolved_at_ms = Some(timings.elapsed_ms());
         if let Some(result) = cached.replay(&invocation.request_id) {
             self.store_cached_state(object, cached)?;
             return Ok(ActorExecutionResult::Completed {
@@ -298,11 +323,10 @@ impl ActorHost {
             });
         }
 
-        let execution_started_at = Instant::now();
         let executed = self
             .execute_method(invocation, cached.state(), Vec::new())
             .await;
-        timings.actor_execution_ms = elapsed_ms(execution_started_at);
+        timings.actor_execution_completed_at_ms = Some(timings.elapsed_ms());
         let (result, next_state, effects) = match executed {
             Ok(outcome) => outcome,
             Err(failure) => {
@@ -315,11 +339,10 @@ impl ActorHost {
             return Ok(ActorExecutionResult::Completed { result, effects });
         }
 
-        let state_publish_started_at = Instant::now();
         let published = self
             .publish_result(invocation, owner_epoch, &mut cached, result, next_state)
             .await;
-        timings.state_publish_ms = elapsed_ms(state_publish_started_at);
+        timings.state_publication_completed_at_ms = Some(timings.elapsed_ms());
         if published.is_err() {
             self.evict(&invocation.actor).await;
         }
@@ -348,8 +371,11 @@ impl ActorHost {
         owner_epoch: u64,
         state_version: u64,
         state_read_url: &str,
+        timings: &mut InvocationTimings,
     ) -> Result<CachedActorState> {
-        if let Some(cached) = self.take_cached_state(object)?
+        let cached = self.take_cached_state(object)?;
+        timings.state_cache_checked_at_ms = Some(timings.elapsed_ms());
+        if let Some(cached) = cached
             && cached.owner_epoch == owner_epoch
         {
             return Ok(cached);
@@ -370,7 +396,10 @@ impl ActorHost {
             .read(state_read_url)
             .await
             .context("load actor state")?;
-        CachedActorState::from_loaded(owner_epoch, state_version, loaded)
+        timings.state_downloaded_at_ms = Some(timings.elapsed_ms());
+        let cached = CachedActorState::from_loaded(owner_epoch, state_version, loaded)?;
+        timings.state_decoded_at_ms = Some(timings.elapsed_ms());
+        Ok(cached)
     }
 
     fn take_cached_state(&self, object: &ActorStorageKey) -> Result<Option<CachedActorState>> {
@@ -479,12 +508,35 @@ impl ActorHost {
         result: Value,
         next_state: Value,
     ) -> Result<ActorExecutionResult> {
-        let started_at = Instant::now();
+        let mut timings = StateWriteTimings::new();
+        let next_version = cached.state_version.checked_add(1);
+        let outcome = self
+            .publish_result_once(
+                invocation,
+                owner_epoch,
+                cached,
+                result,
+                next_state,
+                &mut timings,
+            )
+            .await;
+        self.log_state_write(invocation, owner_epoch, next_version, &timings, &outcome);
+        outcome
+    }
+
+    async fn publish_result_once(
+        &self,
+        invocation: &ActorInvocation,
+        owner_epoch: u64,
+        cached: &mut CachedActorState,
+        result: Value,
+        next_state: Value,
+        timings: &mut StateWriteTimings,
+    ) -> Result<ActorExecutionResult> {
         let next_version = cached
             .state_version
             .checked_add(1)
             .context("actor state version overflow")?;
-        let prepare_started_at = Instant::now();
         let ticket = match cached.next_write.take() {
             Some(ticket)
                 if ticket.state_version == next_version
@@ -510,7 +562,7 @@ impl ActorHost {
             ticket.state_version == next_version,
             "state write ticket has the wrong version"
         );
-        let prepare_ms = elapsed_ms(prepare_started_at);
+        timings.write_ticket_ready_at_ms = Some(timings.elapsed_ms());
         let snapshot = StateSnapshot::new(
             next_version,
             owner_epoch,
@@ -518,41 +570,73 @@ impl ActorHost {
             next_state,
             result.clone(),
         )?;
-        let encode_started_at = Instant::now();
+        timings.snapshot_created_at_ms = Some(timings.elapsed_ms());
         let bytes = snapshot.encode()?;
-        let encode_ms = elapsed_ms(encode_started_at);
-        let storage_started_at = Instant::now();
+        timings.snapshot_encoded_at_ms = Some(timings.elapsed_ms());
         let write = self.state.write(&ticket.url, bytes).await?;
-        let storage_ms = elapsed_ms(storage_started_at);
+        timings.snapshot_uploaded_at_ms = Some(timings.elapsed_ms());
         ensure!(
             matches!(write, StateWrite::Written | StateWrite::AlreadyExists),
             "actor snapshot was not stored"
         );
         cached.pending = Some(PendingStateCommit { snapshot, ticket });
-        let commit_started_at = Instant::now();
         self.finish_pending_commit(invocation, cached).await?;
-        let commit_ms = elapsed_ms(commit_started_at);
-        info!(
-            event = "actor_state_write",
-            request_id = %invocation.request_id,
-            namespace_id = %invocation.actor.namespace_id,
-            actor_type = %invocation.actor.actor_type,
-            actor_id = %invocation.actor.actor_id,
-            host_id = %self.endpoint.id,
-            owner_epoch,
-            state_version = next_version,
-            prepare_ms,
-            encode_ms,
-            storage_ms,
-            commit_ms,
-            total_ms = elapsed_ms(started_at),
-            outcome = "committed",
-            "immutable actor state committed"
-        );
+        timings.commit_rpc_completed_at_ms = Some(timings.elapsed_ms());
         Ok(ActorExecutionResult::Completed {
             result,
             effects: Vec::new(),
         })
+    }
+
+    fn log_state_write(
+        &self,
+        invocation: &ActorInvocation,
+        owner_epoch: u64,
+        state_version: Option<u64>,
+        timings: &StateWriteTimings,
+        outcome: &Result<ActorExecutionResult>,
+    ) {
+        match outcome {
+            Ok(_) => info!(
+                event = "actor_state_write",
+                request_id = %invocation.request_id,
+                namespace_id = %invocation.actor.namespace_id,
+                actor_type = %invocation.actor.actor_type,
+                actor_id = %invocation.actor.actor_id,
+                host_id = %self.endpoint.id,
+                owner_epoch,
+                state_version,
+                started_at_ms = 0,
+                write_ticket_ready_at_ms = timings.write_ticket_ready_at_ms,
+                snapshot_created_at_ms = timings.snapshot_created_at_ms,
+                snapshot_encoded_at_ms = timings.snapshot_encoded_at_ms,
+                snapshot_uploaded_at_ms = timings.snapshot_uploaded_at_ms,
+                commit_rpc_completed_at_ms = timings.commit_rpc_completed_at_ms,
+                completed_at_ms = timings.elapsed_ms(),
+                outcome = "committed",
+                "immutable actor state committed"
+            ),
+            Err(error) => warn!(
+                event = "actor_state_write",
+                request_id = %invocation.request_id,
+                namespace_id = %invocation.actor.namespace_id,
+                actor_type = %invocation.actor.actor_type,
+                actor_id = %invocation.actor.actor_id,
+                host_id = %self.endpoint.id,
+                owner_epoch,
+                state_version,
+                started_at_ms = 0,
+                write_ticket_ready_at_ms = timings.write_ticket_ready_at_ms,
+                snapshot_created_at_ms = timings.snapshot_created_at_ms,
+                snapshot_encoded_at_ms = timings.snapshot_encoded_at_ms,
+                snapshot_uploaded_at_ms = timings.snapshot_uploaded_at_ms,
+                commit_rpc_completed_at_ms = timings.commit_rpc_completed_at_ms,
+                completed_at_ms = timings.elapsed_ms(),
+                outcome = "failed",
+                error = %format!("{error:#}"),
+                "immutable actor state commit failed"
+            ),
+        }
     }
 
     async fn finish_pending_commit(
@@ -590,46 +674,81 @@ impl ActorHost {
     fn log_invocation(
         &self,
         invocation: &ActorInvocation,
-        started_at: Instant,
         timings: &InvocationTimings,
         outcome: &Result<ActorExecutionResult>,
     ) {
         match outcome {
-            Ok(result) => info!(
-                event = "actor_host_invocation",
-                request_id = %invocation.request_id,
-                namespace_id = %invocation.actor.namespace_id,
-                actor_type = %invocation.actor.actor_type,
-                actor_id = %invocation.actor.actor_id,
-                method = %invocation.method,
-                host_id = %self.endpoint.id,
-                queue_ms = timings.queue_ms,
-                state_load_ms = timings.state_load_ms,
-                actor_execution_ms = timings.actor_execution_ms,
-                state_publish_ms = timings.state_publish_ms,
-                total_ms = elapsed_ms(started_at),
-                outcome = actor_execution_outcome(result),
-                failure_code = actor_execution_failure_code(result).unwrap_or(""),
-                "actor host invocation completed"
+            Ok(result) => self.log_invocation_result(
+                invocation,
+                timings,
+                actor_execution_outcome(result),
+                actor_execution_failure_code(result).unwrap_or(""),
+                None,
             ),
-            Err(error) => warn!(
-                event = "actor_host_invocation",
-                request_id = %invocation.request_id,
-                namespace_id = %invocation.actor.namespace_id,
-                actor_type = %invocation.actor.actor_type,
-                actor_id = %invocation.actor.actor_id,
-                method = %invocation.method,
-                host_id = %self.endpoint.id,
-                queue_ms = timings.queue_ms,
-                state_load_ms = timings.state_load_ms,
-                actor_execution_ms = timings.actor_execution_ms,
-                state_publish_ms = timings.state_publish_ms,
-                total_ms = elapsed_ms(started_at),
-                outcome = "host_error",
-                error = %format!("{error:#}"),
-                "actor host invocation failed"
+            Err(error) => self.log_invocation_result(
+                invocation,
+                timings,
+                "host_error",
+                "",
+                Some(format!("{error:#}")),
             ),
         }
+    }
+
+    fn log_socket_invocation(
+        &self,
+        invocation: &ActorInvocation,
+        timings: &InvocationTimings,
+        outcome: &Result<ActorSocketExecutionResult>,
+    ) {
+        match outcome {
+            Ok(result) => self.log_invocation_result(
+                invocation,
+                timings,
+                socket_execution_outcome(result),
+                socket_execution_failure_code(result).unwrap_or(""),
+                None,
+            ),
+            Err(error) => self.log_invocation_result(
+                invocation,
+                timings,
+                "host_error",
+                "",
+                Some(format!("{error:#}")),
+            ),
+        }
+    }
+
+    fn log_invocation_result(
+        &self,
+        invocation: &ActorInvocation,
+        timings: &InvocationTimings,
+        outcome: &str,
+        failure_code: &str,
+        error: Option<String>,
+    ) {
+        info!(
+                event = "actor_host_invocation",
+                request_id = %invocation.request_id,
+                namespace_id = %invocation.actor.namespace_id,
+                actor_type = %invocation.actor.actor_type,
+                actor_id = %invocation.actor.actor_id,
+                method = %invocation.method,
+                host_id = %self.endpoint.id,
+                started_at_ms = 0,
+                queue_admitted_at_ms = timings.queue_admitted_at_ms,
+                state_cache_checked_at_ms = timings.state_cache_checked_at_ms,
+                state_downloaded_at_ms = timings.state_downloaded_at_ms,
+                state_decoded_at_ms = timings.state_decoded_at_ms,
+                pending_commit_resolved_at_ms = timings.pending_commit_resolved_at_ms,
+                actor_execution_completed_at_ms = timings.actor_execution_completed_at_ms,
+                state_publication_completed_at_ms = timings.state_publication_completed_at_ms,
+                completed_at_ms = timings.elapsed_ms(),
+                outcome,
+                failure_code,
+                error,
+                "actor host invocation completed"
+        );
     }
 
     pub(crate) async fn drain(&self, timeout: Duration) -> Result<()> {
@@ -753,20 +872,21 @@ impl CachedActorState {
     }
 
     fn from_loaded(owner_epoch: u64, state_version: u64, loaded: LoadedState) -> Result<Self> {
+        let snapshot = StateSnapshot::decode(&loaded.bytes)?;
         ensure!(
-            loaded.snapshot.state_version == state_version,
+            snapshot.state_version == state_version,
             "actor snapshot version does not match its state head"
         );
         ensure!(
-            loaded.snapshot.owner_epoch <= owner_epoch,
+            snapshot.owner_epoch <= owner_epoch,
             "actor snapshot belongs to a newer owner epoch"
         );
         Ok(Self {
             owner_epoch,
             state_version,
-            state: Some(loaded.snapshot.state),
-            last_request_id: Some(loaded.snapshot.request_id),
-            last_result: Some(loaded.snapshot.result),
+            state: Some(snapshot.state),
+            last_request_id: Some(snapshot.request_id),
+            last_result: Some(snapshot.result),
             next_write: None,
             pending: None,
         })
@@ -783,12 +903,60 @@ impl CachedActorState {
     }
 }
 
-#[derive(Default)]
 struct InvocationTimings {
-    queue_ms: f64,
-    state_load_ms: f64,
-    actor_execution_ms: f64,
-    state_publish_ms: f64,
+    started_at: Instant,
+    queue_admitted_at_ms: Option<f64>,
+    state_cache_checked_at_ms: Option<f64>,
+    state_downloaded_at_ms: Option<f64>,
+    state_decoded_at_ms: Option<f64>,
+    pending_commit_resolved_at_ms: Option<f64>,
+    actor_execution_completed_at_ms: Option<f64>,
+    state_publication_completed_at_ms: Option<f64>,
+}
+
+impl InvocationTimings {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            queue_admitted_at_ms: None,
+            state_cache_checked_at_ms: None,
+            state_downloaded_at_ms: None,
+            state_decoded_at_ms: None,
+            pending_commit_resolved_at_ms: None,
+            actor_execution_completed_at_ms: None,
+            state_publication_completed_at_ms: None,
+        }
+    }
+
+    fn elapsed_ms(&self) -> f64 {
+        elapsed_ms(self.started_at)
+    }
+}
+
+struct StateWriteTimings {
+    started_at: Instant,
+    write_ticket_ready_at_ms: Option<f64>,
+    snapshot_created_at_ms: Option<f64>,
+    snapshot_encoded_at_ms: Option<f64>,
+    snapshot_uploaded_at_ms: Option<f64>,
+    commit_rpc_completed_at_ms: Option<f64>,
+}
+
+impl StateWriteTimings {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            write_ticket_ready_at_ms: None,
+            snapshot_created_at_ms: None,
+            snapshot_encoded_at_ms: None,
+            snapshot_uploaded_at_ms: None,
+            commit_rpc_completed_at_ms: None,
+        }
+    }
+
+    fn elapsed_ms(&self) -> f64 {
+        elapsed_ms(self.started_at)
+    }
 }
 
 fn actor_execution_outcome(result: &ActorExecutionResult) -> &'static str {
@@ -803,6 +971,21 @@ fn actor_execution_outcome(result: &ActorExecutionResult) -> &'static str {
 fn actor_execution_failure_code(result: &ActorExecutionResult) -> Option<&str> {
     match result {
         ActorExecutionResult::Failed { failure } => Some(&failure.code),
+        _ => None,
+    }
+}
+
+fn socket_execution_outcome(result: &ActorSocketExecutionResult) -> &'static str {
+    match result {
+        ActorSocketExecutionResult::Handled { .. } => "completed",
+        ActorSocketExecutionResult::Failed { .. } => "failed",
+        ActorSocketExecutionResult::HostUnavailable => "host_unavailable",
+    }
+}
+
+fn socket_execution_failure_code(result: &ActorSocketExecutionResult) -> Option<&str> {
+    match result {
+        ActorSocketExecutionResult::Failed { failure } => Some(&failure.code),
         _ => None,
     }
 }

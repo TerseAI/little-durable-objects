@@ -27,14 +27,16 @@ interface ActorHostProvisioning {
     readonly provider: string
     readonly resourceId: string
     readonly reused: boolean
-    readonly resourceLookupMs: number
-    readonly existingLookupMs: number
-    readonly createMs: number
-    readonly placementMs: number
-    readonly tunnelMs: number
-    readonly readyMs: number
-    readonly metadataMs: number
-    readonly totalMs: number
+    readonly startedAtMs: number
+    readonly inputParsedAtMs?: number
+    readonly sdkLoadedAtMs?: number
+    readonly resourcesResolvedAtMs?: number
+    readonly existingHostCheckedAtMs?: number
+    readonly sandboxScheduledAtMs?: number
+    readonly hostReadyObservedAtMs?: number
+    readonly routeReadAtMs?: number
+    readonly metadataWrittenAtMs?: number
+    readonly completedAtMs: number
 }
 
 interface WarmImageRequest {

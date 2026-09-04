@@ -153,14 +153,14 @@ test("creates a V2 Modal sandbox with the host as its main process and reports p
             provider: "modal",
             resourceId: "sb-v2-actor",
             reused: false,
-            resourceLookupMs: 0,
-            existingLookupMs: 0,
-            createMs: 0,
-            placementMs: 0,
-            tunnelMs: 0,
-            readyMs: 0,
-            metadataMs: 0,
-            totalMs: 0
+            startedAtMs: 0,
+            resourcesResolvedAtMs: 0,
+            existingHostCheckedAtMs: 0,
+            sandboxScheduledAtMs: 0,
+            hostReadyObservedAtMs: 0,
+            routeReadAtMs: 0,
+            metadataWrittenAtMs: 0,
+            completedAtMs: 0
         }
     })
     assert.equal(usedLegacyCreate, false)

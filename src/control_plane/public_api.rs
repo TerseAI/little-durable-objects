@@ -7,13 +7,14 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tracing::{info, warn};
 
 use crate::{actor::ActorKey, host::ActorProcessRole};
 
 use super::{
     MAX_CONTROL_PLANE_MESSAGE_BYTES,
     admin::{AdminService, HostLaunchSpec},
-    service::ControlPlaneService,
+    service::{ControlPlaneService, TargetResolutionTimings},
 };
 
 #[derive(Clone)]
@@ -119,26 +120,87 @@ async fn resolve_actor_target(
     Path((namespace_id, actor_type, actor_id)): Path<(String, String, String)>,
     headers: HeaderMap,
 ) -> Result<Json<ActorTargetReply>, ApiError> {
+    let mut timings = TargetResolutionTimings::new();
+    let request_id = headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
     let actor = ActorKey {
         namespace_id,
         actor_type,
         actor_id,
     };
-    actor.validate().map_err(ApiError::bad_request)?;
-    let principal = authorized_workflow(&state.invocations, &headers, &actor)?;
-    let target = state
-        .invocations
-        .resolve_workflow_target(&principal, &actor)
-        .await
-        .map_err(|error| ApiError::unavailable(format!("actor host is unavailable: {error:#}")))?;
-    Ok(Json(ActorTargetReply {
-        route: target.route,
-        token: target.token,
-        owner_epoch: target.owner_epoch,
-        state_version: target.state_version,
-        state_read_url: target.state_read_url,
-        expires_at_ms: target.expires_at_ms,
-    }))
+    let result: Result<Json<ActorTargetReply>, ApiError> = async {
+        actor.validate().map_err(ApiError::bad_request)?;
+        timings.request_validated_at_ms = Some(timings.elapsed_ms());
+        let principal = authorized_workflow(&state.invocations, &headers, &actor)?;
+        timings.workflow_authenticated_at_ms = Some(timings.elapsed_ms());
+        let target = state
+            .invocations
+            .resolve_workflow_target_timed(&principal, &actor, &mut timings)
+            .await
+            .map_err(|error| {
+                ApiError::unavailable(format!("actor host is unavailable: {error:#}"))
+            })?;
+        Ok(Json(ActorTargetReply {
+            route: target.route,
+            token: target.token,
+            owner_epoch: target.owner_epoch,
+            state_version: target.state_version,
+            state_read_url: target.state_read_url,
+            expires_at_ms: target.expires_at_ms,
+        }))
+    }
+    .await;
+    let completed_at_ms = timings.elapsed_ms();
+    match &result {
+        Ok(_) => info!(
+            event = "actor_target_resolution",
+            request_id,
+            namespace_id = %actor.namespace_id,
+            actor_type = %actor.actor_type,
+            actor_id = %actor.actor_id,
+            started_at_ms = 0,
+            request_validated_at_ms = timings.request_validated_at_ms,
+            workflow_authenticated_at_ms = timings.workflow_authenticated_at_ms,
+            deployment_loaded_at_ms = timings.deployment_loaded_at_ms,
+            placement_loaded_at_ms = timings.placement_loaded_at_ms,
+            lease_checked_at_ms = timings.lease_checked_at_ms,
+            host_ensured_at_ms = timings.host_ensured_at_ms,
+            placement_claimed_at_ms = timings.placement_claimed_at_ms,
+            state_url_signed_at_ms = timings.state_url_signed_at_ms,
+            invocation_token_issued_at_ms = timings.invocation_token_issued_at_ms,
+            route_selected_at_ms = timings.route_selected_at_ms,
+            completed_at_ms,
+            outcome = "resolved",
+            "actor target resolution completed"
+        ),
+        Err(error) => warn!(
+            event = "actor_target_resolution",
+            request_id,
+            namespace_id = %actor.namespace_id,
+            actor_type = %actor.actor_type,
+            actor_id = %actor.actor_id,
+            started_at_ms = 0,
+            request_validated_at_ms = timings.request_validated_at_ms,
+            workflow_authenticated_at_ms = timings.workflow_authenticated_at_ms,
+            deployment_loaded_at_ms = timings.deployment_loaded_at_ms,
+            placement_loaded_at_ms = timings.placement_loaded_at_ms,
+            lease_checked_at_ms = timings.lease_checked_at_ms,
+            host_ensured_at_ms = timings.host_ensured_at_ms,
+            placement_claimed_at_ms = timings.placement_claimed_at_ms,
+            state_url_signed_at_ms = timings.state_url_signed_at_ms,
+            invocation_token_issued_at_ms = timings.invocation_token_issued_at_ms,
+            route_selected_at_ms = timings.route_selected_at_ms,
+            completed_at_ms,
+            outcome = "failed",
+            error_code = %error.code,
+            error = %error.message,
+            "actor target resolution failed"
+        ),
+    }
+    result
 }
 
 fn authorized_workflow(

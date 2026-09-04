@@ -1,5 +1,11 @@
 use std::{
-    env, future::Future, net::SocketAddr, path::PathBuf, process::Stdio, sync::Arc, time::Duration,
+    env,
+    future::Future,
+    net::SocketAddr,
+    path::PathBuf,
+    process::Stdio,
+    sync::Arc,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -46,6 +52,8 @@ pub struct ActorHostConfig {
     pub lease_duration: Duration,
     pub renew_every: Duration,
     pub host_idle_timeout: Duration,
+    startup_started_at: Instant,
+    configuration_loaded_at_ms: f64,
 }
 
 impl ActorHostConfig {
@@ -58,6 +66,14 @@ pub async fn serve_actor_host<F>(config: ActorHostConfig, shutdown: F) -> Result
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    let mut timings = HostStartupTimings::new(&config);
+    let prepared = match prepare_actor_host(&config, &mut timings).await {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            log_startup(&config, &timings, "failed", Some(&error));
+            return Err(error);
+        }
+    };
     let PreparedActorHost {
         invocation_auth,
         listener,
@@ -67,12 +83,17 @@ where
         host,
         lease,
         renewal,
-    } = prepare_actor_host(&config).await?;
+    } = prepared;
     let mut lease_lost = renewal.lease_lost();
     let mut activity = host.activity();
 
     let service = ActorHostGrpcService::new(host.clone(), invocation_auth).into_service();
-    executor_connection.mark_ready().await?;
+    if let Err(error) = executor_connection.mark_ready().await {
+        log_startup(&config, &timings, "failed", Some(&error));
+        return Err(error);
+    }
+    timings.executor_notified_at_ms = Some(timings.elapsed_ms());
+    log_startup(&config, &timings, "ready", None);
     let stop = CancellationToken::new();
     let server_stop = stop.clone();
     let mut grpc_server = Box::pin(
@@ -110,6 +131,7 @@ where
 
 impl ActorHostConfig {
     fn from_lookup(mut get: impl FnMut(&str) -> Option<String>) -> Result<Self> {
+        let startup_started_at = Instant::now();
         let control_plane_url = required(&mut get, "DURABLE_OBJECT_CONTROL_PLANE_URL")?;
         let host_token = required(&mut get, "DURABLE_OBJECT_HOST_TOKEN")?;
         let jwt_public_keys = required(&mut get, "DURABLE_OBJECT_JWT_PUBLIC_KEYS")?;
@@ -203,6 +225,8 @@ impl ActorHostConfig {
             lease_duration,
             renew_every,
             host_idle_timeout,
+            configuration_loaded_at_ms: startup_started_at.elapsed().as_secs_f64() * 1_000.0,
+            startup_started_at,
         })
     }
 }
@@ -218,12 +242,18 @@ struct PreparedActorHost {
     renewal: LeaseRenewalTask,
 }
 
-async fn prepare_actor_host(config: &ActorHostConfig) -> Result<PreparedActorHost> {
+async fn prepare_actor_host(
+    config: &ActorHostConfig,
+    timings: &mut HostStartupTimings,
+) -> Result<PreparedActorHost> {
     let invocation_auth = invocation_auth(config)?;
+    timings.authentication_ready_at_ms = Some(timings.elapsed_ms());
     let control_plane =
         Arc::new(ControlPlaneClient::connect(&config.control_plane_url, &config.host_token).await?);
-    let (listener, route, endpoint) = bind_host(config).await?;
+    timings.control_plane_connected_at_ms = Some(timings.elapsed_ms());
+    let (listener, route, endpoint) = bind_host(config, timings).await?;
     let (executor_connection, javascript) = connect_executor(&config.executor_socket).await?;
+    timings.executor_attached_at_ms = Some(timings.elapsed_ms());
     let host = Arc::new(ActorHost::new(
         endpoint.clone(),
         config.namespace_id.clone(),
@@ -240,6 +270,7 @@ async fn prepare_actor_host(config: &ActorHostConfig) -> Result<PreparedActorHos
         config.renew_every,
     )?);
     let renewal = lease.clone().start().await?;
+    timings.lease_registered_at_ms = Some(timings.elapsed_ms());
     Ok(PreparedActorHost {
         invocation_auth,
         listener,
@@ -262,21 +293,84 @@ fn invocation_auth(config: &ActorHostConfig) -> Result<ActorJwtVerifier> {
     )
 }
 
-async fn bind_host(config: &ActorHostConfig) -> Result<(TcpListener, String, HostEndpoint)> {
+async fn bind_host(
+    config: &ActorHostConfig,
+    timings: &mut HostStartupTimings,
+) -> Result<(TcpListener, String, HostEndpoint)> {
     let listener = TcpListener::bind(config.host_bind)
         .await
         .with_context(|| format!("bind actor host at {}", config.host_bind))?;
+    timings.listener_bound_at_ms = Some(timings.elapsed_ms());
     let route = advertised_route(config, listener.local_addr()?).await?;
     if let Some(path) = &config.route_file {
         tokio::fs::write(path, &route)
             .await
             .with_context(|| format!("write actor host route to {}", path.display()))?;
     }
+    timings.private_route_resolved_at_ms = Some(timings.elapsed_ms());
     let endpoint = HostEndpoint {
         id: config.host_id.clone(),
         route: route.clone(),
     };
     Ok((listener, route, endpoint))
+}
+
+struct HostStartupTimings {
+    started_at: Instant,
+    configuration_loaded_at_ms: f64,
+    authentication_ready_at_ms: Option<f64>,
+    control_plane_connected_at_ms: Option<f64>,
+    listener_bound_at_ms: Option<f64>,
+    private_route_resolved_at_ms: Option<f64>,
+    executor_attached_at_ms: Option<f64>,
+    lease_registered_at_ms: Option<f64>,
+    executor_notified_at_ms: Option<f64>,
+}
+
+impl HostStartupTimings {
+    fn new(config: &ActorHostConfig) -> Self {
+        Self {
+            started_at: config.startup_started_at,
+            configuration_loaded_at_ms: config.configuration_loaded_at_ms,
+            authentication_ready_at_ms: None,
+            control_plane_connected_at_ms: None,
+            listener_bound_at_ms: None,
+            private_route_resolved_at_ms: None,
+            executor_attached_at_ms: None,
+            lease_registered_at_ms: None,
+            executor_notified_at_ms: None,
+        }
+    }
+
+    fn elapsed_ms(&self) -> f64 {
+        self.started_at.elapsed().as_secs_f64() * 1_000.0
+    }
+}
+
+fn log_startup(
+    config: &ActorHostConfig,
+    timings: &HostStartupTimings,
+    outcome: &str,
+    error: Option<&anyhow::Error>,
+) {
+    info!(
+        event = "actor_host_startup",
+        namespace_id = %config.namespace_id,
+        host_id = %config.host_id,
+        started_at_ms = 0,
+        configuration_loaded_at_ms = timings.configuration_loaded_at_ms,
+        authentication_ready_at_ms = timings.authentication_ready_at_ms,
+        control_plane_connected_at_ms = timings.control_plane_connected_at_ms,
+        listener_bound_at_ms = timings.listener_bound_at_ms,
+        private_route_resolved_at_ms = timings.private_route_resolved_at_ms,
+        executor_attached_at_ms = timings.executor_attached_at_ms,
+        lease_registered_at_ms = timings.lease_registered_at_ms,
+        executor_notified_at_ms = timings.executor_notified_at_ms,
+        completed_at_ms = timings.elapsed_ms(),
+        outcome,
+        error = error.map(|error| format!("{error:#}")),
+        "actor host startup completed"
+    );
 }
 
 async fn advertised_route(config: &ActorHostConfig, bound: SocketAddr) -> Result<String> {
@@ -441,6 +535,17 @@ mod tests {
             Some(PathBuf::from("/tmp/durable-object-route"))
         );
         Ok(())
+    }
+
+    #[test]
+    fn startup_timings_begin_with_only_configuration_loaded() {
+        let values = values();
+        let config = ActorHostConfig::from_lookup(|name| values.get(name).cloned()).unwrap();
+        let timings = HostStartupTimings::new(&config);
+
+        assert!(timings.configuration_loaded_at_ms <= timings.elapsed_ms());
+        assert!(timings.control_plane_connected_at_ms.is_none());
+        assert!(timings.executor_notified_at_ms.is_none());
     }
 
     fn values() -> HashMap<String, String> {

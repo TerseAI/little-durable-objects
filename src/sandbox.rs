@@ -1,4 +1,8 @@
-use std::{collections::HashMap, process::Stdio, time::Duration};
+use std::{
+    collections::HashMap,
+    process::Stdio,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
@@ -48,14 +52,24 @@ pub struct ActorHostProvisioning {
     pub provider: String,
     pub resource_id: String,
     pub reused: bool,
-    pub resource_lookup_ms: u64,
-    pub existing_lookup_ms: u64,
-    pub create_ms: u64,
-    pub placement_ms: u64,
-    pub tunnel_ms: u64,
-    pub ready_ms: u64,
-    pub metadata_ms: u64,
-    pub total_ms: u64,
+    pub started_at_ms: u64,
+    pub input_parsed_at_ms: Option<u64>,
+    pub sdk_loaded_at_ms: Option<u64>,
+    pub resources_resolved_at_ms: Option<u64>,
+    pub existing_host_checked_at_ms: Option<u64>,
+    pub sandbox_scheduled_at_ms: Option<u64>,
+    pub host_ready_observed_at_ms: Option<u64>,
+    pub route_read_at_ms: Option<u64>,
+    pub metadata_written_at_ms: Option<u64>,
+    pub completed_at_ms: u64,
+    #[serde(default)]
+    pub command_spawned_at_ms: Option<u64>,
+    #[serde(default)]
+    pub request_written_at_ms: Option<u64>,
+    #[serde(default)]
+    pub process_completed_at_ms: Option<u64>,
+    #[serde(default)]
+    pub response_decoded_at_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -155,7 +169,14 @@ impl CommandSandboxProvider {
 #[async_trait]
 impl SandboxProvider for CommandSandboxProvider {
     async fn ensure_host(&self, request: &EnsureHostRequest) -> Result<ActorHostHandle> {
-        let response: ActorHostHandle = self.execute("ensure_host", request).await?;
+        let (mut response, command): (ActorHostHandle, _) =
+            self.execute_timed("ensure_host", request).await?;
+        if let Some(provisioning) = &mut response.provisioning {
+            provisioning.command_spawned_at_ms = command.spawned_at_ms;
+            provisioning.request_written_at_ms = command.request_written_at_ms;
+            provisioning.process_completed_at_ms = command.process_completed_at_ms;
+            provisioning.response_decoded_at_ms = command.response_decoded_at_ms;
+        }
         ensure!(
             response.canonical_region == request.canonical_region,
             "{} sandbox command returned a host in the wrong canonical region",
@@ -194,6 +215,32 @@ impl CommandSandboxProvider {
         operation: &str,
         request: &Request,
     ) -> Result<Reply> {
+        Ok(self.execute_timed(operation, request).await?.0)
+    }
+
+    async fn execute_timed<Request: Serialize, Reply: for<'de> Deserialize<'de>>(
+        &self,
+        operation: &str,
+        request: &Request,
+    ) -> Result<(Reply, ProviderCommandTimings)> {
+        let started_at = Instant::now();
+        let mut timings = ProviderCommandTimings::default();
+        match self
+            .execute_timed_inner(operation, request, started_at, &mut timings)
+            .await
+        {
+            Ok(response) => Ok((response, timings)),
+            Err(source) => Err(ProviderCommandFailure { source, timings }.into()),
+        }
+    }
+
+    async fn execute_timed_inner<Request: Serialize, Reply: for<'de> Deserialize<'de>>(
+        &self,
+        operation: &str,
+        request: &Request,
+        started_at: Instant,
+        timings: &mut ProviderCommandTimings,
+    ) -> Result<Reply> {
         let mut child = Command::new(&self.command)
             .env_clear()
             .envs(&self.environment)
@@ -208,6 +255,7 @@ impl CommandSandboxProvider {
                     self.provider_name, self.command
                 )
             })?;
+        timings.spawned_at_ms = Some(elapsed_ms(started_at));
         let document = serde_json::to_vec(&ProviderCommand { operation, request })?;
         let mut stdin = child
             .stdin
@@ -221,6 +269,7 @@ impl CommandSandboxProvider {
             .shutdown()
             .await
             .with_context(|| format!("close {} sandbox command stdin", self.provider_name))?;
+        timings.request_written_at_ms = Some(elapsed_ms(started_at));
         drop(stdin);
         let stdout = child
             .stdout
@@ -246,6 +295,7 @@ impl CommandSandboxProvider {
         let (status, stdout, stderr) = tokio::time::timeout(PROVIDER_REQUEST_TIMEOUT, execution)
             .await
             .with_context(|| format!("{} sandbox command timed out", self.provider_name))??;
+        timings.process_completed_at_ms = Some(elapsed_ms(started_at));
         ensure!(
             status.success(),
             "{} sandbox command failed with {}: {}",
@@ -253,9 +303,59 @@ impl CommandSandboxProvider {
             status,
             String::from_utf8_lossy(&stderr).trim()
         );
-        serde_json::from_slice(&stdout)
-            .with_context(|| format!("decode {} sandbox command response", self.provider_name))
+        let response = serde_json::from_slice(&stdout)
+            .with_context(|| format!("decode {} sandbox command response", self.provider_name))?;
+        timings.response_decoded_at_ms = Some(elapsed_ms(started_at));
+        Ok(response)
     }
+}
+
+#[derive(Debug, Default)]
+struct ProviderCommandTimings {
+    spawned_at_ms: Option<u64>,
+    request_written_at_ms: Option<u64>,
+    process_completed_at_ms: Option<u64>,
+    response_decoded_at_ms: Option<u64>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ProviderCommandFailure {
+    source: anyhow::Error,
+    timings: ProviderCommandTimings,
+}
+
+impl ProviderCommandFailure {
+    pub(crate) fn spawned_at_ms(&self) -> Option<u64> {
+        self.timings.spawned_at_ms
+    }
+
+    pub(crate) fn request_written_at_ms(&self) -> Option<u64> {
+        self.timings.request_written_at_ms
+    }
+
+    pub(crate) fn process_completed_at_ms(&self) -> Option<u64> {
+        self.timings.process_completed_at_ms
+    }
+
+    pub(crate) fn response_decoded_at_ms(&self) -> Option<u64> {
+        self.timings.response_decoded_at_ms
+    }
+}
+
+impl std::fmt::Display for ProviderCommandFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl std::error::Error for ProviderCommandFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.source()
+    }
+}
+
+fn elapsed_ms(started_at: Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 async fn read_bounded_output(
@@ -296,22 +396,22 @@ mod tests {
                 "provider": "modal",
                 "resourceId": "sb-actor",
                 "reused": false,
-                "resourceLookupMs": 12,
-                "existingLookupMs": 34,
-                "createMs": 56,
-                "placementMs": 78,
-                "tunnelMs": 90,
-                "readyMs": 123,
-                "metadataMs": 4,
-                "totalMs": 397
+                "startedAtMs": 0,
+                "resourcesResolvedAtMs": 12,
+                "existingHostCheckedAtMs": 34,
+                "sandboxScheduledAtMs": 56,
+                "hostReadyObservedAtMs": 123,
+                "routeReadAtMs": 125,
+                "metadataWrittenAtMs": 129,
+                "completedAtMs": 130
             }
         }))
         .expect("actor host handle");
 
         let provisioning = handle.provisioning.expect("provisioning timings");
         assert_eq!(provisioning.resource_id, "sb-actor");
-        assert_eq!(provisioning.create_ms, 56);
-        assert_eq!(provisioning.total_ms, 397);
+        assert_eq!(provisioning.sandbox_scheduled_at_ms, Some(56));
+        assert_eq!(provisioning.completed_at_ms, 130);
     }
 
     #[test]

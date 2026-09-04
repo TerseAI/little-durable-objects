@@ -4,6 +4,8 @@ import { z } from "zod"
 import { ActorConfigurationError, ActorInvocationError, ActorProtocolError } from "../shared/errors.js"
 import { currentActorInvocation } from "../shared/invocationContext.js"
 import type { ActorConnection } from "../shared/socket.js"
+import { LatencyTimeline, stderrTelemetry } from "../shared/telemetry.js"
+import type { TelemetrySink } from "../shared/telemetry.js"
 import { JsonActorStateSerializer, validateActorComponent } from "../shared/types.js"
 import type { JsonValue, SocketEffect } from "../shared/types.js"
 
@@ -52,6 +54,8 @@ class RemoteActorClient {
     private readonly requestId: () => string
     private readonly actorHost: ActorHostTransport
     private readonly now: () => number
+    private readonly monotonicNow: () => number
+    private readonly telemetry: TelemetrySink
     private readonly targets = new Map<string, Promise<ActorHostTarget>>()
     private readonly connectWebSocket: WebSocketConnector
 
@@ -61,18 +65,39 @@ class RemoteActorClient {
         this.requestId = dependencies.requestId ?? (() => globalThis.crypto.randomUUID())
         this.actorHost = dependencies.actorHost ?? new GrpcActorHostTransport()
         this.now = dependencies.now ?? Date.now
+        this.monotonicNow = dependencies.monotonicNow ?? (() => performance.now())
+        this.telemetry = dependencies.telemetry ?? stderrTelemetry
         this.connectWebSocket = dependencies.connectWebSocket ?? openWebSocket
         this.settingsValue = options === undefined ? undefined : configuredSettings(options)
     }
 
     async invoke(actorType: string, actorId: string, method: string, args: readonly unknown[]): Promise<unknown> {
         const requestId = validateActorComponent("request ID", this.requestId())
-        if (currentActorInvocation() !== undefined) {
-            throw new ActorInvocationError("actor_error", requestId, "actor-to-actor calls are not available")
+        const timeline = new LatencyTimeline(this.monotonicNow)
+        let outcome = "failed"
+        try {
+            if (currentActorInvocation() !== undefined) {
+                throw new ActorInvocationError("actor_error", requestId, "actor-to-actor calls are not available")
+            }
+            const invocation = this.invocation(requestId, actorType, actorId, method, args)
+            timeline.mark("invocation_built")
+            const target = await this.target(invocation, timeline)
+            timeline.mark("target_resolved")
+            const result = await this.direct(target, invocation, true, timeline)
+            outcome = "completed"
+            return result
+        } finally {
+            this.telemetry({
+                event: "actor_client_invocation",
+                request_id: requestId,
+                namespace_id: this.settings.namespaceId,
+                actor_type: actorType,
+                actor_id: actorId,
+                method,
+                ...timeline.finish(),
+                outcome
+            })
         }
-        const invocation = this.invocation(requestId, actorType, actorId, method, args)
-        const target = await this.target(invocation)
-        return this.direct(target, invocation, true)
     }
 
     async connect(actorType: string, actorId: string, metadata: unknown): Promise<ActorConnection> {
@@ -87,18 +112,20 @@ class RemoteActorClient {
         return this.connectWebSocket(socketUrl(this.settings.socketGatewayUrl, this.settings.namespaceId, actor.actorType, actor.actorId), this.settings.token, attachment)
     }
 
-    private async direct(target: ActorHostTarget, invocation: DirectActorInvocation, retryReroute: boolean): Promise<unknown> {
+    private async direct(target: ActorHostTarget, invocation: DirectActorInvocation, retryReroute: boolean, timeline: LatencyTimeline): Promise<unknown> {
         try {
             const reply = await this.actorHost.invoke(target, invocation)
+            timeline.mark("host_rpc_completed")
             if (reply.type === "completed") {
                 await this.applySocketEffects(invocation, reply.effects)
+                timeline.mark("socket_effects_completed")
                 return reply.result
             }
             if (reply.type === "failed") throw new ActorInvocationError(reply.code, invocation.requestId, reply.message)
             if (!retryReroute) throw new ActorInvocationError("unavailable", invocation.requestId, "actor ownership changed repeatedly before execution")
             this.targets.delete(actorKey(invocation.actorType, invocation.actorId))
-            const rerouted = await this.target(invocation)
-            return this.direct(rerouted, invocation, false)
+            const rerouted = await this.target(invocation, timeline)
+            return this.direct(rerouted, invocation, false, timeline)
         } catch (error) {
             if (error instanceof ActorInvocationError || error instanceof ActorProtocolError) throw error
             this.targets.delete(actorKey(invocation.actorType, invocation.actorId))
@@ -125,9 +152,10 @@ class RemoteActorClient {
         }
     }
 
-    private async target(invocation: DirectActorInvocation): Promise<ActorHostTarget> {
+    private async target(invocation: DirectActorInvocation, timeline: LatencyTimeline): Promise<ActorHostTarget> {
         const key = actorKey(invocation.actorType, invocation.actorId)
         const current = this.targets.get(key)
+        timeline.mark("target_cache_checked")
         if (current) {
             const target = await current
             if (target.expiresAtMs > this.now() + TARGET_EXPIRATION_SAFETY_MS) return target
@@ -146,7 +174,11 @@ class RemoteActorClient {
         try {
             response = await this.fetchRequest(targetUrl(this.settings, invocation.actorType, invocation.actorId), {
                 method: "POST",
-                headers: { accept: "application/json", authorization: `Bearer ${this.settings.token}` }
+                headers: {
+                    accept: "application/json",
+                    authorization: `Bearer ${this.settings.token}`,
+                    "x-request-id": invocation.requestId
+                }
             })
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error)
@@ -307,6 +339,8 @@ interface RemoteActorClientDependencies {
     readonly requestId?: () => string
     readonly actorHost?: ActorHostTransport
     readonly now?: () => number
+    readonly monotonicNow?: () => number
+    readonly telemetry?: TelemetrySink
     readonly connectWebSocket?: WebSocketConnector
 }
 

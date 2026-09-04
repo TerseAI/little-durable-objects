@@ -1,11 +1,11 @@
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 
-use crate::{state_log::StateSnapshot, storage_urls::STATE_CONTENT_TYPE};
+use crate::storage_urls::STATE_CONTENT_TYPE;
 
 #[derive(Debug)]
 pub struct LoadedState {
-    pub snapshot: StateSnapshot,
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,7 +53,7 @@ impl StateTransport for HttpStateTransport {
             .await
             .context("read actor-state response body")?;
         Ok(LoadedState {
-            snapshot: StateSnapshot::decode(&bytes)?,
+            bytes: bytes.to_vec(),
         })
     }
 
