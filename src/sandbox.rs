@@ -3,11 +3,15 @@ use std::{collections::HashMap, process::Stdio, time::Duration};
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::{io::AsyncWriteExt, process::Command};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    process::Command,
+};
 
 use crate::host::HostId;
 
 const PROVIDER_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_PROVIDER_OUTPUT_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -218,19 +222,58 @@ impl CommandSandboxProvider {
             .await
             .with_context(|| format!("close {} sandbox command stdin", self.provider_name))?;
         drop(stdin);
-        let output = tokio::time::timeout(PROVIDER_REQUEST_TIMEOUT, child.wait_with_output())
+        let stdout = child
+            .stdout
+            .take()
+            .with_context(|| format!("open {} sandbox command stdout", self.provider_name))?;
+        let stderr = child
+            .stderr
+            .take()
+            .with_context(|| format!("open {} sandbox command stderr", self.provider_name))?;
+        let execution = async {
+            let wait = async {
+                child
+                    .wait()
+                    .await
+                    .with_context(|| format!("wait for {} sandbox command", self.provider_name))
+            };
+            tokio::try_join!(
+                wait,
+                read_bounded_output(stdout, MAX_PROVIDER_OUTPUT_BYTES, "stdout"),
+                read_bounded_output(stderr, MAX_PROVIDER_OUTPUT_BYTES, "stderr"),
+            )
+        };
+        let (status, stdout, stderr) = tokio::time::timeout(PROVIDER_REQUEST_TIMEOUT, execution)
             .await
             .with_context(|| format!("{} sandbox command timed out", self.provider_name))??;
         ensure!(
-            output.status.success(),
+            status.success(),
             "{} sandbox command failed with {}: {}",
             self.provider_name,
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
+            status,
+            String::from_utf8_lossy(&stderr).trim()
         );
-        serde_json::from_slice(&output.stdout)
+        serde_json::from_slice(&stdout)
             .with_context(|| format!("decode {} sandbox command response", self.provider_name))
     }
+}
+
+async fn read_bounded_output(
+    reader: impl AsyncRead + Unpin,
+    max_bytes: usize,
+    label: &str,
+) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    reader
+        .take((max_bytes + 1) as u64)
+        .read_to_end(&mut output)
+        .await
+        .with_context(|| format!("read sandbox command {label}"))?;
+    ensure!(
+        output.len() <= max_bytes,
+        "sandbox command {label} exceeds {max_bytes} bytes"
+    );
+    Ok(output)
 }
 
 #[derive(Serialize)]
@@ -275,5 +318,13 @@ mod tests {
     fn rejects_ambiguous_command_configuration() {
         assert!(CommandSandboxProvider::new("".into(), "modal".into(), HashMap::new()).is_err());
         assert!(CommandSandboxProvider::new("modal".into(), "".into(), HashMap::new()).is_err());
+    }
+
+    #[tokio::test]
+    async fn provider_output_is_bounded_while_reading() {
+        let error = read_bounded_output(tokio::io::repeat(b'x'), 32, "stdout")
+            .await
+            .expect_err("unbounded provider output should fail");
+        assert!(error.to_string().contains("stdout exceeds 32 bytes"));
     }
 }

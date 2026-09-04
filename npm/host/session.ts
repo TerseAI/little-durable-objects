@@ -178,7 +178,7 @@ class ActorSessionConnection {
 
     private async reply(messageId: number, command: ActorExecutorCommand, reply: ActorExecutorReply): Promise<void> {
         const message = { type: "reply" as const, message_id: messageId, reply }
-        if (Buffer.byteLength(`${JSON.stringify(message)}\n`) <= MAX_MESSAGE_BYTES) {
+        if (jsonFitsWithinBytes(message, MAX_MESSAGE_BYTES - 1)) {
             this.send(message)
             return
         }
@@ -191,7 +191,10 @@ class ActorSessionConnection {
     }
 
     private send(message: ActorSessionClientMessage): void {
-        const document = `${JSON.stringify(message)}\n`
+        this.write(serializeMessage(message))
+    }
+
+    private write(document: string): void {
         if (Buffer.byteLength(document) > MAX_MESSAGE_BYTES) throw new ActorSessionError("actor session message is too large")
         this.socket.write(document)
     }
@@ -210,6 +213,80 @@ class ActorSessionConnection {
         this.closedResolve?.()
         this.closedResolve = undefined
     }
+}
+
+function serializeMessage(message: ActorSessionClientMessage): string {
+    return `${JSON.stringify(message)}\n`
+}
+
+function jsonFitsWithinBytes(value: unknown, maxBytes: number): boolean {
+    return jsonByteLength(value, maxBytes, new WeakSet(), 0) !== undefined
+}
+
+function jsonByteLength(value: unknown, maxBytes: number, ancestors: WeakSet<object>, depth: number): number | undefined {
+    if (maxBytes < 0 || depth > 256) return undefined
+    if (value === null) return 4 <= maxBytes ? 4 : undefined
+    switch (typeof value) {
+        case "string":
+            return jsonStringByteLength(value, maxBytes)
+        case "number": {
+            const bytes = Buffer.byteLength(JSON.stringify(value))
+            return bytes <= maxBytes ? bytes : undefined
+        }
+        case "boolean": {
+            const bytes = value ? 4 : 5
+            return bytes <= maxBytes ? bytes : undefined
+        }
+        case "object":
+            return jsonObjectByteLength(value, maxBytes, ancestors, depth)
+        default:
+            return undefined
+    }
+}
+
+function jsonObjectByteLength(value: object, maxBytes: number, ancestors: WeakSet<object>, depth: number): number | undefined {
+    if (ancestors.has(value) || maxBytes < 2) return undefined
+    ancestors.add(value)
+    let bytes = 2
+    let entries = 0
+    const array = Array.isArray(value)
+    const values: Iterable<[string | number, unknown]> = array ? value.entries() : objectEntries(value)
+    for (const [key, item] of values) {
+        const separatorBytes = entries === 0 ? 0 : 1
+        const keyBytes = array ? 0 : jsonStringByteLength(String(key), maxBytes - bytes - separatorBytes)
+        if (keyBytes === undefined) return undefined
+        const punctuationBytes = array ? separatorBytes : separatorBytes + keyBytes + 1
+        const itemBytes = jsonByteLength(item, maxBytes - bytes - punctuationBytes, ancestors, depth + 1)
+        if (itemBytes === undefined) return undefined
+        bytes += punctuationBytes + itemBytes
+        entries += 1
+    }
+    ancestors.delete(value)
+    return bytes
+}
+
+function* objectEntries(value: object): Iterable<[string, unknown]> {
+    for (const key in value) {
+        if (Object.prototype.hasOwnProperty.call(value, key)) yield [key, Reflect.get(value, key)]
+    }
+}
+
+function jsonStringByteLength(value: string, maxBytes: number): number | undefined {
+    if (maxBytes < 2) return undefined
+    let bytes = 2
+    for (let index = 0; index < value.length; index += 1) {
+        const code = value.charCodeAt(index)
+        if (code === 0x22 || code === 0x5c || code === 0x08 || code === 0x09 || code === 0x0a || code === 0x0c || code === 0x0d) bytes += 2
+        else if (code <= 0x1f || (code >= 0xd800 && code <= 0xdfff && !(code <= 0xdbff && value.charCodeAt(index + 1) >= 0xdc00 && value.charCodeAt(index + 1) <= 0xdfff))) bytes += 6
+        else if (code <= 0x7f) bytes += 1
+        else if (code <= 0x7ff) bytes += 2
+        else if (code <= 0xdbff) {
+            bytes += 4
+            index += 1
+        } else bytes += 3
+        if (bytes > maxBytes) return undefined
+    }
+    return bytes
 }
 
 function connectSocket(socketPath: string): Promise<Socket> {
@@ -251,4 +328,4 @@ function parseActorIdleTimeout(value: string | undefined): number {
 
 type ActorCommandHandler = (command: ActorExecutorCommand) => Promise<ActorExecutorReply>
 
-export { ActorSession, ActorSessionSettings, runActorHost }
+export { ActorSession, ActorSessionSettings, jsonFitsWithinBytes, runActorHost }

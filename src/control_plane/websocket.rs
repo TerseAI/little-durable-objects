@@ -20,7 +20,8 @@ use tracing::warn;
 use crate::{
     actor::{
         ActorKey, ActorSocketConnection, ActorSocketEffect, ActorSocketEvent,
-        ActorSocketInvocation, ActorSocketMessage,
+        ActorSocketInvocation, ActorSocketMessage, MAX_SOCKET_MESSAGE_BYTES,
+        MAX_SOCKET_METADATA_BYTES, validate_socket_effects,
     },
     control_plane::ActorPrincipal,
 };
@@ -28,9 +29,7 @@ use crate::{
 use super::service::ControlPlaneService;
 use super::socket_auth::{SocketAuthorizationError, SocketAuthorizationRequest};
 
-const MAX_METADATA_BYTES: usize = 64 * 1024;
 const MAX_CONNECTIONS_PER_ACTOR: usize = 128;
-const MAX_SOCKET_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SOCKET_EFFECTS_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 const SOCKET_INITIALIZATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -93,6 +92,7 @@ async fn apply_effects(
     };
     actor.validate().map_err(SocketApiError::bad_request)?;
     authorize_workflow(&state, &headers, &actor)?;
+    validate_socket_effects(&request.effects).map_err(SocketApiError::bad_request)?;
     state.registry.apply(&actor, request.effects).await;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -313,6 +313,10 @@ async fn dispatch(
         .await
     {
         Ok(effects) => {
+            if let Err(error) = validate_socket_effects(&effects) {
+                warn!(actor = %actor.storage_key(), error = %format!("{error:#}"), "actor returned invalid socket effects");
+                return false;
+            }
             state.registry.apply(actor, effects).await;
             if let Some(connection_id) = connecting {
                 state.registry.activate(actor, &connection_id).await;
@@ -582,13 +586,11 @@ fn external_credential(headers: &HeaderMap) -> Option<String> {
     if let Some(authorization) = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-    {
-        if let Some(credential) = authorization
+        && let Some(credential) = authorization
             .strip_prefix("Bearer ")
             .filter(|value| !value.is_empty())
-        {
-            return Some(credential.to_owned());
-        }
+    {
+        return Some(credential.to_owned());
     }
     headers
         .get(header::SEC_WEBSOCKET_PROTOCOL)
@@ -611,12 +613,13 @@ async fn receive_metadata(socket: &mut WebSocket) -> Option<Value> {
     let Message::Text(document) = message else {
         return None;
     };
-    if document.len() > MAX_METADATA_BYTES + 128 {
+    if document.len() > MAX_SOCKET_METADATA_BYTES + 128 {
         return None;
     }
     let initialization = serde_json::from_str::<SocketInitialization>(&document).ok()?;
-    (serde_json::to_vec(&initialization.metadata).ok()?.len() <= MAX_METADATA_BYTES)
-        .then_some(initialization.metadata)
+    crate::actor::validate_socket_metadata(&initialization.metadata)
+        .ok()
+        .map(|()| initialization.metadata)
 }
 
 fn websocket_message(message: ActorSocketMessage) -> Option<Message> {
@@ -730,6 +733,35 @@ mod tests {
             external_credential(&headers).as_deref(),
             Some("ticket-value")
         );
+    }
+
+    #[test]
+    fn rejects_socket_effects_that_bypass_sdk_invariants() {
+        let invalid = [
+            ActorSocketEffect::Close {
+                connection_id: "socket-1".into(),
+                code: 1001,
+                reason: String::new(),
+            },
+            ActorSocketEffect::SetTags {
+                connection_id: "socket-1".into(),
+                tags: vec!["x".repeat(257)],
+            },
+            ActorSocketEffect::SetMetadata {
+                connection_id: "socket-1".into(),
+                metadata: json!({ "data": "x".repeat(64 * 1024) }),
+            },
+            ActorSocketEffect::Send {
+                connection_id: "socket-1".into(),
+                message: ActorSocketMessage::Binary {
+                    data: "not base64".into(),
+                },
+            },
+        ];
+
+        for effect in invalid {
+            assert!(crate::actor::validate_socket_effects(&[effect]).is_err());
+        }
     }
 
     #[tokio::test]

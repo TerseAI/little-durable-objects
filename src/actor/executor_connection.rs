@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, unix::OwnedWriteHalf},
     sync::{Mutex as AsyncMutex, oneshot},
     task::JoinHandle,
@@ -451,8 +451,11 @@ async fn read_executor_messages(
 async fn read_client_message(
     reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
 ) -> Result<Option<ActorExecutorClientMessage>> {
-    let mut line = String::new();
-    let bytes = reader.read_line(&mut line).await?;
+    let mut document = Vec::new();
+    let bytes = reader
+        .take((MAX_ACTOR_EXECUTOR_MESSAGE_BYTES + 1) as u64)
+        .read_until(b'\n', &mut document)
+        .await?;
     if bytes == 0 {
         return Ok(None);
     }
@@ -460,9 +463,16 @@ async fn read_client_message(
         bytes <= MAX_ACTOR_EXECUTOR_MESSAGE_BYTES,
         "customer actor executor message exceeds {MAX_ACTOR_EXECUTOR_MESSAGE_BYTES} bytes"
     );
-    serde_json::from_str(line.trim_end())
+    serde_json::from_slice(trim_ascii_end(&document))
         .map(Some)
         .context("decode customer actor executor message")
+}
+
+fn trim_ascii_end(mut document: &[u8]) -> &[u8] {
+    while document.last().is_some_and(u8::is_ascii_whitespace) {
+        document = &document[..document.len() - 1];
+    }
+    document
 }
 
 async fn write_server_message(
@@ -580,6 +590,7 @@ mod tests {
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
         net::UnixStream,
+        time::{Duration, timeout},
     };
 
     #[tokio::test]
@@ -692,6 +703,30 @@ mod tests {
         shutdown.cancel();
         connection_task.await??;
         customer.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oversized_client_messages_are_rejected_before_newline() -> Result<()> {
+        let (host, mut customer) = UnixStream::pair()?;
+        let (reader, _) = host.into_split();
+        let mut reader = BufReader::new(reader);
+        let customer = tokio::spawn(async move {
+            let chunk = vec![b'x'; 64 * 1024];
+            for _ in 0..=MAX_ACTOR_EXECUTOR_MESSAGE_BYTES / chunk.len() {
+                customer.write_all(&chunk).await?;
+            }
+            std::future::pending::<()>().await;
+            #[allow(unreachable_code)]
+            Ok::<(), anyhow::Error>(())
+        });
+
+        let result = timeout(Duration::from_secs(5), read_client_message(&mut reader)).await;
+        customer.abort();
+        let error = result
+            .context("oversized actor executor message was not rejected before newline")?
+            .expect_err("oversized actor executor message should fail");
+        assert!(error.to_string().contains("exceeds"));
         Ok(())
     }
 

@@ -8,6 +8,23 @@ type JsonValue = JsonPrimitive | JsonObject | readonly JsonValue[]
 
 const actorComponentSchema = z.string().regex(/^[A-Za-z0-9._-]+$/u)
 const jsonValueSchema: z.ZodType<JsonValue> = z.lazy(() => z.union([z.string(), z.number(), z.boolean(), z.null(), z.array(jsonValueSchema), z.record(z.string(), jsonValueSchema)]))
+const socketConnectionIdSchema = actorComponentSchema.max(128)
+const socketMetadataSchema = jsonValueSchema.refine(value => Buffer.byteLength(JSON.stringify(value)) <= 64 * 1024, "socket metadata must not exceed 64 KiB")
+const socketTagSchema = z.string().min(1).max(256)
+const socketTagsSchema = z
+    .array(socketTagSchema)
+    .max(128)
+    .refine(tags => tags.reduce((bytes, tag) => bytes + Buffer.byteLength(tag), 0) <= 8 * 1024, "socket tags must not exceed 8 KiB")
+const socketTextSchema = z.string().refine(value => Buffer.byteLength(value) <= 16 * 1024 * 1024, "socket message must not exceed 16 MiB")
+const socketBinarySchema = z
+    .string()
+    .regex(/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u, "socket binary message must be base64")
+    .refine(value => Buffer.byteLength(value, "base64") <= 16 * 1024 * 1024, "socket message must not exceed 16 MiB")
+const socketCloseCodeSchema = z
+    .number()
+    .int()
+    .refine(code => code === 1000 || (code >= 3000 && code <= 4999), "socket close code must be 1000 or between 3000 and 4999")
+const socketCloseReasonSchema = z.string().refine(reason => Buffer.byteLength(reason) <= 123, "socket close reason must not exceed 123 bytes")
 
 const actorIdentitySchema = z.object({
     namespace_id: actorComponentSchema,
@@ -26,12 +43,28 @@ const invokeCommandSchema = z.object({
 })
 
 const socketConnectionSchema = z.object({
-    id: actorComponentSchema,
-    metadata: jsonValueSchema,
-    tags: z.array(z.string().min(1).max(256))
+    id: socketConnectionIdSchema,
+    metadata: socketMetadataSchema,
+    tags: socketTagsSchema
 })
 
-const socketMessageSchema = z.discriminatedUnion("type", [z.object({ type: z.literal("text"), data: z.string() }), z.object({ type: z.literal("binary"), data: z.string() })])
+const socketMessageSchema = z.discriminatedUnion("type", [z.object({ type: z.literal("text"), data: socketTextSchema }), z.object({ type: z.literal("binary"), data: socketBinarySchema })])
+
+const socketEffectSchema = z.discriminatedUnion("type", [
+    z.object({ type: z.literal("send"), connection_id: socketConnectionIdSchema, message: socketMessageSchema }),
+    z.object({
+        type: z.literal("broadcast"),
+        message: socketMessageSchema,
+        except_connection_ids: z.array(socketConnectionIdSchema).max(128),
+        tags: socketTagsSchema
+    }),
+    z.object({ type: z.literal("close"), connection_id: socketConnectionIdSchema, code: socketCloseCodeSchema, reason: socketCloseReasonSchema }),
+    z.object({ type: z.literal("reject"), connection_id: socketConnectionIdSchema, code: socketCloseCodeSchema, reason: socketCloseReasonSchema }),
+    z.object({ type: z.literal("set_metadata"), connection_id: socketConnectionIdSchema, metadata: socketMetadataSchema }),
+    z.object({ type: z.literal("set_tags"), connection_id: socketConnectionIdSchema, tags: socketTagsSchema })
+])
+
+const socketEffectsSchema = z.array(socketEffectSchema)
 
 const socketEventSchema = z.discriminatedUnion("type", [
     z.object({ type: z.literal("connect"), connection: socketConnectionSchema }),
@@ -139,6 +172,12 @@ function parseActorSessionServerMessage(document: string): ActorSessionServerMes
     return result.data
 }
 
+function parseSocketEffects(value: unknown): readonly SocketEffect[] {
+    const result = socketEffectsSchema.safeParse(value)
+    if (!result.success) throw new ActorProtocolError(`actor socket effects are invalid: ${result.error.message}`)
+    return result.data
+}
+
 function failedReply(code: string, message: string): FailedReply {
     return { type: "failed", code, message }
 }
@@ -211,7 +250,7 @@ type SocketEffect =
     | { readonly type: "set_metadata"; readonly connection_id: string; readonly metadata: JsonValue }
     | { readonly type: "set_tags"; readonly connection_id: string; readonly tags: readonly string[] }
 
-export { JsonActorStateSerializer, errorMessage, failedReply, parseActorSessionServerMessage, validateActorComponent }
+export { JsonActorStateSerializer, errorMessage, failedReply, parseActorSessionServerMessage, parseSocketEffects, validateActorComponent }
 export type {
     ActorExecutorCommand,
     ActorExecutorReply,

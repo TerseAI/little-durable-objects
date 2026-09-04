@@ -3,7 +3,11 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::actor::ActorKey;
+use crate::actor::{ActorKey, validate_socket_metadata};
+
+use super::CONTROL_PLANE_REQUEST_TIMEOUT;
+
+const MAX_SOCKET_AUTHORIZATION_RESPONSE_BYTES: usize = 128 * 1024;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -66,7 +70,10 @@ impl HttpSocketAuthenticator {
             "socket authorization token must not be empty"
         );
         Ok(Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(CONTROL_PLANE_REQUEST_TIMEOUT)
+                .build()
+                .context("build socket authorization HTTP client")?,
             url,
             token,
         })
@@ -92,10 +99,10 @@ impl SocketAuthenticator for HttpSocketAuthenticator {
         }
         let response = response
             .error_for_status()
-            .map_err(|error| SocketAuthorizationError::Unavailable(error.into()))?
-            .json::<SocketAuthorizationResponse>()
-            .await
             .map_err(|error| SocketAuthorizationError::Unavailable(error.into()))?;
+        let response = read_authorization_response(response)
+            .await
+            .map_err(SocketAuthorizationError::Unavailable)?;
         response
             .into_authorization(&request.actor_id)
             .map_err(SocketAuthorizationError::Unavailable)
@@ -127,6 +134,7 @@ impl SocketAuthorizationResponse {
             self.expires_at > unix_seconds()?,
             "socket authorization has expired"
         );
+        validate_socket_metadata(&self.metadata)?;
         let actor = ActorKey {
             namespace_id: self.namespace_id,
             actor_type: self.actor_type,
@@ -148,4 +156,78 @@ fn unix_seconds() -> Result<i64> {
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs(),
     )?)
+}
+
+async fn read_authorization_response(
+    mut response: reqwest::Response,
+) -> Result<SocketAuthorizationResponse> {
+    if let Some(content_length) = response.content_length() {
+        ensure!(
+            content_length <= MAX_SOCKET_AUTHORIZATION_RESPONSE_BYTES as u64,
+            "socket authorization response exceeds {MAX_SOCKET_AUTHORIZATION_RESPONSE_BYTES} bytes"
+        );
+    }
+    let mut document = Vec::with_capacity(
+        response
+            .content_length()
+            .unwrap_or_default()
+            .min(MAX_SOCKET_AUTHORIZATION_RESPONSE_BYTES as u64) as usize,
+    );
+    while let Some(chunk) = response.chunk().await? {
+        ensure!(
+            document.len().saturating_add(chunk.len()) <= MAX_SOCKET_AUTHORIZATION_RESPONSE_BYTES,
+            "socket authorization response exceeds {MAX_SOCKET_AUTHORIZATION_RESPONSE_BYTES} bytes"
+        );
+        document.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&document).context("decode socket authorization response")
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{Router, routing::post};
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn rejects_oversized_authorized_socket_metadata() {
+        let response = SocketAuthorizationResponse {
+            namespace_id: "project-1".into(),
+            actor_type: "ChatRoom".into(),
+            actor_id: "room-1".into(),
+            storage_region: "north-america-east".into(),
+            metadata: json!({ "data": "x".repeat(64 * 1024) }),
+            expires_at: i64::MAX,
+        };
+
+        let error = response
+            .into_authorization("room-1")
+            .expect_err("oversized metadata should fail");
+        assert!(error.to_string().contains("metadata"));
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_authorization_response_while_reading() -> Result<()> {
+        let app = Router::new().route("/", post(|| async { vec![b'x'; 128 * 1024 + 1] }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(axum::serve(listener, app).into_future());
+        let authenticator = HttpSocketAuthenticator::new(
+            format!("http://{address}"),
+            "authorization-token".into(),
+        )?;
+
+        let error = authenticator
+            .authorize(SocketAuthorizationRequest {
+                trigger_id: "trigger-1".into(),
+                actor_id: "room-1".into(),
+                credential: "socket-credential".into(),
+            })
+            .await
+            .expect_err("oversized authorization response should fail");
+        server.abort();
+        assert!(error.to_string().contains("exceeds"));
+        Ok(())
+    }
 }

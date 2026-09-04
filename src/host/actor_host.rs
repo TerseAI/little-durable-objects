@@ -17,7 +17,7 @@ use crate::{
     actor::{
         ActorExecutionResult, ActorExecutor, ActorInvocation, ActorInvocationFailure,
         ActorMethodEviction, ActorMethodInvocation, ActorMethodOutcome, ActorSocketEffect,
-        ActorSocketInvocation, ActorSocketOutcome,
+        ActorSocketInvocation, ActorSocketOutcome, validate_socket_effects,
     },
     actor_state::{ActorExecutionAdmission, ActorExecutionLocks, ActorStorageKey},
     control_plane::ControlPlaneClient,
@@ -411,7 +411,16 @@ impl ActorHost {
                 result,
                 state,
                 effects,
-            }) => Ok((result, state, effects)),
+            }) => match validate_socket_effects(&effects) {
+                Ok(()) => Ok((result, state, effects)),
+                Err(error) => {
+                    self.evict(&invocation.actor).await;
+                    Err(failed(
+                        "actor_error",
+                        format!("actor returned invalid socket effects: {error:#}"),
+                    ))
+                }
+            },
             Ok(ActorMethodOutcome::Failed(failure)) => {
                 self.evict(&invocation.actor).await;
                 let code = match failure.code.as_str() {
@@ -434,8 +443,20 @@ impl ActorHost {
         &self,
         invocation: ActorSocketInvocation,
     ) -> std::result::Result<(Value, Vec<ActorSocketEffect>), ActorExecutionResult> {
+        let actor = invocation.actor.clone();
         match self.executor.handle_socket(invocation).await {
-            Ok(ActorSocketOutcome::Handled { state, effects }) => Ok((state, effects)),
+            Ok(ActorSocketOutcome::Handled { state, effects }) => {
+                match validate_socket_effects(&effects) {
+                    Ok(()) => Ok((state, effects)),
+                    Err(error) => {
+                        self.evict(&actor).await;
+                        Err(failed(
+                            "actor_error",
+                            format!("actor returned invalid socket effects: {error:#}"),
+                        ))
+                    }
+                }
+            }
             Ok(ActorSocketOutcome::Failed(failure)) => {
                 let code = match failure.code.as_str() {
                     "resource_exhausted" => "resource_exhausted",
@@ -841,6 +862,8 @@ mod tests {
 
     struct ExhaustedExecutor;
 
+    struct InvalidEffectsExecutor;
+
     #[async_trait]
     impl ActorExecutor for IncrementingExecutor {
         fn supports(&self, actor_type: &str) -> bool {
@@ -897,6 +920,25 @@ mod tests {
                 code: "resource_exhausted".into(),
                 message: "actor session message is too large".into(),
             }))
+        }
+    }
+
+    #[async_trait]
+    impl ActorExecutor for InvalidEffectsExecutor {
+        fn supports(&self, _actor_type: &str) -> bool {
+            true
+        }
+
+        async fn invoke(&self, _invocation: ActorMethodInvocation) -> Result<ActorMethodOutcome> {
+            Ok(ActorMethodOutcome::Completed {
+                result: Value::Null,
+                state: json!({ "count": 1 }),
+                effects: vec![ActorSocketEffect::Close {
+                    connection_id: "socket-1".into(),
+                    code: 1001,
+                    reason: String::new(),
+                }],
+            })
         }
     }
 
@@ -1053,6 +1095,31 @@ mod tests {
             invoke(&host, "request-1").await?,
             ActorExecutionResult::Failed { ref failure } if failure.code == "resource_exhausted"
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_socket_effects_do_not_commit_actor_state() -> Result<()> {
+        let authority = Arc::new(FakeAuthority::default());
+        let state = Arc::new(FakeStateTransport::default());
+        let host = ActorHost::new(
+            HostEndpoint {
+                id: super::super::HostId::new("host-1"),
+                route: "http://host.invalid/".into(),
+            },
+            "project-1".into(),
+            Arc::new(InvalidEffectsExecutor),
+            authority.clone(),
+            state.clone(),
+        );
+
+        assert!(matches!(
+            invoke(&host, "request-1").await?,
+            ActorExecutionResult::Failed { ref failure }
+                if failure.code == "actor_error" && failure.message.contains("invalid socket effects")
+        ));
+        assert!(state.writes.lock().unwrap().is_empty());
+        assert!(authority.commits.lock().unwrap().is_empty());
         Ok(())
     }
 

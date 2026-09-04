@@ -7,6 +7,18 @@ import { createInterface } from "node:readline"
 import { test } from "node:test"
 import { fileURLToPath } from "node:url"
 
+import { jsonFitsWithinBytes } from "./session.js"
+
+test("checks JSON message sizes before serialization", () => {
+    const values = [null, true, 12.5, "plain", 'quote\"slash\\', "emoji 😀", "\ud800", ["nested"], { nested: { value: "ok" } }]
+    for (const value of values) {
+        const bytes = Buffer.byteLength(JSON.stringify(value))
+        assert.equal(jsonFitsWithinBytes(value, bytes), true)
+        assert.equal(jsonFitsWithinBytes(value, bytes - 1), false)
+    }
+    assert.equal(jsonFitsWithinBytes("x".repeat(1024), 100), false)
+})
+
 test("the actor session carries only owned execution commands", async () => {
     const socketPath = `/tmp/ta-session-${process.pid}.sock`
     await removeSocket(socketPath)

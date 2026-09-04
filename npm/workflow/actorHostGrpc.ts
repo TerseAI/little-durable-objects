@@ -2,6 +2,7 @@ import { Client, Metadata, credentials } from "@grpc/grpc-js"
 import protobuf from "protobufjs"
 
 import { ActorProtocolError } from "../shared/errors.js"
+import { parseSocketEffects } from "../shared/types.js"
 import type { JsonValue, SocketEffect } from "../shared/types.js"
 
 const { Field, OneOf, Type } = protobuf
@@ -85,19 +86,23 @@ function unaryRequest(client: Client, request: HostInvokeActorRequest, metadata:
 
 function decodeReply(reply: InvokeActorReply): ActorHostReply {
     if (reply.completed) {
-        try {
-            return {
-                type: "completed",
-                result: JSON.parse(Buffer.from(reply.completed.resultJson).toString("utf8")) as unknown,
-                effects: JSON.parse(Buffer.from(reply.completed.socketEffectsJson).toString("utf8")) as SocketEffect[]
-            }
-        } catch (error) {
-            throw new ActorProtocolError("actor host result was not valid JSON", { cause: error })
+        return {
+            type: "completed",
+            result: parseJson(reply.completed.resultJson, "result"),
+            effects: parseSocketEffects(parseJson(reply.completed.socketEffectsJson, "socket effects"))
         }
     }
     if (reply.failed) return { type: "failed", code: reply.failed.code, message: reply.failed.message }
     if (reply.reroute) return { type: "reroute" }
     throw new ActorProtocolError("actor host response did not contain a result")
+}
+
+function parseJson(bytes: Uint8Array, label: string): unknown {
+    try {
+        return JSON.parse(Buffer.from(bytes).toString("utf8")) as unknown
+    } catch (error) {
+        throw new ActorProtocolError(`actor host ${label} was not valid JSON`, { cause: error })
+    }
 }
 
 function actorHostUrl(route: string): URL {

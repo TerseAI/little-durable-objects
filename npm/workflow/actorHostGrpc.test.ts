@@ -5,6 +5,8 @@ import assert from "node:assert/strict"
 import { resolve } from "node:path"
 import { test } from "node:test"
 
+import { ActorProtocolError } from "../shared/errors.js"
+
 import { GrpcActorHostTransport } from "./actorHostGrpc.js"
 
 test("direct transport speaks the actor host protobuf contract", async () => {
@@ -61,6 +63,60 @@ test("direct transport speaks the actor host protobuf contract", async () => {
         server.forceShutdown()
     }
 })
+
+test("direct transport rejects structurally invalid socket effects", async () => {
+    const server = actorHostServer({
+        completed: {
+            resultJson: Buffer.from("null"),
+            socketEffectsJson: Buffer.from('{"type":"send"}')
+        },
+        result: "completed"
+    })
+    const port = await listen(server)
+    const transport = new GrpcActorHostTransport()
+    try {
+        await assert.rejects(
+            transport.invoke(
+                {
+                    route: `http://127.0.0.1:${port}`,
+                    token: "direct-token",
+                    ownerEpoch: 3,
+                    stateVersion: 7,
+                    stateReadUrl: "https://storage.example.com/state",
+                    expiresAtMs: 4_000_000_000_000
+                },
+                {
+                    requestId: "request-1",
+                    namespaceId: "project-1",
+                    actorType: "Counter",
+                    actorId: "counter-1",
+                    method: "increment",
+                    args: [2]
+                }
+            ),
+            ActorProtocolError
+        )
+    } finally {
+        server.forceShutdown()
+    }
+})
+
+function actorHostServer(reply: HostReply): Server {
+    const server = new Server()
+    const definition = loadPackageDefinition(
+        loadSync(resolve("../proto/durable_object.proto"), {
+            defaults: true,
+            longs: Number,
+            oneofs: true
+        })
+    ) as unknown as GrpcPackages
+    server.addService(definition.durable_object.v1.ActorHostService.service, {
+        invoke(_call: ServerUnaryCall<HostRequest, HostReply>, callback: sendUnaryData<HostReply>) {
+            callback(null, reply)
+        }
+    })
+    return server
+}
 
 function listen(server: Server): Promise<number> {
     return new Promise((resolvePort, reject) => {
