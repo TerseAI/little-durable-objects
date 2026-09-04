@@ -52,9 +52,11 @@ export class ChatRoom extends Actor {
 
 const socket = await ChatRoom.get("lobby").connect({ userId: "user-1" })
 socket.send("hello")
+
+await ChatRoom.get("lobby").broadcast("streamed output")
 ```
 
-The control-plane gateway retains live sockets, metadata, and tags. Every successful connection automatically receives `{ "type": "state", "state": { ... } }` with the actor's current durable properties, so `onConnect` is only needed for custom behavior. Each lifecycle event wakes the actor host as needed, and ordinary workflow actor methods forward returned socket effects to the gateway. `this.connections`, `this.broadcast(...)`, `socket.setTags(...)`, `socket.close(...)`, and connect-time `socket.reject(...)` cover connection membership and the full lifecycle without a context object.
+The control-plane gateway retains live sockets, metadata, and tags. Every successful connection automatically receives `{ "type": "state", "state": { ... } }` with the actor's current durable properties, so `onConnect` is only needed for custom behavior. Each lifecycle event wakes the actor host as needed, and ordinary workflow actor methods forward returned socket effects to the gateway. A workflow can use `Actor.get(id).broadcast(...)` for transient streaming without invoking the actor or persisting state. `this.connections`, `this.broadcast(...)`, `socket.setTags(...)`, `socket.close(...)`, and connect-time `socket.reject(...)` cover connection membership and the full lifecycle without a context object.
 
 Calling `configureDurableObjects` is optional when these environment variables are already present:
 

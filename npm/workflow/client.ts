@@ -1,9 +1,10 @@
 import { AsyncLocalStorage } from "node:async_hooks"
 
 import { ActorProtocolError } from "../shared/errors.js"
-import type { ActorConnection } from "../shared/socket.js"
+import { socketMessage } from "../shared/socket.js"
+import type { ActorConnection, ActorSocketMessage } from "../shared/socket.js"
 import { JsonActorStateSerializer, validateActorComponent } from "../shared/types.js"
-import type { JsonValue } from "../shared/types.js"
+import type { JsonValue, SocketMessage } from "../shared/types.js"
 
 import { RemoteActorClient } from "./remoteClient.js"
 import type { DurableObjectsClientOptions } from "./remoteClient.js"
@@ -11,6 +12,7 @@ import type { DurableObjectsClientOptions } from "./remoteClient.js"
 interface ActorClientTransport {
     invoke(actorType: string, actorId: string, method: string, args: readonly unknown[]): Promise<unknown>
     connect(actorType: string, actorId: string, metadata: unknown): Promise<ActorConnection>
+    broadcast(actorType: string, actorId: string, message: ActorSocketMessage): Promise<void>
 }
 
 const scopedClients = new AsyncLocalStorage<ActorClientTransport>()
@@ -46,11 +48,13 @@ class TestActorClient implements ActorClientTransport {
     private readonly requestId: () => string
     private readonly invokeTest: ActorTestInvoker
     private readonly connectTest: ActorTestConnector
+    private readonly broadcastTest: ActorTestBroadcaster
 
     constructor(options: ActorTestClientOptions) {
         this.requestId = options.requestId ?? (() => globalThis.crypto.randomUUID())
         this.invokeTest = options.invoke
         this.connectTest = options.connect ?? (() => Promise.reject(new ActorProtocolError("socket connections are not configured for this test")))
+        this.broadcastTest = options.broadcast ?? (() => Promise.reject(new ActorProtocolError("socket broadcasts are not configured for this test")))
     }
 
     async invoke(actorType: string, actorId: string, method: string, args: readonly unknown[]): Promise<unknown> {
@@ -76,6 +80,15 @@ class TestActorClient implements ActorClientTransport {
         }
         return this.connectTest(request)
     }
+
+    async broadcast(actorType: string, actorId: string, message: ActorSocketMessage): Promise<void> {
+        return this.broadcastTest({
+            requestId: validateActorComponent("request ID", this.requestId()),
+            actorType: validateActorComponent("actor type", actorType),
+            actorId: validateActorComponent("actor ID", actorId),
+            message: socketMessage(message)
+        })
+    }
 }
 
 interface ActorInvocationRequest {
@@ -90,10 +103,12 @@ interface ActorTestClientOptions {
     readonly requestId?: () => string
     readonly invoke: ActorTestInvoker
     readonly connect?: ActorTestConnector
+    readonly broadcast?: ActorTestBroadcaster
 }
 
 type ActorTestInvoker = (request: ActorInvocationRequest) => Promise<unknown>
 type ActorTestConnector = (request: ActorConnectionRequest) => Promise<ActorConnection>
+type ActorTestBroadcaster = (request: ActorBroadcastRequest) => Promise<void>
 
 interface ActorConnectionRequest {
     readonly requestId: string
@@ -102,5 +117,12 @@ interface ActorConnectionRequest {
     readonly metadata: JsonValue
 }
 
+interface ActorBroadcastRequest {
+    readonly requestId: string
+    readonly actorType: string
+    readonly actorId: string
+    readonly message: SocketMessage
+}
+
 export { actorClient, configureDurableObjects, runWithActorClientForTests }
-export type { ActorConnectionRequest, ActorInvocationRequest, ActorTestClientOptions, DurableObjectsClientOptions }
+export type { ActorBroadcastRequest, ActorConnectionRequest, ActorInvocationRequest, ActorTestClientOptions, DurableObjectsClientOptions }

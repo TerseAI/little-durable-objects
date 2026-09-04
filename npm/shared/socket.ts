@@ -198,5 +198,5 @@ function excludedSocketIds(except: ActorBroadcastOptions["except"]): readonly st
     return Array.isArray(except) ? except.map(socket => socket.id) : [(except as ActorSocket).id]
 }
 
-export { actorConnections, broadcastActor, decodeSocketMessage, runWithActorSockets }
+export { actorConnections, broadcastActor, decodeSocketMessage, runWithActorSockets, socketMessage }
 export type { ActorBroadcastOptions, ActorConnection, ActorSocket, ActorSocketMessage, ActorSocketState }

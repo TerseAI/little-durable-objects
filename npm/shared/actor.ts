@@ -83,6 +83,16 @@ function referenceClass(definition: ActorDefinition): ActorReferenceClass {
         }
     })
 
+    Object.defineProperty(ActorReference.prototype, "broadcast", {
+        configurable: false,
+        enumerable: false,
+        writable: false,
+        value: function broadcastActorMessage(this: Actor, message: ActorSocketMessage): Promise<void> {
+            const actor = metadataFor(this)
+            return actorClient().broadcast(definition.actorType, actor.actorId, message)
+        }
+    })
+
     definition.methods.forEach(method => {
         Object.defineProperty(ActorReference.prototype, method, {
             configurable: false,
@@ -113,7 +123,7 @@ function discoverMethods(actorClass: ActorClass, actorType: string): string[] {
         if (typeof descriptor.value !== "function") return []
         validateActorComponent("actor method", name)
         if (name === "then") throw new ActorDefinitionError(`actor class ${actorType} cannot define method then`)
-        if (name === "connect") throw new ActorDefinitionError(`actor class ${actorType} cannot define reserved method connect`)
+        if (name === "connect" || name === "broadcast") throw new ActorDefinitionError(`actor class ${actorType} cannot define reserved method ${name}`)
         if (!(descriptor.value instanceof asyncFunction)) throw new ActorDefinitionError(`actor method ${actorType}.${name} must be async`)
         if (lifecycleMethods.has(name)) return []
         return [name]
@@ -156,6 +166,7 @@ type ActorReference<Instance extends Actor> = {
     [Key in keyof Instance as Instance[Key] extends AsyncMethod ? (Key extends SocketLifecycleMethod ? never : Key) : never]: Instance[Key]
 } & {
     connect(metadata: SocketMetadata<Instance>): Promise<ActorConnection>
+    broadcast(message: ActorSocketMessage): Promise<void>
 }
 type SocketLifecycleMethod = "onConnect" | "onMessage" | "onDisconnect"
 type SocketMetadata<Instance> = Instance extends { onConnect(socket: ActorSocket<infer Metadata>): Promise<unknown> } ? Metadata : unknown

@@ -136,6 +136,53 @@ test("opens actor WebSockets on the control plane without provisioning a host fi
     ])
 })
 
+test("broadcasts to actor sockets without resolving or invoking an actor host", async () => {
+    const requests: { readonly method?: string; readonly url?: string; readonly authorization?: string; readonly body?: unknown }[] = []
+    let hostInvocations = 0
+    const server = createServer(async (request, response) => {
+        requests.push({
+            method: request.method,
+            url: request.url,
+            authorization: request.headers.authorization,
+            body: await requestBody(request)
+        })
+        response.writeHead(204).end()
+    })
+    const port = await listen(server)
+    const client = new RemoteActorClient(
+        {
+            token: "workflow-token",
+            namespaceId: "project-1",
+            controlPlaneUrl: "https://control.example.com",
+            socketGatewayUrl: `http://127.0.0.1:${port}`
+        },
+        {
+            actorHost: {
+                async invoke() {
+                    hostInvocations += 1
+                    return { type: "completed", result: null, effects: [] }
+                }
+            }
+        }
+    )
+    try {
+        await client.broadcast("ChatRoom", "room-1", "hello")
+        assert.equal(hostInvocations, 0)
+        assert.deepEqual(requests, [
+            {
+                method: "POST",
+                url: "/v1/namespaces/project-1/actors/ChatRoom/room-1/socket-effects",
+                authorization: "Bearer workflow-token",
+                body: {
+                    effects: [{ type: "broadcast", message: { type: "text", data: "hello" }, except_connection_ids: [], tags: [] }]
+                }
+            }
+        ])
+    } finally {
+        await close(server)
+    }
+})
+
 test("forwards actor socket effects to the control-plane gateway after a direct invocation", async () => {
     const requests: { readonly method?: string; readonly url?: string; readonly body?: unknown }[] = []
     const server = createServer(async (request, response) => {

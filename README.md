@@ -117,6 +117,8 @@ const socket = await ChatRoom.get("lobby").connect({
 
 socket.addEventListener("message", event => console.log(event.data))
 socket.send("hello")
+
+await ChatRoom.get("lobby").broadcast("streamed output")
 ```
 
 ## License

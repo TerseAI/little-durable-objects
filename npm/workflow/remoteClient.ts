@@ -3,7 +3,8 @@ import { z } from "zod"
 
 import { ActorConfigurationError, ActorInvocationError, ActorProtocolError } from "../shared/errors.js"
 import { currentActorInvocation } from "../shared/invocationContext.js"
-import type { ActorConnection } from "../shared/socket.js"
+import { socketMessage } from "../shared/socket.js"
+import type { ActorConnection, ActorSocketMessage } from "../shared/socket.js"
 import { LatencyTimeline, stderrTelemetry } from "../shared/telemetry.js"
 import type { TelemetrySink } from "../shared/telemetry.js"
 import { JsonActorStateSerializer, validateActorComponent } from "../shared/types.js"
@@ -112,6 +113,18 @@ class RemoteActorClient {
         return this.connectWebSocket(socketUrl(this.settings.socketGatewayUrl, this.settings.namespaceId, actor.actorType, actor.actorId), this.settings.token, attachment)
     }
 
+    async broadcast(actorType: string, actorId: string, message: ActorSocketMessage): Promise<void> {
+        const requestId = validateActorComponent("request ID", this.requestId())
+        if (currentActorInvocation() !== undefined) throw new ActorInvocationError("actor_error", requestId, "actor-to-actor socket broadcasts are not available")
+        await this.deliverSocketEffects(
+            validateActorComponent("actor type", actorType),
+            validateActorComponent("actor ID", actorId),
+            [{ type: "broadcast", message: socketMessage(message), except_connection_ids: [], tags: [] }],
+            requestId,
+            "actor socket broadcast"
+        )
+    }
+
     private async direct(target: ActorHostTarget, invocation: DirectActorInvocation, retryReroute: boolean, timeline: LatencyTimeline): Promise<unknown> {
         try {
             const reply = await this.actorHost.invoke(target, invocation)
@@ -136,19 +149,23 @@ class RemoteActorClient {
 
     private async applySocketEffects(invocation: DirectActorInvocation, effects: readonly SocketEffect[]): Promise<void> {
         if (effects.length === 0) return
+        return this.deliverSocketEffects(invocation.actorType, invocation.actorId, effects, invocation.requestId, "actor completed but socket effects")
+    }
+
+    private async deliverSocketEffects(actorType: string, actorId: string, effects: readonly SocketEffect[], requestId: string, failureContext: string): Promise<void> {
         let response: Response
         try {
-            response = await this.fetchRequest(socketEffectsUrl(this.settings, invocation.actorType, invocation.actorId), {
+            response = await this.fetchRequest(socketEffectsUrl(this.settings, actorType, actorId), {
                 method: "POST",
                 headers: { "content-type": "application/json", authorization: `Bearer ${this.settings.token}` },
                 body: JSON.stringify({ effects })
             })
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error)
-            throw new ActorInvocationError("outcome_unknown", invocation.requestId, `actor completed but socket effects could not be delivered: ${message}`)
+            throw new ActorInvocationError("outcome_unknown", requestId, `${failureContext} could not be delivered: ${message}`)
         }
         if (!response.ok) {
-            throw new ActorInvocationError("outcome_unknown", invocation.requestId, `actor completed but socket effects returned HTTP ${response.status}`)
+            throw new ActorInvocationError("outcome_unknown", requestId, `${failureContext} returned HTTP ${response.status}`)
         }
     }
 
