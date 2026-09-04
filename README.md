@@ -97,11 +97,6 @@ interface Session {
 }
 
 export class ChatRoom extends Actor {
-    async onConnect(socket: ActorSocket<Session>): Promise<void> {
-        socket.setTags("member")
-        socket.send("ready")
-    }
-
     async onMessage(socket: ActorSocket<Session>, message: string | Uint8Array): Promise<void> {
         this.broadcast(message)
     }
