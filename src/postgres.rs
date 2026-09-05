@@ -18,22 +18,7 @@ pub(crate) struct PostgresDatabase {
 
 impl PostgresDatabase {
     pub(crate) async fn connect(url: &str) -> Result<Self> {
-        let config = Config::from_str(url).context("parse PostgreSQL connection URL")?;
-        let manager = match config.get_ssl_mode() {
-            SslMode::Disable => Manager::new(config, NoTls),
-            _ => {
-                let connector = TlsConnector::builder()
-                    .build()
-                    .context("build PostgreSQL TLS connector")?;
-                Manager::new(config, MakeTlsConnector::new(connector))
-            }
-        };
-        let pool = Pool::builder(manager)
-            .max_size(8)
-            .runtime(Runtime::Tokio1)
-            .wait_timeout(Some(Duration::from_secs(5)))
-            .create_timeout(Some(Duration::from_secs(5)))
-            .build()?;
+        let pool = connection_pool(url)?;
         let mut client = pool.get().await.context("connect to PostgreSQL")?;
         embedded::migrations::runner()
             .run_async(&mut **client)
@@ -82,6 +67,25 @@ impl PostgresDatabase {
     }
 }
 
+fn connection_pool(url: &str) -> Result<Pool> {
+    let config = Config::from_str(url).context("parse PostgreSQL connection URL")?;
+    let manager = match config.get_ssl_mode() {
+        SslMode::Disable => Manager::new(config, NoTls),
+        _ => {
+            let connector = TlsConnector::builder()
+                .build()
+                .context("build PostgreSQL TLS connector")?;
+            Manager::new(config, MakeTlsConnector::new(connector))
+        }
+    };
+    Ok(Pool::builder(manager)
+        .max_size(8)
+        .runtime(Runtime::Tokio1)
+        .wait_timeout(Some(Duration::from_secs(5)))
+        .create_timeout(Some(Duration::from_secs(5)))
+        .build()?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,7 +95,9 @@ mod tests {
         let Ok(url) = std::env::var("DURABLE_OBJECT_TEST_POSTGRES_URL") else {
             return Ok(());
         };
-        let database = PostgresDatabase::connect(&url).await?;
+        let database = PostgresDatabase {
+            pool: connection_pool(&url)?,
+        };
         let (first, second) = tokio::try_join!(
             database.query_one("SELECT pg_backend_pid(), pg_sleep(0.05)", &[]),
             database.query_one("SELECT pg_backend_pid(), pg_sleep(0.05)", &[]),
