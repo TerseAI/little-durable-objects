@@ -17,14 +17,14 @@ trusted backend
 |                                     |                                     |
 |                              HostProvisioner                              |
 |                                     |                                     |
-| command sandbox provider ---------->+----> Modal Sandbox V2               |
+| command sandbox provider ---------->+----> Modal Sandbox V2 (GCP pools)   |
 |   JSON host handle / lazy public gRPC route | current filesystem API      |
 |                                               |                           |
 | internal gRPC API <-------- host JWT ---------+----> Rust actor host       |
 +---------------------------------------------------------------------------+
           ^                 ^                |                  |
           | workflow JWT    | WebSocket      | public lifecycle | Unix socket
-          |                 | + key/ticket   | or private method| methods + lifecycle
+          |                 | + key/ticket   | / method gRPC   | methods + lifecycle
           |                 |                v                  v
        workflow          clients        Rust actor host --> Node actor worker
           ^                                  |
@@ -41,7 +41,7 @@ The gateway retains physical connections, JSON metadata, and tags. Each connect,
 
 The Rust-to-Node actor session allows a 32 MiB internal envelope so a 16 MiB actor state plus protocol framing and results can cross the process boundary. It maps oversized requests or responses to `resource_exhausted`; an oversized response also evicts the in-memory actor so unpublished state cannot survive the rejected invocation. Actor state and individual WebSocket messages are limited to 16 MiB. A state-changing invocation uploads a uniquely named snapshot through a create-only signed URL, then asks the control plane to advance the PostgreSQL state head. That single update is conditional on the active host session, owner epoch, and expected state version. The commit response includes a best-effort write ticket for the next version, removing one control-plane round trip from the normal warm path. If a commit response is lost, the host retains the pending snapshot and retries the same idempotent commit before executing another request. Unique snapshot names avoid GCS's same-object write-rate limit; PostgreSQL remains the source of truth for which snapshot is current.
 
-The sandbox provider translates each canonical home region into one exact Modal GCP region. Actor hosts and Terse workflow sandboxes enable Modal private IPv6 networking, so same-region method invocations connect directly over i6pn. Hosted workflow JWTs explicitly grant private routing; local and older workflow tokens default to public routing so they never receive an unreachable i6pn address. Actor hosts advertise their private gRPC address in the lease and start concurrently with Modal's public HTTP/2 endpoint provisioning; activation never waits for the public route. The public route is resolved lazily and cached by host session for control-plane-dispatched socket lifecycle events.
+The sandbox provider translates each canonical home region into a Modal GCP placement. The North American defaults use the broader `us-east`, `us-central`, and `us-west` scheduler pools and public HTTP/2 routes for method and socket lifecycle traffic. These pools preserve the actor's logical home but do not guarantee placement in the exact region of its GCS bucket or control plane; benchmarks record the actual Modal region. Custom placements marked for private networking must pin actor hosts and workflow sandboxes to the same exact region, where method invocations can connect directly over i6pn. Hosted workflow JWTs may grant private routing; local and older workflow tokens default to public routing so they never receive an unreachable i6pn address. Private actor hosts advertise their i6pn gRPC address in the lease and resolve the public route lazily for control-plane-dispatched socket lifecycle events. Public actor hosts wait for the HTTP/2 tunnel during activation and advertise that route for both traffic classes.
 
 The workflow client, control plane, provider adapter, and actor host emit one completion event per timed operation:
 

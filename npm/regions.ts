@@ -15,16 +15,16 @@ type CanonicalRegionCatalog = Readonly<Record<string, RegionDefinition>>
 
 const recommendedRegionCatalog = {
     "north-america-east": {
-        modal: { regions: ["us-east4"], cloud: "gcp", observedPlacements: ["gcp:us-east4*"], privateNetwork: true }
+        modal: { regions: ["us-east"], cloud: "gcp", observedPlacements: ["gcp:us-east*"] }
     },
     "north-america-central": {
-        modal: { regions: ["us-central1"], cloud: "gcp", observedPlacements: ["gcp:us-central1*"], privateNetwork: true }
+        modal: { regions: ["us-central"], cloud: "gcp", observedPlacements: ["gcp:us-central*"] }
     },
     "north-america-south": {
         modal: { regions: ["us-south"], cloud: "gcp", observedPlacements: ["gcp:us-south*"] }
     },
     "north-america-west": {
-        modal: { regions: ["us-west1"], cloud: "gcp", observedPlacements: ["gcp:us-west1*"], privateNetwork: true }
+        modal: { regions: ["us-west"], cloud: "gcp", observedPlacements: ["gcp:us-west*"] }
     },
     "europe-west": {
         modal: { regions: ["eu-west"], cloud: "gcp", observedPlacements: ["gcp:europe-west*"] }
