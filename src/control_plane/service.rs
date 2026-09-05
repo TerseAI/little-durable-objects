@@ -1,8 +1,12 @@
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
-use tokio::sync::RwLock;
+use moka::future::Cache;
+use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
@@ -46,7 +50,9 @@ pub struct ControlPlaneService {
     auth: ActorJwtVerifier,
     host_token_issuer: Option<ActorJwtIssuer>,
     routing: Option<RoutingDependencies>,
-    public_routes: Arc<RwLock<HashMap<(HostId, String), String>>>,
+    public_routes: Cache<(HostId, String), String>,
+    socket_targets: Cache<(ActorKey, HostId, String, i64), Arc<WorkflowActorTarget>>,
+    host_channels: Cache<String, Channel>,
     socket_events: Option<Arc<dyn super::event_sink::SocketMessageEventSink>>,
     socket_authenticator: Option<Arc<dyn super::socket_auth::SocketAuthenticator>>,
 }
@@ -71,7 +77,18 @@ impl ControlPlaneService {
             auth,
             host_token_issuer: None,
             routing: None,
-            public_routes: Arc::new(RwLock::new(HashMap::new())),
+            public_routes: Cache::builder()
+                .max_capacity(1024)
+                .time_to_live(Duration::from_secs(60))
+                .build(),
+            socket_targets: Cache::builder()
+                .max_capacity(4096)
+                .time_to_live(Duration::from_secs(55))
+                .build(),
+            host_channels: Cache::builder()
+                .max_capacity(256)
+                .time_to_idle(Duration::from_secs(300))
+                .build(),
             socket_events: None,
             socket_authenticator: None,
         }
@@ -256,44 +273,108 @@ impl ControlPlaneService {
         principal: &ActorPrincipal,
         invocation: ActorSocketInvocation,
     ) -> Result<Vec<ActorSocketEffect>> {
-        let target = self
-            .resolve_workflow_route(
-                principal,
-                &invocation.actor,
-                WorkflowRoute::ControlPlane,
-                None,
-            )
-            .await?;
-        let mut client = ActorHostServiceClient::connect(target.route.clone())
+        let key = (
+            invocation.actor.clone(),
+            principal.host_id.clone(),
+            principal.session_id.clone(),
+            principal.expires_at,
+        );
+        for attempt in 0..2 {
+            let target = self.socket_target(principal, &invocation.actor).await?;
+            match self.send_socket_event(&target, &invocation).await {
+                Ok(crate::actor::ActorExecutionResult::Completed { effects, .. }) => {
+                    return Ok(effects);
+                }
+                Ok(
+                    crate::actor::ActorExecutionResult::Reroute
+                    | crate::actor::ActorExecutionResult::HostUnavailable,
+                ) => {
+                    self.socket_targets.invalidate(&key).await;
+                    if attempt == 1 {
+                        anyhow::bail!("actor host remained unavailable after socket reroute");
+                    }
+                }
+                Ok(crate::actor::ActorExecutionResult::Failed { failure }) => {
+                    anyhow::bail!("{}: {}", failure.code, failure.message)
+                }
+                Err(error) => {
+                    self.socket_targets.invalidate(&key).await;
+                    self.host_channels.invalidate(&target.route).await;
+                    return Err(error);
+                }
+            }
+        }
+        unreachable!("socket dispatch returns after its final attempt")
+    }
+
+    async fn send_socket_event(
+        &self,
+        target: &WorkflowActorTarget,
+        invocation: &ActorSocketInvocation,
+    ) -> Result<crate::actor::ActorExecutionResult> {
+        let channel = self
+            .host_channels
+            .try_get_with(target.route.clone(), async {
+                Endpoint::new(target.route.clone())?
+                    .connect_timeout(Duration::from_secs(5))
+                    .timeout(super::CONTROL_PLANE_REQUEST_TIMEOUT)
+                    .connect()
+                    .await
+                    .context("connect to actor host")
+            })
             .await
-            .with_context(|| format!("connect to actor host at {}", target.route))?
+            .map_err(|error| anyhow::anyhow!("{error:#}"))?;
+        let mut client = ActorHostServiceClient::new(channel)
             .max_decoding_message_size(crate::actor::MAX_ACTOR_EXECUTOR_MESSAGE_BYTES)
             .max_encoding_message_size(crate::actor::MAX_ACTOR_EXECUTOR_MESSAGE_BYTES);
         let mut request = Request::new(HostSocketEventRequest {
-            request_id: invocation.request_id,
-            actor: Some(invocation.actor.into()),
+            request_id: invocation.request_id.clone(),
+            actor: Some(invocation.actor.clone().into()),
             event_json: serde_json::to_vec(&invocation.event)?,
             connections_json: serde_json::to_vec(&invocation.connections)?,
             owner_epoch: target.owner_epoch,
-            state_read_url: target.state_read_url,
+            state_read_url: target.state_read_url.clone(),
             state_version: target.state_version,
         });
         request
             .metadata_mut()
             .insert("authorization", format!("Bearer {}", target.token).parse()?);
         let reply = client.handle_socket(request).await?.into_inner();
-        match crate::actor::ActorExecutionResult::try_from(reply)? {
-            crate::actor::ActorExecutionResult::Completed { effects, .. } => Ok(effects),
-            crate::actor::ActorExecutionResult::Failed { failure } => {
-                anyhow::bail!("{}: {}", failure.code, failure.message)
+        crate::actor::ActorExecutionResult::try_from(reply)
+    }
+
+    async fn socket_target(
+        &self,
+        principal: &ActorPrincipal,
+        actor: &ActorKey,
+    ) -> Result<Arc<WorkflowActorTarget>> {
+        actor.validate()?;
+        ensure!(
+            principal.process_role == ActorProcessRole::Workflow && principal.scope.contains(actor),
+            "workflow token cannot resolve this actor"
+        );
+        let now = unix_seconds()?;
+        ensure!(principal.expires_at > now, "workflow token has expired");
+        let key = (
+            actor.clone(),
+            principal.host_id.clone(),
+            principal.session_id.clone(),
+            principal.expires_at,
+        );
+        if let Some(target) = self.socket_targets.get(&key).await {
+            if target.expires_at_ms > (now + 5) * 1000 {
+                return Ok(target);
             }
-            crate::actor::ActorExecutionResult::Reroute => {
-                anyhow::bail!("actor ownership changed during socket dispatch")
-            }
-            crate::actor::ActorExecutionResult::HostUnavailable => {
-                anyhow::bail!("actor host is unavailable")
-            }
+            self.socket_targets.invalidate(&key).await;
         }
+        self.socket_targets
+            .try_get_with(key, async {
+                self.resolve_workflow_route(principal, actor, WorkflowRoute::ControlPlane, None)
+                    .await
+                    .map(Arc::new)
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("{error:#}"))
     }
 
     pub(super) fn deliver_socket_message_event(
@@ -387,12 +468,9 @@ impl ControlPlaneService {
             {
                 target.lease.route.clone()
             }
-            WorkflowRoute::Invocation => {
-                self.provisioner()?
-                    .public_host_route(&target.spec, &target.placement.home_region)
-                    .await?
+            WorkflowRoute::Invocation | WorkflowRoute::ControlPlane => {
+                self.public_route(&target).await?
             }
-            WorkflowRoute::ControlPlane => self.public_route(&target).await?,
         };
         if let Some(timings) = timings {
             timings.route_selected_at_ms = Some(timings.elapsed_ms());
@@ -415,16 +493,18 @@ impl ControlPlaneService {
     }
 
     async fn public_route(&self, target: &RoutedActor) -> Result<String> {
-        let key = (target.lease.id.clone(), target.lease.session_id.clone());
-        if let Some(route) = self.public_routes.read().await.get(&key) {
-            return Ok(route.clone());
+        if target.lease.route.starts_with("https://") {
+            return Ok(target.lease.route.clone());
         }
-        let route = self
-            .provisioner()?
-            .public_host_route(&target.spec, &target.placement.home_region)
-            .await?;
-        self.public_routes.write().await.insert(key, route.clone());
-        Ok(route)
+        let key = (target.lease.id.clone(), target.lease.session_id.clone());
+        self.public_routes
+            .try_get_with(key, async {
+                self.provisioner()?
+                    .public_host_route(&target.spec, &target.placement.home_region)
+                    .await
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("{error:#}"))
     }
 }
 
@@ -1560,31 +1640,234 @@ mod tests {
             .await?;
 
         assert_eq!(cross_region_target.route, "https://actor.example.com/");
+        let principal = ActorPrincipal {
+            scope: ActorScope {
+                namespace_id: "project-1".into(),
+            },
+            host_id: HostId::new("workflow.v1.project-1.socket-test"),
+            session_id: uuid::Uuid::new_v4().to_string(),
+            process_role: ActorProcessRole::Workflow,
+            region: "us-east".into(),
+            private_routing: false,
+            code_revision: None,
+            expires_at: unix_seconds()? + 30,
+            invocation: None,
+        };
+        let first = service.socket_target(&principal, &actor).await?;
+        let second = service.socket_target(&principal, &actor).await?;
+        assert!(Arc::ptr_eq(&first, &second));
+        let cached_key = (
+            actor.clone(),
+            principal.host_id.clone(),
+            principal.session_id.clone(),
+            principal.expires_at,
+        );
+        service
+            .socket_targets
+            .insert(
+                cached_key,
+                Arc::new(WorkflowActorTarget {
+                    route: first.route.clone(),
+                    token: first.token.clone(),
+                    owner_epoch: first.owner_epoch,
+                    state_version: first.state_version,
+                    state_read_url: first.state_read_url.clone(),
+                    expires_at_ms: (unix_seconds()? + 4) * 1000,
+                }),
+            )
+            .await;
+        let refreshed = service.socket_target(&principal, &actor).await?;
+        assert!(refreshed.expires_at_ms > (unix_seconds()? + 5) * 1000);
+        let mut shorter = principal.clone();
+        shorter.expires_at -= 10;
+        let shorter_target = service.socket_target(&shorter, &actor).await?;
+        assert!(shorter_target.expires_at_ms <= shorter.expires_at * 1000);
+        let mut other_session = principal.clone();
+        other_session.session_id = uuid::Uuid::new_v4().to_string();
+        assert!(!Arc::ptr_eq(
+            &first,
+            &service.socket_target(&other_session, &actor).await?
+        ));
+        let mut expired = principal.clone();
+        expired.expires_at = unix_seconds()?;
+        assert!(service.socket_target(&expired, &actor).await.is_err());
         assert_eq!(
             provisioner.routes.lock().unwrap().as_slice(),
-            &[
-                (
-                    HostLaunchSpec {
-                        namespace_id: "project-1".into(),
-                        code_revision: "revision-1".into(),
-                        image_ref: "image-1".into(),
-                        working_directory: "/workspace".into(),
-                        actor_entrypoint: None,
-                    },
-                    "us-east".into()
-                ),
-                (
-                    HostLaunchSpec {
-                        namespace_id: "project-1".into(),
-                        code_revision: "revision-1".into(),
-                        image_ref: "image-1".into(),
-                        working_directory: "/workspace".into(),
-                        actor_entrypoint: None,
-                    },
-                    "us-east".into()
-                )
-            ]
+            &[(
+                HostLaunchSpec {
+                    namespace_id: "project-1".into(),
+                    code_revision: "revision-1".into(),
+                    image_ref: "image-1".into(),
+                    working_directory: "/workspace".into(),
+                    actor_entrypoint: None,
+                },
+                "us-east".into()
+            )]
         );
+        let mut routed = service.route_actor(&actor, "us-east", None).await?;
+        routed.lease.route = "https://already-public.example.com/".into();
+        assert_eq!(service.public_route(&routed).await?, routed.lease.route);
+        assert_eq!(provisioner.routes.lock().unwrap().len(), 1);
+        routed.lease.route = "http://[fd00:cafe::5678]:7101/".into();
+        routed.lease.session_id = uuid::Uuid::new_v4().to_string();
+        service.public_route(&routed).await?;
+        assert_eq!(provisioner.routes.lock().unwrap().len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn socket_dispatch_reuses_a_connection_and_does_not_replay_transport_failures()
+    -> Result<()> {
+        use crate::grpc::proto::{
+            self,
+            actor_host_service_server::{ActorHostService, ActorHostServiceServer},
+        };
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use tokio_stream::{StreamExt, wrappers::TcpListenerStream};
+
+        struct Host {
+            calls: Arc<AtomicUsize>,
+            fail: Arc<AtomicBool>,
+        }
+        #[tonic::async_trait]
+        impl ActorHostService for Host {
+            async fn invoke(
+                &self,
+                _: Request<proto::HostInvokeActorRequest>,
+            ) -> Result<tonic::Response<proto::InvokeActorReply>, Status> {
+                Err(Status::unimplemented(
+                    "method invocation is outside this test",
+                ))
+            }
+            async fn handle_socket(
+                &self,
+                request: Request<HostSocketEventRequest>,
+            ) -> Result<tonic::Response<proto::InvokeActorReply>, Status> {
+                assert_eq!(
+                    request.metadata().get("authorization").unwrap(),
+                    "Bearer test-token"
+                );
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if self.fail.load(Ordering::SeqCst) {
+                    return Err(Status::unavailable("reply lost after execution"));
+                }
+                Ok(tonic::Response::new(
+                    crate::actor::ActorExecutionResult::Completed {
+                        result: serde_json::Value::Null,
+                        effects: vec![],
+                    }
+                    .into(),
+                ))
+            }
+        }
+        let connections = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fail = Arc::new(AtomicBool::new(false));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let route = format!("http://{}", listener.local_addr()?);
+        let accepted = connections.clone();
+        let incoming = TcpListenerStream::new(listener).map(move |stream| {
+            if stream.is_ok() {
+                accepted.fetch_add(1, Ordering::SeqCst);
+            }
+            stream
+        });
+        let stop = tokio_util::sync::CancellationToken::new();
+        let shutdown = stop.clone();
+        let host = Host {
+            calls: calls.clone(),
+            fail: fail.clone(),
+        };
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(ActorHostServiceServer::new(host))
+                .serve_with_incoming_shutdown(incoming, async move { shutdown.cancelled().await }),
+        );
+        let issuer = test_issuer()?;
+        let auth = ActorJwtVerifier::for_scope(
+            issuer.verifier_keys_json()?,
+            "issuer",
+            "invocation",
+            ActorTokenPurpose::Invocation,
+            Duration::from_secs(60),
+        )?;
+        let service = ControlPlaneService::new(
+            Arc::new(FakeLeaseStore {
+                leases: Mutex::new(HashMap::new()),
+            }),
+            Arc::new(LocalObjectPlacementStore::default()),
+            Arc::new(FakeStorageUrls),
+            auth,
+        );
+        let actor = ActorKey {
+            namespace_id: "project-1".into(),
+            actor_type: "Counter".into(),
+            actor_id: "one".into(),
+        };
+        let principal = ActorPrincipal {
+            scope: ActorScope {
+                namespace_id: actor.namespace_id.clone(),
+            },
+            host_id: HostId::new("workflow.v1.project-1.test"),
+            session_id: uuid::Uuid::new_v4().to_string(),
+            process_role: ActorProcessRole::Workflow,
+            region: "us-east".into(),
+            private_routing: false,
+            code_revision: None,
+            expires_at: unix_seconds()? + 60,
+            invocation: None,
+        };
+        let key = (
+            actor.clone(),
+            principal.host_id.clone(),
+            principal.session_id.clone(),
+            principal.expires_at,
+        );
+        service
+            .socket_targets
+            .insert(
+                key.clone(),
+                Arc::new(WorkflowActorTarget {
+                    route: route.clone(),
+                    token: "test-token".into(),
+                    owner_epoch: 1,
+                    state_version: 0,
+                    state_read_url: String::new(),
+                    expires_at_ms: (unix_seconds()? + 30) * 1000,
+                }),
+            )
+            .await;
+        let invocation = |id: &str| ActorSocketInvocation {
+            request_id: id.into(),
+            actor: actor.clone(),
+            event: ActorSocketEvent::Message {
+                connection_id: "one".into(),
+                message: crate::actor::ActorSocketMessage::Text {
+                    data: "hello".into(),
+                },
+            },
+            connections: vec![],
+            state: None,
+        };
+        service
+            .dispatch_socket_event(&principal, invocation("first"))
+            .await?;
+        service
+            .dispatch_socket_event(&principal, invocation("second"))
+            .await?;
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+        fail.store(true, Ordering::SeqCst);
+        assert!(
+            service
+                .dispatch_socket_event(&principal, invocation("third"))
+                .await
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert!(service.socket_targets.get(&key).await.is_none());
+        assert!(service.host_channels.get(&route).await.is_none());
+        stop.cancel();
+        server.await??;
         Ok(())
     }
 

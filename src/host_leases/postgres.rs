@@ -28,7 +28,6 @@ impl HostLeaseRegistry for PostgresHostLeaseStore {
             .expect("validated host lease duration must fit PostgreSQL BIGINT");
         let row = self
             .database
-            .client()
             .query_opt(
                 &format!(
                     "INSERT INTO durable_object_host_leases (host_id, session_id, route, expires_at_ms) \
@@ -61,7 +60,6 @@ impl HostLeaseRegistry for PostgresHostLeaseStore {
 
     async fn unregister(&self, id: &HostId, session_id: &str) -> Result<()> {
         self.database
-            .client()
             .execute(
                 "DELETE FROM durable_object_host_leases WHERE host_id = $1 AND session_id = $2",
                 &[&id.as_str(), &session_id],
@@ -77,7 +75,6 @@ impl HostLeaseStore for PostgresHostLeaseStore {
     async fn lease_status(&self, id: &HostId) -> Result<HostLeaseStatus> {
         let row = self
             .database
-            .client()
             .query_one(
                 &format!(
                     "SELECT {REGISTRY_NOW_MS} AS store_now_ms, lease.session_id, \

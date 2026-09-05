@@ -38,7 +38,8 @@ const invokeCommandSchema = z.object({
     actor: actorIdentitySchema,
     method: actorComponentSchema,
     args: z.array(jsonValueSchema),
-    state: jsonValueSchema.nullable(),
+    state: jsonValueSchema.nullable().optional(),
+    resident_only: z.boolean().optional(),
     connections: z.array(z.lazy(() => socketConnectionSchema)).optional()
 })
 
@@ -84,7 +85,8 @@ const websocketEventCommandSchema = z.object({
     actor: actorIdentitySchema,
     event: socketEventSchema,
     connections: z.array(socketConnectionSchema),
-    state: jsonValueSchema.nullable()
+    state: jsonValueSchema.nullable().optional(),
+    resident_only: z.boolean().optional()
 })
 
 const evictCommandSchema = z.object({
@@ -95,7 +97,7 @@ const evictCommandSchema = z.object({
 const executorCommandSchema = z.discriminatedUnion("type", [invokeCommandSchema, websocketEventCommandSchema, evictCommandSchema])
 
 const actorSessionServerMessageSchema = z.discriminatedUnion("type", [
-    z.object({ type: z.literal("attached"), protocol: z.literal(12) }),
+    z.object({ type: z.literal("attached"), protocol: z.literal(13) }),
     z.object({
         type: z.literal("command"),
         message_id: z.number().int().nonnegative(),
@@ -194,12 +196,12 @@ type InvokeCommand = z.infer<typeof invokeCommandSchema>
 type EvictCommand = z.infer<typeof evictCommandSchema>
 type ActorExecutorCommand = z.infer<typeof executorCommandSchema>
 type ActorSessionServerMessage = z.infer<typeof actorSessionServerMessageSchema>
-type ActorExecutorReply = InvokedReply | WebSocketHandledReply | FailedReply | EvictedReply
+type ActorExecutorReply = InvokedReply | WebSocketHandledReply | FailedReply | EvictedReply | { readonly type: "state_required" }
 type ActorSessionClientMessage = AttachMessage | ReplyMessage
 
 interface AttachMessage {
     readonly type: "attach"
-    readonly protocol: 12
+    readonly protocol: 13
     readonly actor_types: readonly string[]
 }
 
@@ -233,11 +235,11 @@ interface EvictedReply {
 }
 
 interface ActorWorkerData {
-    readonly actorType: string
     readonly moduleUrl: string
 }
 
 type ActorWorkerRequest = { readonly type: "execute"; readonly command: InvokeCommand | WebSocketEventCommand }
+type ActorWorkerMessage = { readonly type: "ready"; readonly actorTypes: readonly string[] } | ActorExecutorReply
 
 type SocketConnection = z.infer<typeof socketConnectionSchema>
 type SocketMessage = z.infer<typeof socketMessageSchema>
@@ -257,6 +259,7 @@ export type {
     ActorSessionClientMessage,
     ActorSessionServerMessage,
     ActorWorkerData,
+    ActorWorkerMessage,
     ActorWorkerRequest,
     EvictCommand,
     InvokeCommand,

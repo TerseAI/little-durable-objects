@@ -235,12 +235,7 @@ impl ActorHost {
             });
         }
         timings.pending_commit_resolved_at_ms = Some(timings.elapsed_ms());
-        let outcome = self
-            .execute_socket_event(ActorSocketInvocation {
-                state: cached.state().cloned(),
-                ..invocation
-            })
-            .await;
+        let outcome = self.execute_socket_event(invocation, cached.state()).await;
         timings.actor_execution_completed_at_ms = Some(timings.elapsed_ms());
         let (next_state, effects) = match outcome {
             Ok(outcome) => outcome,
@@ -426,14 +421,17 @@ impl ActorHost {
     ) -> std::result::Result<(Value, Value, Vec<ActorSocketEffect>), ActorExecutionResult> {
         let outcome = self
             .executor
-            .invoke(ActorMethodInvocation {
-                request_id: invocation.request_id.clone(),
-                actor: invocation.actor.clone(),
-                method: invocation.method.clone(),
-                args: invocation.args.clone(),
-                state: state.cloned(),
-                connections,
-            })
+            .invoke_with_state(
+                ActorMethodInvocation {
+                    request_id: invocation.request_id.clone(),
+                    actor: invocation.actor.clone(),
+                    method: invocation.method.clone(),
+                    args: invocation.args.clone(),
+                    state: None,
+                    connections,
+                },
+                state,
+            )
             .await;
         match outcome {
             Ok(ActorMethodOutcome::Completed {
@@ -471,9 +469,14 @@ impl ActorHost {
     async fn execute_socket_event(
         &self,
         invocation: ActorSocketInvocation,
+        state: Option<&Value>,
     ) -> std::result::Result<(Value, Vec<ActorSocketEffect>), ActorExecutionResult> {
         let actor = invocation.actor.clone();
-        match self.executor.handle_socket(invocation).await {
+        match self
+            .executor
+            .handle_socket_with_state(invocation, state)
+            .await
+        {
             Ok(ActorSocketOutcome::Handled { state, effects }) => {
                 match validate_socket_effects(&effects) {
                     Ok(()) => Ok((state, effects)),

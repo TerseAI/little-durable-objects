@@ -27,6 +27,168 @@ test("keeps an actor resident until Rust explicitly evicts it", async () => {
     }
 })
 
+test("starts one speculative Worker and gives it to the first actor", async () => {
+    const consumerRoot = await createTypeScriptConsumer("PreloadedCounter")
+    const entrypoint = pathToFileURL(path.join(consumerRoot, "src/durable-objects.ts")).href
+    const created: number[] = []
+    try {
+        await loadActorEntrypoint(entrypoint)
+        const runtime = new ActorWorkerSupervisor({
+            actorEntrypointUrl: entrypoint,
+            createWorker: () => {
+                created.push(created.length + 1)
+                return {
+                    async ready() {
+                        return ["PreloadedCounter"]
+                    },
+                    async execute() {
+                        return { type: "invoked", result: null, state: {} }
+                    },
+                    terminate() {}
+                }
+            }
+        })
+
+        assert.equal(created.length, 1)
+        await runtime.handle(invokeCommand("counter-1", "PreloadedCounter"))
+        assert.equal(created.length, 1)
+        await runtime.handle(invokeCommand("counter-2", "PreloadedCounter"))
+        assert.equal(created.length, 2)
+    } finally {
+        await rm(consumerRoot, { recursive: true, force: true })
+    }
+})
+
+test("expires an unused speculative Worker without replenishing it", async () => {
+    let created = 0
+    let terminated = 0
+    let finish: (() => void) | undefined
+    const expired = new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error("preload did not expire")), 1_000)
+        finish = () => {
+            clearTimeout(timeout)
+            resolve()
+        }
+    })
+    const supervisor = new ActorWorkerSupervisor({
+        actorEntrypointUrl: "file:///unused.ts",
+        actorIdleTimeoutMs: 50,
+        createWorker: () => {
+            created += 1
+            return {
+                ready: () => new Promise(() => undefined),
+                async execute() {
+                    return { type: "invoked", result: null, state: {} }
+                },
+                terminate() {
+                    terminated += 1
+                    finish?.()
+                }
+            }
+        }
+    })
+    await expired
+    assert.equal(terminated, 1)
+    await new Promise(resolve => setTimeout(resolve, 100))
+    assert.equal(created, 1)
+    supervisor.close()
+})
+
+test("eviction during Worker startup settles the invocation and allows recovery", { timeout: 5_000 }, async () => {
+    const root = await createTypeScriptConsumer("CancelledCounter")
+    const entrypoint = pathToFileURL(path.join(root, "src/durable-objects.ts")).href
+    const command = invokeCommand("counter-1", "CancelledCounter")
+    try {
+        await loadActorEntrypoint(entrypoint)
+        const runtime = new ActorWorkerSupervisor({ actorEntrypointUrl: entrypoint })
+        await runtime.ready()
+        const pending = runtime.handle(command)
+        await runtime.handle({ type: "evict", actor: command.actor })
+        const reply = await pending
+        assert.equal(reply.type, "failed")
+        if (reply.type === "failed") assert.equal(reply.code, "actor_worker_terminated")
+        assert.deepEqual(await runtime.handle({ ...command, state: { count: 9 } }), { type: "invoked", result: 10, state: { count: 10 } })
+        await runtime.handle({ type: "evict", actor: command.actor })
+    } finally {
+        await rm(root, { recursive: true, force: true })
+    }
+})
+
+test("discards a failed preload before accepting the first actor", async () => {
+    const root = await createTypeScriptConsumer("RetryPreloadCounter")
+    const entrypoint = pathToFileURL(path.join(root, "src/durable-objects.ts")).href
+    let created = 0
+    let terminated = 0
+    try {
+        await loadActorEntrypoint(entrypoint)
+        const runtime = new ActorWorkerSupervisor({
+            actorEntrypointUrl: entrypoint,
+            createWorker: () => {
+                const failed = created++ === 0
+                return {
+                    ready: () => (failed ? Promise.reject(new Error("preload failed")) : Promise.resolve(["RetryPreloadCounter"])),
+                    async execute() {
+                        if (failed) throw new Error("preload failed")
+                        return { type: "invoked", result: 1, state: { count: 1 } }
+                    },
+                    terminate() {
+                        terminated += 1
+                    }
+                }
+            }
+        })
+        await new Promise(resolve => setImmediate(resolve))
+        assert.equal(terminated, 1)
+        assert.deepEqual(await runtime.handle(invokeCommand("counter-1", "RetryPreloadCounter")), { type: "invoked", result: 1, state: { count: 1 } })
+        assert.equal(created, 2)
+        runtime.close()
+    } finally {
+        await rm(root, { recursive: true, force: true })
+    }
+})
+
+test("closing the supervisor terminates an unused Worker and rejects new work", async () => {
+    let terminated = 0
+    const runtime = new ActorWorkerSupervisor({
+        actorEntrypointUrl: "file:///unused.ts",
+        createWorker: () => ({
+            async ready() {
+                return ["UnusedCounter"]
+            },
+            async execute() {
+                throw new Error("closed supervisor must not execute")
+            },
+            terminate() {
+                terminated += 1
+            }
+        })
+    })
+    runtime.close()
+    runtime.close()
+    assert.equal(terminated, 1)
+    const reply = await runtime.handle(invokeCommand("counter-1", "UnusedCounter"))
+    assert.equal(reply.type, "failed")
+    if (reply.type === "failed") assert.equal(reply.code, "actor_worker_terminated")
+})
+
+test("an actor module that fails inside a Worker returns a failure without hanging", { timeout: 5_000 }, async () => {
+    const root = await createTypeScriptConsumer("FailedImportCounter", 'import { isMainThread } from "node:worker_threads"\nif (!isMainThread) throw new Error("worker import failed")')
+    const entrypoint = pathToFileURL(path.join(root, "src/durable-objects.ts")).href
+    try {
+        await loadActorEntrypoint(entrypoint)
+        const runtime = new ActorWorkerSupervisor({ actorEntrypointUrl: entrypoint })
+        try {
+            const reply = await runtime.handle(invokeCommand("counter-1", "FailedImportCounter"))
+            assert.equal(reply.type, "failed")
+            if (reply.type === "failed") assert.match(reply.message, /worker import failed/)
+        } finally {
+            runtime.close()
+        }
+    } finally {
+        await rm(root, { recursive: true, force: true })
+    }
+})
+
 async function exerciseResidency(entrypoint: string): Promise<void> {
     assert.deepEqual(await loadActorEntrypoint(entrypoint), ["SessionCounter"])
     const runtime = new ActorWorkerSupervisor({ actorEntrypointUrl: entrypoint })
@@ -136,7 +298,7 @@ async function exerciseIdleRecycling(entrypoint: string): Promise<void> {
     )
 }
 
-async function createTypeScriptConsumer(): Promise<string> {
+async function createTypeScriptConsumer(actorType = "SessionCounter", preamble = ""): Promise<string> {
     const root = await mkdtemp(path.join(os.tmpdir(), "durable-object-worker-"))
     const source = path.join(root, "src")
     await mkdir(source)
@@ -145,8 +307,9 @@ async function createTypeScriptConsumer(): Promise<string> {
     await writeFile(
         path.join(source, "durable-objects.ts"),
         `import { Actor } from ${JSON.stringify(pathToFileURL(path.join(compiledSdkRoot, "index.js")).href)}
+${preamble}
 
-export class SessionCounter extends Actor {
+export class ${actorType} extends Actor {
     count = 0
 
     async increment(amount = 1): Promise<number> {
@@ -170,4 +333,15 @@ export class SessionCounter extends Actor {
 `
     )
     return root
+}
+
+function invokeCommand(actorId: string, actorType: string) {
+    return {
+        type: "invoke" as const,
+        request_id: `request-${actorId}`,
+        actor: { ...actorIdentity, actor_type: actorType, actor_id: actorId },
+        method: "increment",
+        args: [],
+        state: null
+    }
 }

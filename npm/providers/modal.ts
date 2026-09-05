@@ -163,7 +163,7 @@ class ModalSandboxProvider implements SandboxProvider {
                 name,
                 timeoutMs: maximumSandboxLifetimeMs,
                 idleTimeoutMs: request.hostIdleTimeoutMs,
-                command: hostCommand(this.binaryPath, placement.privateNetwork === true),
+                command: hostCommand(this.binaryPath),
                 workdir: request.workingDirectory,
                 env: hostEnvironment(request, placement.privateNetwork === true),
                 h2Ports: [hostPort],
@@ -281,16 +281,13 @@ function hostEnvironment(request: EnsureHostRequest, privateNetwork: boolean): R
                   DURABLE_OBJECT_HOST_PRIVATE_HOSTNAME: modalPrivateHostname,
                   DURABLE_OBJECT_HOST_ROUTE_FILE: hostRouteFile
               }
-            : {})
+            : { DURABLE_OBJECT_HOST_PUBLIC_ROUTE_FILE: hostRouteFile })
     }
 }
 
-function hostCommand(binaryPath: string, privateNetwork: boolean): string[] {
-    const bootstrap = privateNetwork
-        ? '"$1" 2>"$2"; status=$?; printf \'%s\n\' "$status" >"$3"; if ! test -f "$4"; then sleep 60; fi; exit "$status"'
-        : 'until test -s "$1"; do sleep 0.05; done; export DURABLE_OBJECT_HOST_ROUTE="$(cat "$1")"; "$2" 2>"$3"; status=$?; printf \'%s\n\' "$status" >"$4"; if ! test -f "$5"; then sleep 60; fi; exit "$status"'
-    const commandArguments = privateNetwork ? [binaryPath, hostStderrFile, hostExitedFile, readyFile] : [hostRouteFile, binaryPath, hostStderrFile, hostExitedFile, readyFile]
-    return ["sh", "-c", bootstrap, "durable-object-host-bootstrap", ...commandArguments]
+function hostCommand(binaryPath: string): string[] {
+    const bootstrap = '"$1" 2>"$2"; status=$?; printf \'%s\n\' "$status" >"$3"; if ! test -f "$4"; then sleep 60; fi; exit "$status"'
+    return ["sh", "-c", bootstrap, "durable-object-host-bootstrap", binaryPath, hostStderrFile, hostExitedFile, readyFile]
 }
 
 function validateEnsureRequest(request: EnsureHostRequest): void {

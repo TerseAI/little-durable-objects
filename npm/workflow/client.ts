@@ -6,7 +6,7 @@ import type { ActorConnection, ActorSocketMessage } from "../shared/socket.js"
 import { JsonActorStateSerializer, validateActorComponent } from "../shared/types.js"
 import type { JsonValue, SocketMessage } from "../shared/types.js"
 
-import { RemoteActorClient } from "./remoteClient.js"
+import { configuredSettings } from "./clientSettings.js"
 import type { DurableObjectsClientOptions } from "./remoteClient.js"
 
 interface ActorClientTransport {
@@ -30,14 +30,42 @@ function runWithActorClientForTests<T>(options: ActorTestClientOptions, operatio
 }
 
 class DefaultActorClientProvider {
-    private client: ActorClientTransport = new RemoteActorClient()
+    private client: ActorClientTransport = new LazyActorClient()
 
     get(): ActorClientTransport {
         return this.client
     }
 
     configure(options: DurableObjectsClientOptions): void {
-        this.client = new RemoteActorClient(options)
+        this.client = new LazyActorClient(configuredSettings(options))
+    }
+}
+
+class LazyActorClient implements ActorClientTransport {
+    private client: Promise<ActorClientTransport> | undefined
+
+    constructor(private readonly options?: DurableObjectsClientOptions) {}
+
+    async invoke(actorType: string, actorId: string, method: string, args: readonly unknown[]): Promise<unknown> {
+        return (await this.load()).invoke(actorType, actorId, method, args)
+    }
+
+    async connect(actorType: string, actorId: string, metadata: unknown): Promise<ActorConnection> {
+        return (await this.load()).connect(actorType, actorId, metadata)
+    }
+
+    async broadcast(actorType: string, actorId: string, message: ActorSocketMessage): Promise<void> {
+        return (await this.load()).broadcast(actorType, actorId, message)
+    }
+
+    private load(): Promise<ActorClientTransport> {
+        this.client ??= import("./remoteClient.js")
+            .then(({ RemoteActorClient }) => new RemoteActorClient(this.options))
+            .catch(error => {
+                this.client = undefined
+                throw error
+            })
+        return this.client
     }
 }
 

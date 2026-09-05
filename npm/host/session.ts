@@ -6,8 +6,9 @@ import { ActorConfigurationError, ActorProtocolError, ActorSessionError } from "
 import { failedReply, parseActorSessionServerMessage } from "../shared/types.js"
 import type { ActorExecutorCommand, ActorExecutorReply, ActorSessionClientMessage } from "../shared/types.js"
 
-import { loadActorEntrypoint, resolveActorEntrypoint } from "./actorModule.js"
+import { resolveActorEntrypoint } from "./actorModule.js"
 import { ActorWorkerSupervisor } from "./worker/supervisor.js"
+import type { ActorWorkerSupervisorOptions } from "./worker/supervisor.js"
 
 const DEFAULT_ACTOR_STARTUP_TIMEOUT_MS = 10_000
 const DEFAULT_ACTOR_IDLE_TIMEOUT_MS = 60_000
@@ -23,7 +24,10 @@ class ActorSession {
     private startup: Promise<void> | undefined
     private connection: ActorSessionConnection | undefined
 
-    constructor(private readonly settings = ActorSessionSettings.fromEnvironment(process.env)) {}
+    constructor(
+        private readonly settings = ActorSessionSettings.fromEnvironment(process.env),
+        private readonly createSupervisor: (options: ActorWorkerSupervisorOptions) => Pick<ActorWorkerSupervisor, "ready" | "handle" | "close"> = options => new ActorWorkerSupervisor(options)
+    ) {}
 
     start(): Promise<void> {
         this.startup ??= this.initialize()
@@ -37,13 +41,33 @@ class ActorSession {
 
     private async initialize(): Promise<void> {
         const actorEntrypointUrl = await resolveActorEntrypoint(this.settings.actorEntrypoint)
-        const actorTypes = await loadActorEntrypoint(actorEntrypointUrl)
-        const supervisor = new ActorWorkerSupervisor({
+        const supervisor = this.createSupervisor({
             actorEntrypointUrl,
             actorIdleTimeoutMs: this.settings.actorIdleTimeoutMs
         })
         const commandHandler = (command: ActorExecutorCommand): Promise<ActorExecutorReply> => supervisor.handle(command)
-        this.connection = await ActorSessionConnection.open(this.settings.socketPath, actorTypes, commandHandler, this.settings.startupTimeoutMs)
+        try {
+            const actorTypes = await discoverActorTypes(supervisor, this.settings.startupTimeoutMs)
+            this.connection = await ActorSessionConnection.open(this.settings.socketPath, actorTypes, commandHandler, this.settings.startupTimeoutMs)
+            void this.connection.closed().then(() => supervisor.close())
+        } catch (error) {
+            supervisor.close()
+            throw error
+        }
+    }
+}
+
+async function discoverActorTypes(supervisor: Pick<ActorWorkerSupervisor, "ready">, timeoutMs: number): Promise<readonly string[]> {
+    let timer: NodeJS.Timeout | undefined
+    try {
+        return await Promise.race([
+            supervisor.ready(),
+            new Promise<never>((_, reject) => {
+                timer = setTimeout(() => reject(new ActorSessionError(`actor module loading timed out after ${timeoutMs}ms`)), timeoutMs)
+            })
+        ])
+    } finally {
+        clearTimeout(timer)
     }
 }
 
@@ -90,7 +114,7 @@ class ActorSessionConnection {
         if (actorTypes.length === 0) throw new ActorSessionError("the actor entrypoint does not export any actor classes")
         const socket = await connectSocket(socketPath)
         const connection = new ActorSessionConnection(socket, commandHandler)
-        connection.send({ type: "attach", protocol: 12, actor_types: actorTypes })
+        connection.send({ type: "attach", protocol: 13, actor_types: actorTypes })
         await connection.waitUntilAttached(timeoutMs)
         return connection
     }

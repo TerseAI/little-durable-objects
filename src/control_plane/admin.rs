@@ -196,7 +196,6 @@ impl AdminRegistry for PostgresAdminRegistry {
         spec.validate()?;
         Ok(self
             .database
-            .client()
             .execute(
                 "WITH ensured_namespace AS ( \
                    INSERT INTO durable_object_namespaces (namespace_id) VALUES ($1) \
@@ -234,7 +233,6 @@ impl AdminRegistry for PostgresAdminRegistry {
         validate_namespace(namespace_id)?;
         Ok(self
             .database
-            .client()
             .query_opt(
                 "SELECT code_revision, image_ref, working_directory, actor_entrypoint \
                  FROM durable_object_project_specs WHERE namespace_id = $1",
@@ -330,7 +328,6 @@ mod tests {
             Some(deployment.clone())
         );
         let namespace_exists = database
-            .client()
             .query_one(
                 "SELECT EXISTS(SELECT 1 FROM durable_object_namespaces WHERE namespace_id = $1)",
                 &[&deployment.namespace_id],

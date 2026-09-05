@@ -12,6 +12,7 @@ import type { JsonValue, SocketEffect } from "../shared/types.js"
 
 import { GrpcActorHostTransport } from "./actorHostGrpc.js"
 import type { ActorHostTarget, ActorHostTransport, DirectActorInvocation } from "./actorHostGrpc.js"
+import { configuredSettings, validateOrigin } from "./clientSettings.js"
 
 const namespaceIdSchema = z.string().regex(/^[A-Za-z0-9._-]+$/u)
 const remoteSettingsSchema = z.object({
@@ -19,13 +20,6 @@ const remoteSettingsSchema = z.object({
     DURABLE_OBJECT_NAMESPACE_ID: namespaceIdSchema,
     DURABLE_OBJECT_CONTROL_PLANE_URL: z.string().url(),
     DURABLE_OBJECT_SOCKET_GATEWAY_URL: z.string().url().optional()
-})
-
-const clientOptionsSchema = z.object({
-    token: z.string().trim().min(1),
-    namespaceId: namespaceIdSchema,
-    controlPlaneUrl: z.string().url(),
-    socketGatewayUrl: z.string().url().optional()
 })
 
 const errorDocumentSchema = z.object({
@@ -248,30 +242,6 @@ class RemoteActorClient {
         if (!Array.isArray(value)) throw new ActorProtocolError("actor arguments must be a JSON array")
         return value
     }
-}
-
-function configuredSettings(options: DurableObjectsClientOptions): RemoteActorSettings {
-    const result = clientOptionsSchema.safeParse(options)
-    if (!result.success) throw new ActorConfigurationError(`durable-object client settings are invalid: ${result.error.message}`)
-    const controlPlaneUrl = validateOrigin(result.data.controlPlaneUrl)
-    return {
-        ...result.data,
-        controlPlaneUrl,
-        socketGatewayUrl: validateOrigin(result.data.socketGatewayUrl ?? controlPlaneUrl)
-    }
-}
-
-function validateOrigin(origin: string): string {
-    let url: URL
-    try {
-        url = new URL(origin)
-    } catch (error) {
-        throw new ActorConfigurationError(`actor HTTP origin is invalid: ${origin}`, { cause: error })
-    }
-    if (!/^https?:$/u.test(url.protocol) || !url.hostname || url.username || url.password || url.pathname !== "/" || url.search || url.hash) {
-        throw new ActorConfigurationError(`actor control-plane URL must be an HTTP or HTTPS origin: ${origin}`)
-    }
-    return url.origin
 }
 
 function targetUrl(settings: RemoteActorSettings, actorType: string, actorId: string): string {

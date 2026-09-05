@@ -28,6 +28,20 @@ test("rejects a configured actor entrypoint that does not exist", async () => {
     await assert.rejects(resolveActorEntrypoint("./missing-durable-objects.ts"), ActorConfigurationError)
 })
 
+test("prefers a compiled conventional entrypoint when available", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "durable-object-compiled-"))
+    const previousDirectory = process.cwd()
+    try {
+        await mkdir(path.join(root, "dist"))
+        await writeFile(path.join(root, "dist/durable-objects.js"), "export {}\n")
+        process.chdir(root)
+        assert.equal(await realpath(fileURLToPath(await resolveActorEntrypoint(undefined))), await realpath(path.join(root, "dist/durable-objects.js")))
+    } finally {
+        process.chdir(previousDirectory)
+        await rm(root, { recursive: true, force: true })
+    }
+})
+
 test("rejects default and non-actor entrypoint exports", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "durable-object-invalid-entrypoint-"))
     try {

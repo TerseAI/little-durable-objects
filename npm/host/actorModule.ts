@@ -1,7 +1,6 @@
 import { stat } from "node:fs/promises"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
-import { register } from "tsx/esm/api"
 
 import type { ActorClass } from "../shared/actor.js"
 import { Actor, registerActorClass } from "../shared/actor.js"
@@ -10,18 +9,19 @@ import { ActorConfigurationError, ActorDefinitionError } from "../shared/errors.
 const DEFAULT_ACTOR_ENTRYPOINT = "src/durable-objects.ts"
 
 async function resolveActorEntrypoint(configured: string | undefined): Promise<string> {
+    if (configured === undefined && (await isFile("dist/durable-objects.js"))) configured = "dist/durable-objects.js"
     const entrypointPath = path.resolve(configured ?? DEFAULT_ACTOR_ENTRYPOINT)
     await requireFile(entrypointPath, configured === undefined ? `default actor entrypoint ${DEFAULT_ACTOR_ENTRYPOINT}` : `configured actor entrypoint ${configured}`)
     return pathToFileURL(entrypointPath).href
 }
 
 async function loadActorEntrypoint(moduleUrl: string): Promise<string[]> {
-    const unregister = register()
+    const unregister = /\.[cm]?tsx?$/u.test(new URL(moduleUrl).pathname) ? (await import("tsx/esm/api")).register() : undefined
     let actorModule: Record<string, unknown>
     try {
         actorModule = (await import(moduleUrl)) as Record<string, unknown>
     } finally {
-        await unregister()
+        await unregister?.()
     }
     const exports = Object.entries(actorModule)
     if (exports.length === 0) {

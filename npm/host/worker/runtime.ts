@@ -75,7 +75,10 @@ class ActorRuntime {
         if (this.identity !== undefined && identityKey(this.identity) !== identityKey(identity)) {
             return failedReply("actor_identity_mismatch", "resident actor Worker received an invocation for a different actor")
         }
-        return this.instance ?? this.createInstance(identity, command.state)
+        if (this.instance !== undefined) return this.instance
+        if (command.resident_only) return { type: "state_required" }
+        if (command.state === undefined) return failedReply("invalid_actor_state", "actor hydration requires an explicit state or null")
+        return this.createInstance(identity, command.state)
     }
 
     private reset(): void {

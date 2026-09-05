@@ -44,6 +44,7 @@ pub struct ActorHostConfig {
     pub executor_socket: PathBuf,
     pub host_bind: SocketAddr,
     pub host_route: Option<String>,
+    pub public_route_file: Option<PathBuf>,
     pub private_hostname: Option<String>,
     pub route_file: Option<PathBuf>,
     pub jwt_issuer: String,
@@ -169,11 +170,17 @@ impl ActorHostConfig {
             "DURABLE_OBJECT_HOST_ROUTE and DURABLE_OBJECT_HOST_PRIVATE_HOSTNAME are mutually exclusive"
         );
         let route_file = get("DURABLE_OBJECT_HOST_ROUTE_FILE").map(PathBuf::from);
+        let public_route_file = get("DURABLE_OBJECT_HOST_PUBLIC_ROUTE_FILE").map(PathBuf::from);
+        ensure!(
+            public_route_file.is_none()
+                || (host_route.is_none() && private_hostname.is_none() && route_file.is_none()),
+            "DURABLE_OBJECT_HOST_PUBLIC_ROUTE_FILE cannot be combined with other host route settings"
+        );
         let host_bind = get("DURABLE_OBJECT_HOST_BIND")
             .unwrap_or_else(|| {
                 if private_hostname.is_some() {
                     "[::]:7101"
-                } else if host_route.is_some() {
+                } else if host_route.is_some() || public_route_file.is_some() {
                     "0.0.0.0:7101"
                 } else {
                     "127.0.0.1:0"
@@ -217,6 +224,7 @@ impl ActorHostConfig {
             executor_socket,
             host_bind,
             host_route,
+            public_route_file,
             private_hostname,
             route_file,
             jwt_issuer,
@@ -248,12 +256,32 @@ async fn prepare_actor_host(
 ) -> Result<PreparedActorHost> {
     let invocation_auth = invocation_auth(config)?;
     timings.authentication_ready_at_ms = Some(timings.elapsed_ms());
-    let control_plane =
-        Arc::new(ControlPlaneClient::connect(&config.control_plane_url, &config.host_token).await?);
-    timings.control_plane_connected_at_ms = Some(timings.elapsed_ms());
-    let (listener, route, endpoint) = bind_host(config, timings).await?;
-    let (executor_connection, javascript) = connect_executor(&config.executor_socket).await?;
-    timings.executor_attached_at_ms = Some(timings.elapsed_ms());
+    let started_at = timings.started_at;
+    let (control_plane, (listener, route, endpoint), (executor_connection, javascript)) =
+        connect_host_dependencies(
+            timed_connection(
+                started_at,
+                &mut timings.control_plane_connected_at_ms,
+                ControlPlaneClient::connect(&config.control_plane_url, &config.host_token),
+            ),
+            bind_host(
+                config,
+                started_at,
+                &mut timings.listener_bound_at_ms,
+                &mut timings.private_route_resolved_at_ms,
+            ),
+            timed_connection(
+                started_at,
+                &mut timings.executor_attached_at_ms,
+                connect_executor(
+                    &config.executor_socket,
+                    started_at,
+                    &mut timings.javascript_spawned_at_ms,
+                ),
+            ),
+        )
+        .await?;
+    let control_plane = Arc::new(control_plane);
     let host = Arc::new(ActorHost::new(
         endpoint.clone(),
         config.namespace_id.clone(),
@@ -293,21 +321,41 @@ fn invocation_auth(config: &ActorHostConfig) -> Result<ActorJwtVerifier> {
     )
 }
 
+async fn connect_host_dependencies<C, L, E>(
+    control_plane: impl Future<Output = Result<C>>,
+    listener: impl Future<Output = Result<L>>,
+    executor: impl Future<Output = Result<E>>,
+) -> Result<(C, L, E)> {
+    tokio::try_join!(control_plane, listener, executor)
+}
+
+async fn timed_connection<T>(
+    started_at: Instant,
+    milestone: &mut Option<f64>,
+    operation: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    let result = operation.await?;
+    *milestone = Some(started_at.elapsed().as_secs_f64() * 1_000.0);
+    Ok(result)
+}
+
 async fn bind_host(
     config: &ActorHostConfig,
-    timings: &mut HostStartupTimings,
+    started_at: Instant,
+    listener_bound_at_ms: &mut Option<f64>,
+    route_resolved_at_ms: &mut Option<f64>,
 ) -> Result<(TcpListener, String, HostEndpoint)> {
     let listener = TcpListener::bind(config.host_bind)
         .await
         .with_context(|| format!("bind actor host at {}", config.host_bind))?;
-    timings.listener_bound_at_ms = Some(timings.elapsed_ms());
+    *listener_bound_at_ms = Some(started_at.elapsed().as_secs_f64() * 1_000.0);
     let route = advertised_route(config, listener.local_addr()?).await?;
     if let Some(path) = &config.route_file {
         tokio::fs::write(path, &route)
             .await
             .with_context(|| format!("write actor host route to {}", path.display()))?;
     }
-    timings.private_route_resolved_at_ms = Some(timings.elapsed_ms());
+    *route_resolved_at_ms = Some(started_at.elapsed().as_secs_f64() * 1_000.0);
     let endpoint = HostEndpoint {
         id: config.host_id.clone(),
         route: route.clone(),
@@ -323,6 +371,7 @@ struct HostStartupTimings {
     listener_bound_at_ms: Option<f64>,
     private_route_resolved_at_ms: Option<f64>,
     executor_attached_at_ms: Option<f64>,
+    javascript_spawned_at_ms: Option<f64>,
     lease_registered_at_ms: Option<f64>,
     executor_notified_at_ms: Option<f64>,
 }
@@ -337,6 +386,7 @@ impl HostStartupTimings {
             listener_bound_at_ms: None,
             private_route_resolved_at_ms: None,
             executor_attached_at_ms: None,
+            javascript_spawned_at_ms: None,
             lease_registered_at_ms: None,
             executor_notified_at_ms: None,
         }
@@ -364,6 +414,7 @@ fn log_startup(
         listener_bound_at_ms = timings.listener_bound_at_ms,
         private_route_resolved_at_ms = timings.private_route_resolved_at_ms,
         executor_attached_at_ms = timings.executor_attached_at_ms,
+        javascript_spawned_at_ms = timings.javascript_spawned_at_ms,
         lease_registered_at_ms = timings.lease_registered_at_ms,
         executor_notified_at_ms = timings.executor_notified_at_ms,
         completed_at_ms = timings.elapsed_ms(),
@@ -377,6 +428,11 @@ async fn advertised_route(config: &ActorHostConfig, bound: SocketAddr) -> Result
     if let Some(route) = &config.host_route {
         return Ok(route.clone());
     }
+    if let Some(path) = &config.public_route_file {
+        return tokio::time::timeout(Duration::from_secs(60), read_public_route(path))
+            .await
+            .context("public host route was not published within 60 seconds")?;
+    }
     let Some(hostname) = &config.private_hostname else {
         return Ok(format!("http://{bound}"));
     };
@@ -388,11 +444,35 @@ async fn advertised_route(config: &ActorHostConfig, bound: SocketAddr) -> Result
     Ok(format!("http://{address}"))
 }
 
+async fn read_public_route(path: &std::path::Path) -> Result<String> {
+    loop {
+        match tokio::fs::read_to_string(path).await {
+            Ok(route) if !route.trim().is_empty() => {
+                let route = route.trim().to_owned();
+                let endpoint = tonic::transport::Endpoint::from_shared(route.clone())
+                    .context("public host route file must contain a valid HTTPS URI")?;
+                ensure!(
+                    endpoint.uri().scheme_str() == Some("https") && endpoint.uri().host().is_some(),
+                    "public host route must use HTTPS"
+                );
+                return Ok(route);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("read public host route"),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 async fn connect_executor(
     socket: &std::path::Path,
+    started_at: Instant,
+    javascript_spawned_at_ms: &mut Option<f64>,
 ) -> Result<(ActorExecutorConnection, tokio::process::Child)> {
     let listener = ActorExecutorListener::bind(socket).await?;
     let javascript = spawn_javascript_process()?;
+    *javascript_spawned_at_ms = Some(started_at.elapsed().as_secs_f64() * 1_000.0);
     Ok((listener.accept().await?, javascript))
 }
 
@@ -514,6 +594,22 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn host_connections_start_without_waiting_for_each_other() -> Result<()> {
+        let barrier = tokio::sync::Barrier::new(3);
+        let connect = || async {
+            barrier.wait().await;
+            Ok(())
+        };
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            connect_host_dependencies(connect(), connect(), connect()),
+        )
+        .await
+        .context("host dependencies ran sequentially")??;
+        Ok(())
+    }
+
     #[test]
     fn private_network_hosts_bind_ipv6_and_publish_their_route() -> Result<()> {
         let mut values = values();
@@ -537,6 +633,47 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn public_route_can_arrive_after_the_host_process_starts() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("route");
+        let mut values = values();
+        values.insert(
+            "DURABLE_OBJECT_HOST_PUBLIC_ROUTE_FILE".into(),
+            path.display().to_string(),
+        );
+        let config = ActorHostConfig::from_lookup(|name| values.get(name).cloned())?;
+        assert_eq!(config.host_bind, "0.0.0.0:7101".parse()?);
+        let publish = async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::fs::write(path, "https://host.example.com").await?;
+            anyhow::Ok(())
+        };
+        let (route, ()) = tokio::try_join!(advertised_route(&config, config.host_bind), publish)?;
+        assert_eq!(route, "https://host.example.com");
+        Ok(())
+    }
+
+    #[test]
+    fn public_route_file_cannot_be_combined_with_other_route_settings() {
+        for conflict in [
+            "DURABLE_OBJECT_HOST_ROUTE",
+            "DURABLE_OBJECT_HOST_PRIVATE_HOSTNAME",
+            "DURABLE_OBJECT_HOST_ROUTE_FILE",
+        ] {
+            let mut values = values();
+            values.insert(
+                "DURABLE_OBJECT_HOST_PUBLIC_ROUTE_FILE".into(),
+                "/tmp/input-route".into(),
+            );
+            values.insert(conflict.into(), "https://host.example.com".into());
+            assert!(
+                ActorHostConfig::from_lookup(|name| values.get(name).cloned()).is_err(),
+                "{conflict}"
+            );
+        }
+    }
+
     #[test]
     fn startup_timings_begin_with_only_configuration_loaded() {
         let values = values();
@@ -545,6 +682,7 @@ mod tests {
 
         assert!(timings.configuration_loaded_at_ms <= timings.elapsed_ms());
         assert!(timings.control_plane_connected_at_ms.is_none());
+        assert!(timings.javascript_spawned_at_ms.is_none());
         assert!(timings.executor_notified_at_ms.is_none());
     }
 

@@ -91,6 +91,14 @@ const forwarderDefinition = registerActorClass(Forwarder)
 const chatDefinition = registerActorClass(ChatRoom)
 const rejectingDefinition = registerActorClass(RejectingRoom)
 
+test("a resident-only command requests hydration before constructing or executing an actor", async () => {
+    const runtime = new ActorRuntime(counterDefinition)
+    const command = { type: "invoke" as const, request_id: "resident-1", actor: actorIdentity, method: "increment", args: [1], state: null, resident_only: true }
+    assert.deepEqual(await runtime.handle(command), { type: "state_required" })
+    assert.deepEqual(await runtime.handle({ ...command, resident_only: false, state: { count: 9 } }), { type: "invoked", result: 10, state: { count: 10 } })
+    assert.deepEqual(await runtime.handle(command), { type: "invoked", result: 11, state: { count: 11 } })
+})
+
 test("keeps a successful actor instance resident and restores it after failure", async () => {
     const runtime = new ActorRuntime(counterDefinition)
     assert.deepEqual(

@@ -175,7 +175,6 @@ impl ObjectPlacementStore for PostgresObjectPlacementStore {
     async fn get(&self, object: &ActorStorageKey) -> Result<Option<ObjectPlacement>> {
         let row = self
             .database
-            .client()
             .query_opt(
                 "SELECT owner_host_id, owner_epoch, home_region, state_version, state_object, last_request_id \
                  FROM durable_object_placements WHERE object_id = $1",
@@ -198,7 +197,6 @@ impl ObjectPlacementStore for PostgresObjectPlacementStore {
         if expected.is_none() {
             if let Some(row) = self
                 .database
-                .client()
                 .query_opt(
                     "INSERT INTO durable_object_placements \
                      (object_id, owner_host_id, owner_epoch, home_region) \
@@ -226,7 +224,6 @@ impl ObjectPlacementStore for PostgresObjectPlacementStore {
             .context("object owner epoch exceeds PostgreSQL BIGINT")?;
         if let Some(row) = self
             .database
-            .client()
             .query_opt(
                 "UPDATE durable_object_placements \
                  SET owner_host_id = $2, owner_epoch = owner_epoch + 1, updated_at = clock_timestamp() \
@@ -256,7 +253,6 @@ impl ObjectPlacementStore for PostgresObjectPlacementStore {
             .context("actor state version exceeds PostgreSQL BIGINT")?;
         let row = self
             .database
-            .client()
             .query_opt(
                 "UPDATE durable_object_placements AS placement \
                  SET state_version = state_version + 1, state_object = $6, last_request_id = $7, updated_at = clock_timestamp() \

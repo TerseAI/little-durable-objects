@@ -25,7 +25,7 @@ use tracing::{debug, info};
 
 use super::{ActorInvocationFailure, ActorKey};
 
-const ACTOR_EXECUTOR_PROTOCOL_VERSION: u32 = 12;
+const ACTOR_EXECUTOR_PROTOCOL_VERSION: u32 = 13;
 pub(crate) const MAX_ACTOR_EXECUTOR_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Serialize)]
@@ -34,6 +34,7 @@ pub struct ActorMethodInvocation {
     pub actor: ActorKey,
     pub method: String,
     pub args: Vec<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<Value>,
     pub connections: Vec<ActorSocketConnection>,
 }
@@ -81,6 +82,7 @@ pub struct ActorSocketInvocation {
     pub actor: ActorKey,
     pub event: ActorSocketEvent,
     pub connections: Vec<ActorSocketConnection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<Value>,
 }
 
@@ -140,6 +142,24 @@ pub trait ActorExecutor: Send + Sync {
     fn supports(&self, actor_type: &str) -> bool;
 
     async fn invoke(&self, invocation: ActorMethodInvocation) -> Result<ActorMethodOutcome>;
+
+    async fn invoke_with_state(
+        &self,
+        mut invocation: ActorMethodInvocation,
+        state: Option<&Value>,
+    ) -> Result<ActorMethodOutcome> {
+        invocation.state = state.cloned();
+        self.invoke(invocation).await
+    }
+
+    async fn handle_socket_with_state(
+        &self,
+        mut invocation: ActorSocketInvocation,
+        state: Option<&Value>,
+    ) -> Result<ActorSocketOutcome> {
+        invocation.state = state.cloned();
+        self.handle_socket(invocation).await
+    }
 
     async fn handle_socket(
         &self,
@@ -279,6 +299,7 @@ struct JsActorExecutor {
     next_message_id: AtomicU64,
     pending: Mutex<HashMap<u64, oneshot::Sender<ExecutorReply>>>,
     writer: AsyncMutex<OwnedWriteHalf>,
+    residents: Mutex<HashSet<ActorKey>>,
 }
 
 #[async_trait]
@@ -287,8 +308,21 @@ impl ActorExecutor for JsActorExecutor {
         self.actor_types.contains(actor_type)
     }
 
-    async fn invoke(&self, invocation: ActorMethodInvocation) -> Result<ActorMethodOutcome> {
-        match self.exchange(ExecutorCommand::Invoke(invocation)).await? {
+    async fn invoke(&self, mut invocation: ActorMethodInvocation) -> Result<ActorMethodOutcome> {
+        let state = invocation.state.take();
+        self.invoke_with_state(invocation, state.as_ref()).await
+    }
+
+    async fn invoke_with_state(
+        &self,
+        mut invocation: ActorMethodInvocation,
+        state: Option<&Value>,
+    ) -> Result<ActorMethodOutcome> {
+        invocation.state = None;
+        match self
+            .exchange_with_state(ExecutorCommand::Invoke(invocation), state)
+            .await?
+        {
             ExecutorReply::Invoked {
                 result,
                 state,
@@ -304,7 +338,7 @@ impl ActorExecutor for JsActorExecutor {
                     message,
                 }))
             }
-            ExecutorReply::Evicted => {
+            ExecutorReply::Evicted | ExecutorReply::StateRequired => {
                 anyhow::bail!("actor executor returned eviction reply to invocation")
             }
             ExecutorReply::WebsocketHandled { .. } => {
@@ -313,9 +347,23 @@ impl ActorExecutor for JsActorExecutor {
         }
     }
 
-    async fn handle_socket(&self, invocation: ActorSocketInvocation) -> Result<ActorSocketOutcome> {
+    async fn handle_socket(
+        &self,
+        mut invocation: ActorSocketInvocation,
+    ) -> Result<ActorSocketOutcome> {
+        let state = invocation.state.take();
+        self.handle_socket_with_state(invocation, state.as_ref())
+            .await
+    }
+
+    async fn handle_socket_with_state(
+        &self,
+        mut invocation: ActorSocketInvocation,
+        state: Option<&Value>,
+    ) -> Result<ActorSocketOutcome> {
+        invocation.state = None;
         match self
-            .exchange(ExecutorCommand::WebsocketEvent(invocation))
+            .exchange_with_state(ExecutorCommand::WebsocketEvent(invocation), state)
             .await?
         {
             ExecutorReply::WebsocketHandled { state, effects } => {
@@ -327,14 +375,23 @@ impl ActorExecutor for JsActorExecutor {
                     message,
                 }))
             }
-            ExecutorReply::Invoked { .. } | ExecutorReply::Evicted => {
+            ExecutorReply::Invoked { .. }
+            | ExecutorReply::Evicted
+            | ExecutorReply::StateRequired => {
                 anyhow::bail!("actor executor returned the wrong reply to socket event")
             }
         }
     }
 
     async fn evict(&self, eviction: ActorMethodEviction) -> Result<()> {
-        match self.exchange(ExecutorCommand::Evict(eviction)).await? {
+        self.residents
+            .lock()
+            .map_err(|_| anyhow::anyhow!("actor residency lock poisoned"))?
+            .remove(&eviction.actor);
+        match self
+            .exchange(&ExecutorCommand::Evict(eviction), None, false)
+            .await?
+        {
             ExecutorReply::Evicted => Ok(()),
             ExecutorReply::Failed { code, message } => {
                 anyhow::bail!("actor executor rejected eviction ({code}): {message}")
@@ -342,7 +399,7 @@ impl ActorExecutor for JsActorExecutor {
             ExecutorReply::Invoked { .. } => {
                 anyhow::bail!("actor executor returned the wrong reply to eviction")
             }
-            ExecutorReply::WebsocketHandled { .. } => {
+            ExecutorReply::WebsocketHandled { .. } | ExecutorReply::StateRequired => {
                 anyhow::bail!("actor executor returned socket reply to eviction")
             }
         }
@@ -356,10 +413,67 @@ impl JsActorExecutor {
             next_message_id: AtomicU64::new(1),
             pending: Mutex::new(HashMap::new()),
             writer: AsyncMutex::new(writer),
+            residents: Mutex::new(HashSet::new()),
         }
     }
 
-    async fn exchange(&self, command: ExecutorCommand) -> Result<ExecutorReply> {
+    async fn exchange_with_state(
+        &self,
+        command: ExecutorCommand,
+        state: Option<&Value>,
+    ) -> Result<ExecutorReply> {
+        let actor = match &command {
+            ExecutorCommand::Invoke(invocation) => &invocation.actor,
+            ExecutorCommand::WebsocketEvent(invocation) => &invocation.actor,
+            ExecutorCommand::Evict(_) => unreachable!("eviction does not hydrate"),
+        };
+        let resident = self
+            .residents
+            .lock()
+            .map_err(|_| anyhow::anyhow!("actor residency lock poisoned"))?
+            .remove(actor);
+        let mut reply = self
+            .exchange(
+                &command,
+                if resident {
+                    None
+                } else {
+                    Some(state.unwrap_or(&Value::Null))
+                },
+                resident,
+            )
+            .await?;
+        if resident && matches!(reply, ExecutorReply::StateRequired) {
+            reply = self
+                .exchange(&command, Some(state.unwrap_or(&Value::Null)), false)
+                .await?;
+        }
+        ensure!(
+            !matches!(reply, ExecutorReply::StateRequired),
+            "actor executor refused explicit hydration"
+        );
+        if matches!(
+            reply,
+            ExecutorReply::Invoked { .. } | ExecutorReply::WebsocketHandled { .. }
+        ) {
+            let mut residents = self
+                .residents
+                .lock()
+                .map_err(|_| anyhow::anyhow!("actor residency lock poisoned"))?;
+            if residents.len() >= 4096 {
+                residents.clear();
+            }
+            residents.insert(actor.clone());
+        }
+        Ok(reply)
+    }
+
+    async fn exchange(
+        &self,
+        command: &ExecutorCommand,
+        state: Option<&Value>,
+        resident_only: bool,
+    ) -> Result<ExecutorReply> {
         let message_id = self.next_message_id.fetch_add(1, Ordering::Relaxed);
         let (reply_tx, reply_rx) = oneshot::channel();
         self.pending
@@ -370,7 +484,11 @@ impl JsActorExecutor {
         let write_result = self
             .send(&ActorExecutorServerMessage::Command {
                 message_id,
-                command: Box::new(command),
+                command: ExecutorCommandEnvelope {
+                    command,
+                    state,
+                    resident_only,
+                },
             })
             .await;
         if let Err(error) = write_result {
@@ -389,7 +507,7 @@ impl JsActorExecutor {
             .context("customer actor executor disconnected before replying")
     }
 
-    async fn send(&self, message: &ActorExecutorServerMessage) -> Result<()> {
+    async fn send(&self, message: &ActorExecutorServerMessage<'_>) -> Result<()> {
         write_server_message(&mut *self.writer.lock().await, message).await
     }
 
@@ -477,7 +595,7 @@ fn trim_ascii_end(mut document: &[u8]) -> &[u8] {
 
 async fn write_server_message(
     writer: &mut OwnedWriteHalf,
-    message: &ActorExecutorServerMessage,
+    message: &ActorExecutorServerMessage<'_>,
 ) -> Result<()> {
     let mut bytes = serde_json::to_vec(message)?;
     bytes.push(b'\n');
@@ -531,14 +649,23 @@ async fn remove_socket(path: &Path) -> Result<()> {
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum ActorExecutorServerMessage {
+enum ActorExecutorServerMessage<'a> {
     Attached {
         protocol: u32,
     },
     Command {
         message_id: u64,
-        command: Box<ExecutorCommand>,
+        command: ExecutorCommandEnvelope<'a>,
     },
+}
+
+#[derive(Debug, Serialize)]
+struct ExecutorCommandEnvelope<'a> {
+    #[serde(flatten)]
+    command: &'a ExecutorCommand,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<&'a Value>,
+    resident_only: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -565,6 +692,7 @@ enum ExecutorCommand {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ExecutorReply {
+    StateRequired,
     Invoked {
         result: Value,
         state: Value,
@@ -670,6 +798,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resident_commands_omit_state_and_retry_only_an_explicit_hydration_request()
+    -> Result<()> {
+        let (host, customer) = UnixStream::pair()?;
+        let (_, writer) = host.into_split();
+        let executor = Arc::new(JsActorExecutor::new(writer, vec!["counter".into()]));
+        let mut reader = BufReader::new(customer);
+        let customer = async {
+            let first = read_json_line(&mut reader).await?;
+            assert_eq!(first["command"]["state"], json!({"count": 9}));
+            executor.deliver(
+                first["message_id"].as_u64().unwrap(),
+                serde_json::from_value(
+                    json!({"type":"invoked", "result":10,"state":{"count":10}}),
+                )?,
+            )?;
+            let warm = read_json_line(&mut reader).await?;
+            assert!(warm["command"].get("state").is_none());
+            assert_eq!(warm["command"]["resident_only"], true);
+            executor.deliver(
+                warm["message_id"].as_u64().unwrap(),
+                serde_json::from_value(json!({"type":"state_required"}))?,
+            )?;
+            let retry = read_json_line(&mut reader).await?;
+            assert_eq!(
+                retry["command"]["request_id"],
+                warm["command"]["request_id"]
+            );
+            assert_eq!(retry["command"]["state"], json!({"count": 10}));
+            assert_eq!(retry["command"]["resident_only"], false);
+            executor.deliver(
+                retry["message_id"].as_u64().unwrap(),
+                serde_json::from_value(
+                    json!({"type":"invoked", "result":11,"state":{"count":11}}),
+                )?,
+            )?;
+            anyhow::Ok(())
+        };
+        let invoke = async {
+            for count in [9, 10] {
+                let outcome = executor
+                    .invoke(ActorMethodInvocation {
+                        request_id: format!("request-{count}"),
+                        actor: ActorKey {
+                            namespace_id: "test".into(),
+                            actor_type: "counter".into(),
+                            actor_id: "one".into(),
+                        },
+                        method: "increment".into(),
+                        args: vec![],
+                        connections: vec![],
+                        state: Some(json!({"count":count})),
+                    })
+                    .await?;
+                assert!(
+                    matches!(outcome, ActorMethodOutcome::Completed {result, ..} if result == json!(count + 1))
+                );
+            }
+            anyhow::Ok(())
+        };
+        tokio::try_join!(customer, invoke)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn oversized_commands_are_reported_as_resource_exhausted() -> Result<()> {
         let root = TempDir::new_in("/tmp")?;
         let socket = root.path().join("actor-executor.sock");
@@ -735,10 +927,10 @@ mod tests {
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
         writer
-            .write_all(b"{\"type\":\"attach\",\"protocol\":12,\"actor_types\":[\"counter\"]}\n")
+            .write_all(b"{\"type\":\"attach\",\"protocol\":13,\"actor_types\":[\"counter\"]}\n")
             .await?;
         ensure!(
-            read_json_line(&mut reader).await? == json!({ "type": "attached", "protocol": 12 })
+            read_json_line(&mut reader).await? == json!({ "type": "attached", "protocol": 13 })
         );
 
         let invocation = read_json_line(&mut reader).await?;
@@ -798,10 +990,10 @@ mod tests {
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
         writer
-            .write_all(b"{\"type\":\"attach\",\"protocol\":12,\"actor_types\":[\"counter\"]}\n")
+            .write_all(b"{\"type\":\"attach\",\"protocol\":13,\"actor_types\":[\"counter\"]}\n")
             .await?;
         ensure!(
-            read_json_line(&mut reader).await? == json!({ "type": "attached", "protocol": 12 })
+            read_json_line(&mut reader).await? == json!({ "type": "attached", "protocol": 13 })
         );
         let mut trailing = String::new();
         ensure!(
